@@ -321,7 +321,7 @@ app.get('/', (c) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
-  <title>Xiaozhi Virtual Device — Web Client</title>
+  <title>OLIVIA — Open Language Intelligence & Voice Interactive Assistant</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 
   <!-- Fonts -->
@@ -351,7 +351,7 @@ app.get('/', (c) => {
         <i class="fas fa-microchip"></i>
       </div>
       <div class="device-info">
-        <h3 class="device-name" id="deviceNameDisplay">Virtual ESP32</h3>
+        <h3 class="device-name" id="deviceNameDisplay">Olivia</h3>
         <div class="device-status" id="deviceStatusBadge">
           <span class="status-dot offline" id="statusDot"></span>
           <span id="statusText">Offline</span>
@@ -396,7 +396,7 @@ app.get('/', (c) => {
       <div class="conv-item active">
         <div class="conv-avatar"><i class="fas fa-robot"></i></div>
         <div class="conv-meta">
-          <div class="conv-name">Xiaozhi AI</div>
+          <div class="conv-name">Olivia</div>
           <div class="conv-preview" id="convPreview">Start a conversation...</div>
         </div>
         <div class="conv-time" id="convTime">Now</div>
@@ -451,7 +451,7 @@ app.get('/', (c) => {
         <h3>Virtual Device Identity</h3>
         <div class="form-group">
           <label for="deviceNameInput">Device Name</label>
-          <input type="text" id="deviceNameInput" placeholder="My Virtual ESP32" value="My Virtual ESP32" />
+          <input type="text" id="deviceNameInput" placeholder="Olivia AI Server" value="Olivia AI Server" />
         </div>
         <div class="form-group">
           <label for="deviceIdInput">Device-Id (MAC Address)</label>
@@ -532,8 +532,8 @@ app.get('/', (c) => {
       <div class="chat-header-info">
         <div class="chat-avatar"><i class="fas fa-robot"></i></div>
         <div class="chat-title-block">
-          <h2>Xiaozhi AI</h2>
-          <div class="chat-subtitle" id="chatSubtitle">Virtual ESP32 Device</div>
+          <h2>Olivia</h2>
+          <div class="chat-subtitle" id="chatSubtitle">AI Assistant</div>
         </div>
       </div>
       <div class="chat-header-actions">
@@ -559,7 +559,7 @@ app.get('/', (c) => {
       <!-- System welcome message -->
       <div class="system-message" id="welcomeMsg">
         <i class="fas fa-microchip"></i>
-        <span>Virtual ESP32 device initialized. Click Connect to register and pair via xiaozhi.me.</span>
+        <span>OLIVIA initialized. Click Connect to register and pair via xiaozhi.me.</span>
       </div>
 
     </div>
@@ -586,7 +586,7 @@ app.get('/', (c) => {
         <div class="input-wrapper">
           <textarea
             id="messageInput"
-            placeholder="Type a message... (Enter to send)"
+            placeholder="Type a message..."
             rows="1"
           ></textarea>
         </div>
@@ -618,8 +618,8 @@ app.get('/', (c) => {
   <!-- ── INFO PANEL ────────────────────────────────────────── -->
   <div class="info-panel" id="infoPanel" style="display:none;">
     <div class="info-content">
-      <h3><i class="fas fa-microchip"></i> Xiaozhi Web Client</h3>
-      <p>This browser application emulates an ESP32 hardware device and connects to a Xiaozhi server through a local WebSocket proxy that injects required auth headers.</p>
+      <h3><i class="fas fa-microchip"></i> O.L.I.V.I.A.</h3>
+      <p>OLIVIA (Open Language Intelligence & Voice Interactive Assistant) is a web application that emulates an ESP32 hardware device and connects to a Xiaozhi server through a local WebSocket proxy that injects required auth headers.</p>
 
       <h4>Protocol Summary</h4>
       <div class="protocol-table">
