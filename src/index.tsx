@@ -30,6 +30,38 @@ const ALLOWED_OTA_HOSTS = new Set([
   'api.xiaozhi.me',
 ])
 
+/** Allowed vision hosts — same as OTA but for the vision/explain endpoint */
+const ALLOWED_VISION_HOSTS = new Set([
+  'api.xiaozhi.me',
+  'xiaozhi.me',
+  'www.xiaozhi.me',
+])
+
+/**
+ * Accept both http:// and https:// vision URLs.
+ * The Xiaozhi server sends the vision URL as http:// in the MCP initialize
+ * capabilities block (e.g. http://api.xiaozhi.me/vision/explain).
+ * We normalise to https:// when forwarding so the upstream request is always TLS.
+ */
+function isAllowedVisionUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl)
+    // Accept http:// or https:// — we upgrade to https when forwarding
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false
+    return ALLOWED_VISION_HOSTS.has(parsed.hostname)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Normalise a vision URL to always use https://.
+ * The server sends http:// but the actual endpoint is HTTPS.
+ */
+function normaliseVisionUrl(rawUrl: string): string {
+  return rawUrl.replace(/^http:\/\//i, 'https://')
+}
+
 function isAllowedOtaUrl(rawUrl: string): boolean {
   try {
     const parsed = new URL(rawUrl)
@@ -302,6 +334,107 @@ app.post('/api/ota/activate', async (c) => {
   return c.json(data, upstream.status as 200)
 })
 
+/**
+ * Vision proxy — POST multipart/form-data image to Xiaozhi vision endpoint.
+ *
+ * Protocol (exactly mirrors Esp32Camera::Explain() from xiaozhi-esp32 firmware):
+ *
+ *   POST <vision_url>
+ *   Headers:
+ *     Authorization: Bearer <vision_token>
+ *     Device-Id: <mac_address>
+ *     Client-Id: <uuid>
+ *     Content-Type: multipart/form-data; boundary=<boundary>
+ *   Body (multipart/form-data):
+ *     --<boundary>
+ *     Content-Disposition: form-data; name="question"
+ *
+ *     <text question>
+ *     --<boundary>
+ *     Content-Disposition: form-data; name="file"; filename="camera.jpg"
+ *     Content-Type: image/jpeg
+ *
+ *     <jpeg binary data>
+ *     --<boundary>--
+ *
+ * IMPORTANT: The MCP server sends the vision URL as http:// (not https://).
+ * We normalise to https:// before forwarding.
+ *
+ * CORS: The browser cannot POST directly to api.xiaozhi.me because CORS
+ * headers are not set for browser origins. We proxy through here and add
+ * the required auth headers.
+ */
+app.post('/api/vision/explain', async (c) => {
+  const rawVisionUrl = c.req.header('X-Vision-Url')?.trim()   ?? ''
+  const token        = c.req.header('X-Vision-Token')?.trim() ?? ''
+  const deviceId     = c.req.header('X-Device-Id')?.trim()    ?? ''
+  const clientId     = c.req.header('X-Client-Id')?.trim()    ?? ''
+
+  console.log('[VISION] Proxy request received')
+  console.log('[VISION] Raw vision URL:', rawVisionUrl)
+  console.log('[VISION] Has token:', !!token)
+  console.log('[VISION] Device-Id:', deviceId)
+  console.log('[VISION] Client-Id:', clientId)
+
+  if (!rawVisionUrl) {
+    console.log('[VISION] Error: X-Vision-Url header missing')
+    return c.json({ error: 'X-Vision-Url header is required' }, 400)
+  }
+
+  // Validate the host (accept both http:// and https://)
+  if (!isAllowedVisionUrl(rawVisionUrl)) {
+    console.log('[VISION] Error: host not allowed for URL:', rawVisionUrl)
+    return c.json({ error: `Vision URL host is not allowed (got: ${rawVisionUrl})` }, 400)
+  }
+
+  // Normalise to https:// — the server sends http:// in MCP capabilities
+  // but the actual API endpoint requires TLS.
+  const visionUrl = normaliseVisionUrl(rawVisionUrl)
+  console.log('[VISION] Normalised URL:', visionUrl)
+
+  // Forward the entire multipart body unchanged.
+  // The Content-Type (including boundary) is preserved from the original request.
+  const contentType = c.req.header('Content-Type') ?? ''
+  const body = await c.req.arrayBuffer()
+
+  console.log('[VISION] Content-Type:', contentType)
+  console.log('[VISION] Body size:', body.byteLength, 'bytes')
+
+  const headers: Record<string, string> = {
+    'Content-Type': contentType,
+    'User-Agent': 'xiaozhi-esp32/1.0.0',
+  }
+  if (token)    headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`
+  if (deviceId) headers['Device-Id']     = deviceId
+  if (clientId) headers['Client-Id']     = clientId
+
+  console.log('[VISION] Forwarding headers:', JSON.stringify(headers))
+  console.log('[VISION] Sending POST to:', visionUrl)
+
+  let upstream: Response
+  try {
+    upstream = await fetch(visionUrl, {
+      method:  'POST',
+      headers,
+      body,
+    })
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.log('[VISION] Fetch error:', msg)
+    return c.json({ error: `Vision fetch failed: ${msg}` }, 502)
+  }
+
+  const text = await upstream.text()
+  console.log('[VISION] Upstream status:', upstream.status)
+  console.log('[VISION] Upstream response (first 500 chars):', text.slice(0, 500))
+
+  // Return the raw response with the same status
+  return c.text(text, upstream.status as 200, {
+    'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json',
+    'Access-Control-Allow-Origin': '*',
+  })
+})
+
 // Serve static assets (JS, CSS, audio worklets, etc.)
 app.use('/static/*', serveStatic({ root: './public' }))
 
@@ -351,7 +484,7 @@ app.get('/', (c) => {
         <i class="fas fa-microchip"></i>
       </div>
       <div class="device-info">
-        <h3 class="device-name" id="deviceNameDisplay">Olivia</h3>
+        <h3 class="device-name" id="deviceNameDisplay">OLIVIA</h3>
         <div class="device-status" id="deviceStatusBadge">
           <span class="status-dot offline" id="statusDot"></span>
           <span id="statusText">Offline</span>
@@ -396,7 +529,7 @@ app.get('/', (c) => {
       <div class="conv-item active">
         <div class="conv-avatar"><i class="fas fa-robot"></i></div>
         <div class="conv-meta">
-          <div class="conv-name">Olivia</div>
+          <div class="conv-name">Xiaozhi AI</div>
           <div class="conv-preview" id="convPreview">Start a conversation...</div>
         </div>
         <div class="conv-time" id="convTime">Now</div>
@@ -451,7 +584,7 @@ app.get('/', (c) => {
         <h3>Virtual Device Identity</h3>
         <div class="form-group">
           <label for="deviceNameInput">Device Name</label>
-          <input type="text" id="deviceNameInput" placeholder="Olivia AI Server" value="Olivia AI Server" />
+          <input type="text" id="deviceNameInput" placeholder="OLIVIA" value="OLIVIA" />
         </div>
         <div class="form-group">
           <label for="deviceIdInput">Device-Id (MAC Address)</label>
@@ -532,8 +665,8 @@ app.get('/', (c) => {
       <div class="chat-header-info">
         <div class="chat-avatar"><i class="fas fa-robot"></i></div>
         <div class="chat-title-block">
-          <h2>Olivia</h2>
-          <div class="chat-subtitle" id="chatSubtitle">AI Assistant</div>
+          <h2>OLIVIA</h2>
+          <div class="chat-subtitle" id="chatSubtitle">AI Chatbot</div>
         </div>
       </div>
       <div class="chat-header-actions">
@@ -577,7 +710,45 @@ app.get('/', (c) => {
 
     <!-- Input Area -->
     <div class="input-area">
+      <!-- ── Image Attachment Preview (shown when image is selected) ── -->
+      <div class="image-attachment-bar" id="imageAttachmentBar" style="display:none;">
+        <div class="image-attachment-preview">
+          <img class="attachment-thumb" id="attachmentThumb" src="" alt="attachment" />
+          <div class="attachment-info">
+            <span class="attachment-name" id="attachmentName">Photo</span>
+          </div>
+          <button class="attachment-remove-btn" id="attachmentRemoveBtn" title="Remove image">
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
+      </div>
+
       <div class="input-toolbar">
+        <!-- Plus / Attach button -->
+        <div class="plus-btn-wrapper" id="plusBtnWrapper">
+          <button class="toolbar-btn plus-btn" id="plusBtn" title="Attach image">
+            <i class="fas fa-plus"></i>
+          </button>
+          <!-- Plus popup menu -->
+          <div class="plus-popup" id="plusPopup" style="display:none;">
+            <button class="plus-menu-item" id="menuCameraBtn">
+              <i class="fas fa-camera"></i>
+              <span>Camera</span>
+            </button>
+            <button class="plus-menu-item plus-menu-disabled" id="menuPhotosBtn" disabled>
+              <i class="fas fa-image"></i>
+              <span>Photos</span>
+              <span class="coming-soon-badge">Soon</span>
+            </button>
+            <div class="plus-menu-divider"></div>
+            <button class="plus-menu-item plus-menu-disabled" disabled>
+              <i class="fas fa-paperclip"></i>
+              <span>Documents</span>
+              <span class="coming-soon-badge">Soon</span>
+            </button>
+          </div>
+        </div>
+
         <!-- Voice button -->
         <button class="toolbar-btn mic-btn" id="micBtn" title="Hold to speak / Click to toggle">
           <i class="fas fa-microphone" id="micIcon"></i>
@@ -586,7 +757,7 @@ app.get('/', (c) => {
         <div class="input-wrapper">
           <textarea
             id="messageInput"
-            placeholder="Type a message..."
+            placeholder="Type a message... (Enter to send)"
             rows="1"
           ></textarea>
         </div>
@@ -600,6 +771,49 @@ app.get('/', (c) => {
         <span id="inputHint">Connect to server to start chatting</span>
       </div>
     </div>
+
+    <!-- ── Camera Modal ──────────────────────────────────────── -->
+    <div class="camera-modal" id="cameraModal" style="display:none;">
+      <div class="camera-modal-overlay" id="cameraModalOverlay"></div>
+      <div class="camera-modal-content">
+        <div class="camera-modal-header">
+          <h3><i class="fas fa-camera"></i> Take Photo</h3>
+          <button class="camera-close-btn" id="cameraCloseBtn">
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
+
+        <!-- Live viewfinder -->
+        <div class="camera-viewfinder" id="cameraViewfinder">
+          <video id="cameraVideo" autoplay playsinline muted></video>
+          <canvas id="cameraCanvas" style="display:none;"></canvas>
+          <div class="camera-controls">
+            <button class="camera-switch-btn" id="cameraSwitchBtn" title="Switch camera">
+              <i class="fas fa-rotate"></i>
+            </button>
+            <button class="camera-capture-btn" id="cameraCaptureBtn">
+              <i class="fas fa-circle"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- Preview after capture -->
+        <div class="camera-preview" id="cameraPreview" style="display:none;">
+          <img id="cameraPreviewImg" src="" alt="Preview" />
+          <div class="camera-preview-actions">
+            <button class="btn-secondary" id="cameraRetakeBtn">
+              <i class="fas fa-rotate-left"></i> Retake
+            </button>
+            <button class="btn-primary" id="cameraUsephotoBtn">
+              <i class="fas fa-check"></i> Use Photo
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hidden file input for gallery -->
+    <input type="file" id="galleryFileInput" accept="image/jpeg,image/jpg,image/png,image/webp,image/gif,image/bmp,image/heic,image/*" style="display:none;" />
 
   </main>
 
@@ -678,7 +892,7 @@ app.get('/', (c) => {
 <div class="loading-overlay" id="loadingOverlay">
   <div class="loading-card">
     <div class="loading-spinner"></div>
-    <div class="loading-text" id="loadingText">Initializing Virtual Device...</div>
+    <div class="loading-text" id="loadingText">Initializing OLIVIA...</div>
   </div>
 </div>
 
