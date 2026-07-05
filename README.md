@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://www.genspark.ai/api/files/s/Hf0CQCjT" alt="Olivia — Virtual ESP32 Device for Xiaozhi AI" width="100%" />
+<img src="docs/images/banner.png" alt="O.L.I.V.I.A. — Virtual ESP32 Device for Xiaozhi AI" width="100%" />
 
 <br/>
 <br/>
