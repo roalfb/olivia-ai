@@ -128,7 +128,7 @@
 // ================================================================
 const Logger = (() => {
   const logEl = document.getElementById('debugLog');
-  const LEVELS = ['BOOT','AUTH','WS','CHAT','PROTO','AUDIO','ERROR','WARN','INFO','STATE','MCP'];
+  const LEVELS = ['BOOT','AUTH','WS','CHAT','PROTO','AUDIO','ERROR','WARN','INFO','STATE','MCP','VISION'];
 
   function log(tag, message, data = null) {
     const now = new Date();
@@ -193,6 +193,7 @@ const Logger = (() => {
     info:  (msg, d) => log('INFO',  msg, d),
     state: (msg, d) => log('STATE', msg, d),
     mcp:   (msg, d) => log('MCP',   msg, d),
+    vision: (msg, d) => log('VISION', msg, d),
   };
 })();
 
@@ -1145,6 +1146,39 @@ const AudioEngine = (() => {
 })();
 
 // ================================================================
+// MODULE: VisionCapability
+// Stores the Xiaozhi Vision URL and token received during MCP initialize.
+// The server advertises: capabilities.vision.url and capabilities.vision.token
+// in the MCP initialize message. This mirrors ParseCapabilities() in
+// mcp_server.cc from the official xiaozhi-esp32 firmware.
+//
+// IMPORTANT: The server sends the vision URL as http:// (not https://).
+// Example: http://api.xiaozhi.me/vision/explain
+// The Hono proxy normalises this to https:// before forwarding.
+// ================================================================
+const VisionCapability = (() => {
+  let visionUrl   = '';
+  let visionToken = '';
+
+  function setUrl(url, token) {
+    visionUrl   = url;
+    visionToken = token || '';
+    // ── VERBOSE VISION LOGGING ──
+    Logger.mcp('=== VISION CAPABILITY RECEIVED ===');
+    Logger.mcp(`Vision URL: ${url}`);
+    Logger.mcp(`Vision token present: ${!!token}`);
+    Logger.mcp(`Vision token value: ${token ? ('...' + String(token).slice(-8)) : '(none)'}`);
+    Logger.mcp('==================================');
+  }
+
+  function getUrl()   { return visionUrl; }
+  function getToken() { return visionToken; }
+  function isAvailable() { return !!visionUrl; }
+
+  return { setUrl, getUrl, getToken, isAvailable };
+})();
+
+// ================================================================
 // MODULE: ProtocolClient
 // Core ESP32 WebSocket protocol implementation
 // This is the heart of the device emulator.
@@ -1471,8 +1505,23 @@ const ProtocolClient = (() => {
     Logger.mcp('MCP message received', msg.payload);
     if (callbacks.onMCP) callbacks.onMCP(msg.payload, msg.session_id);
 
-    // Auto-respond to MCP capability queries (tools/list, etc.)
-    if (msg.payload && msg.payload.method === 'tools/list') {
+    // ── Handle MCP initialize from server ──────────────────────────────────
+    // The server sends:
+    //   { type:"mcp", payload:{ jsonrpc:"2.0", id:1, method:"initialize",
+    //       params:{ capabilities:{ vision:{ url:"...", token:"..." } }, ... }}}
+    // We parse capabilities.vision here, exactly like Esp32Camera::ParseCapabilities()
+    // in the official firmware mcp_server.cc.
+    if (msg.payload && msg.payload.method === 'initialize') {
+      const params = msg.payload.params;
+      if (params && params.capabilities) {
+        const vision = params.capabilities.vision;
+        if (vision && vision.url) {
+          Logger.mcp('Vision capability received', { url: vision.url, hasToken: !!vision.token });
+          // Store in the shared VisionCapability singleton
+          VisionCapability.setUrl(vision.url, vision.token || '');
+        }
+      }
+      // Respond to initialize — mirrors ESP32 firmware ParseCapabilities/ReplyResult
       const response = {
         session_id: sessionId,
         type: 'mcp',
@@ -1480,28 +1529,260 @@ const ProtocolClient = (() => {
           jsonrpc: '2.0',
           id: msg.payload.id,
           result: {
-            tools: [],  // Virtual device has no tools in text mode
+            protocolVersion: '2024-11-05',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'xiaozhi-web-client', version: '1.0.0' }
           }
         }
       };
       sendText(response);
-      Logger.mcp('→ MCP tools/list response (empty)', null);
-    } else if (msg.payload && msg.payload.method === 'tools/call') {
-      // Respond with error for unsupported tools
+      Logger.mcp('→ MCP initialize response sent', null);
+      return;
+    }
+
+    // Auto-respond to MCP capability queries (tools/list, etc.)
+    if (msg.payload && msg.payload.method === 'tools/list') {
+      // ── Official firmware reference: McpServer::AddCommonTools()  ──────────
+      // mcp_server.cc lines 100–121: the firmware registers self.camera.take_photo
+      // when a Camera is present.  We advertise the same tool here so the
+      // Xiaozhi server knows it can call us with vision tool-call requests,
+      // exactly as it would a real ESP32 with a camera attached.
+      // ─────────────────────────────────────────────────────────────────────
+      const cameraTools = VisionCapability.isAvailable() ? [
+        {
+          name: 'self.camera.take_photo',
+          description:
+            'Always remember you have a camera. If the user asks you to see something, ' +
+            'use this tool to take a photo and then explain it.\n' +
+            'Args:\n  `question`: The question that you want to ask about the photo.\n' +
+            'Return:\n  A JSON object that provides the photo information.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              question: { type: 'string' }
+            },
+            required: ['question']
+          }
+        }
+      ] : [];
+
       const response = {
         session_id: sessionId,
         type: 'mcp',
         payload: {
           jsonrpc: '2.0',
           id: msg.payload.id,
-          error: {
-            code: -32601,
-            message: 'Tool not found on virtual device'
+          result: {
+            tools: cameraTools,
           }
         }
       };
       sendText(response);
-      Logger.mcp(`→ MCP tools/call error (tool: ${msg.payload.params?.name})`, null);
+      Logger.mcp(`→ MCP tools/list response (${cameraTools.length} tool(s))`, null);
+    } else if (msg.payload && msg.payload.method === 'tools/call') {
+      // ── Official firmware reference: McpServer::DoToolCall() ────────────
+      // mcp_server.cc lines 508–559: firmware dispatches tools/call to the
+      // registered callback, wraps the return value in a JSON-RPC result, and
+      // sends it back via Protocol::SendMcpMessage() → WebSocket.
+      //
+      // self.camera.take_photo callback (mcp_server.cc lines 111–119):
+      //   camera->Capture(); return camera->Explain(question);
+      //
+      // McpTool::Call() (mcp_server.h lines 272–311) wraps the std::string
+      // returned by Explain() as:
+      //   { content: [{type:"text", text:"<description>"}], isError: false }
+      //
+      // We replicate that exact wrapping here, using ImageInput.getPendingBlob()
+      // to get the user-selected image that is waiting in the UI.
+      // ─────────────────────────────────────────────────────────────────────
+      const toolName = msg.payload.params?.name;
+      const toolArgs = msg.payload.params?.arguments || {};
+      const toolId   = msg.payload.id;
+
+      if (toolName === 'self.camera.take_photo') {
+        Logger.mcp(`→ tools/call self.camera.take_photo received, question: "${toolArgs.question}"`);
+
+        // Retrieve the image blob the user attached in the UI.
+        const pendingBlob = ImageInput.getPendingBlob();
+
+        if (!pendingBlob) {
+          // No image attached — the server called take_photo but the user hasn't
+          // selected an image yet.  Return a graceful error so the LLM knows.
+          const errResp = {
+            session_id: sessionId,
+            type: 'mcp',
+            payload: {
+              jsonrpc: '2.0',
+              id: toolId,
+              result: {
+                content: [{ type: 'text', text: 'No image available. The user has not attached a photo yet.' }],
+                isError: true
+              }
+            }
+          };
+          sendText(errResp);
+          Logger.mcp('→ tools/call take_photo: no blob available, sent isError result');
+          return;
+        }
+
+        // Execute vision upload asynchronously (mirrors firmware's async Capture+Explain).
+        // We cannot block the WebSocket message loop, so we fire-and-forget and
+        // send the MCP result when the HTTP upload completes.
+        (async () => {
+          try {
+            const question = (toolArgs.question && toolArgs.question.trim()) || 'Please describe this image.';
+            Logger.mcp(`Executing take_photo: uploading image, question="${question}"`);
+
+            // ── Replicate Esp32Camera::Explain() ──────────────────────────
+            // esp32_camera.cc lines 155–321:
+            //   1. Encode frame to JPEG (we already have a browser File/Blob)
+            //   2. POST multipart/form-data to explain_url_ with question + file
+            //   3. Return http->ReadAll() as std::string
+            // ─────────────────────────────────────────────────────────────
+            let jpegBlob = pendingBlob;
+            if (!pendingBlob.type.includes('jpeg') && !pendingBlob.type.includes('jpg')) {
+              jpegBlob = await convertToJpeg(pendingBlob);
+            }
+
+            const boundary = '----XiaozhiWebClientBoundary' + Date.now().toString(16);
+            const enc = new TextEncoder();
+
+            const questionPart = enc.encode(
+              '--' + boundary + '\r\n' +
+              'Content-Disposition: form-data; name="question"\r\n' +
+              '\r\n' +
+              question + '\r\n'
+            );
+            const fileHeader = enc.encode(
+              '--' + boundary + '\r\n' +
+              'Content-Disposition: form-data; name="file"; filename="camera.jpg"\r\n' +
+              'Content-Type: image/jpeg\r\n' +
+              '\r\n'
+            );
+            const fileFooter = enc.encode('\r\n--' + boundary + '--\r\n');
+            const jpegBytes  = await jpegBlob.arrayBuffer();
+
+            const totalLen = questionPart.length + fileHeader.length + jpegBytes.byteLength + fileFooter.length;
+            const body = new Uint8Array(totalLen);
+            let off = 0;
+            body.set(questionPart, off); off += questionPart.length;
+            body.set(fileHeader, off);   off += fileHeader.length;
+            body.set(new Uint8Array(jpegBytes), off); off += jpegBytes.byteLength;
+            body.set(fileFooter, off);
+
+            const resp = await fetch('/api/vision/explain', {
+              method: 'POST',
+              headers: {
+                'Content-Type':   `multipart/form-data; boundary=${boundary}`,
+                'X-Vision-Url':   VisionCapability.getUrl(),
+                'X-Vision-Token': VisionCapability.getToken(),
+                'X-Device-Id':    SettingsManager.get('deviceId'),
+                'X-Client-Id':    SettingsManager.get('clientId'),
+              },
+              body: body.buffer,
+            });
+
+            const rawBody = await resp.text();
+            Logger.vision(`take_photo HTTP ${resp.status}, body: ${rawBody.slice(0, 200)}`);
+
+            // Extract the description text (response may be JSON or plain text)
+            let visionText = rawBody.trim();
+            try {
+              const parsed = JSON.parse(rawBody);
+              if (parsed && typeof parsed.text === 'string' && parsed.text.trim()) {
+                visionText = parsed.text.trim();
+              }
+            } catch (_e) { /* plain text — use as-is */ }
+
+            if (!resp.ok) {
+              // Vision HTTP error — send isError result back to server
+              const errResp = {
+                session_id: sessionId,
+                type: 'mcp',
+                payload: {
+                  jsonrpc: '2.0',
+                  id: toolId,
+                  result: {
+                    content: [{ type: 'text', text: `Vision upload failed (HTTP ${resp.status}): ${visionText}` }],
+                    isError: true
+                  }
+                }
+              };
+              sendText(errResp);
+              Logger.mcp(`→ tools/call take_photo: HTTP ${resp.status} error sent to server`);
+              return;
+            }
+
+            // ── Replicate McpTool::Call() result wrapping ─────────────────
+            // mcp_server.h lines 285–305: wraps std::string return value as
+            //   { content:[{type:"text",text:"..."}], isError:false }
+            // then McpServer::ReplyResult() wraps in jsonrpc 2.0 result
+            // then Protocol::SendMcpMessage() adds session_id + type:"mcp"
+            // ─────────────────────────────────────────────────────────────
+            const mcpResult = {
+              session_id: sessionId,
+              type: 'mcp',
+              payload: {
+                jsonrpc: '2.0',
+                id: toolId,
+                result: {
+                  content: [{ type: 'text', text: visionText }],
+                  isError: false
+                }
+              }
+            };
+            sendText(mcpResult);
+            Logger.mcp(`→ tools/call take_photo: MCP result sent to server (${visionText.length} chars)`);
+            Logger.vision(`Vision description delivered to LLM via MCP tool result: "${visionText.slice(0, 100)}..."`);
+
+            // ── Local UI update (mirrors firmware display behavior) ────────
+            // The firmware calls display->SetChatMessage("assistant", text) for
+            // sentence_start events.  We render the vision description into the
+            // chat immediately so the user sees it before server TTS arrives.
+            // We do NOT call finalizeAIResponse() here — the server will send
+            // proper tts/sentence_start events once the LLM uses the tool result.
+            UIController.hideTypingIndicator();
+            beginAIResponse(null);
+            appendAIResponseSentence(visionText);
+            finalizeAIResponse();
+
+          } catch (err) {
+            Logger.error('take_photo tool execution failed', err.message);
+            // Send error result back to server so LLM knows something went wrong
+            const errResp = {
+              session_id: sessionId,
+              type: 'mcp',
+              payload: {
+                jsonrpc: '2.0',
+                id: toolId,
+                result: {
+                  content: [{ type: 'text', text: `Vision error: ${err.message}` }],
+                  isError: true
+                }
+              }
+            };
+            sendText(errResp);
+            Logger.mcp('→ tools/call take_photo: exception result sent to server');
+          }
+        })();
+
+      } else {
+        // Unknown tool — reply with JSON-RPC error (unchanged behavior for other tools)
+        const response = {
+          session_id: sessionId,
+          type: 'mcp',
+          payload: {
+            jsonrpc: '2.0',
+            id: toolId,
+            error: {
+              code: -32601,
+              message: 'Tool not found on virtual device'
+            }
+          }
+        };
+        sendText(response);
+        Logger.mcp(`→ MCP tools/call error (tool: ${toolName})`, null);
+      }
     }
   }
 
@@ -1918,6 +2199,8 @@ const ChatEngine = (() => {
       status: options.status || 'sent',
       emotion: options.emotion || null,
       grouped: false,
+      imageThumb: options.imageThumb || null,   // data URL for thumbnail
+      imageName:  options.imageName  || null,   // filename for alt text
     };
 
     messages.push(msg);
@@ -2048,8 +2331,170 @@ const ChatEngine = (() => {
     return false;
   }
 
+  /**
+   * Send an image + optional text question to Xiaozhi Vision.
+   *
+   * ══════════════════════════════════════════════════════════
+   * PROTOCOL (reverse-engineered from Esp32Camera::Explain()
+   * in xiaozhi-esp32/main/boards/common/esp32_camera.cc)
+   * ══════════════════════════════════════════════════════════
+   *
+   * The official firmware:
+   *   1. Gets vision URL + token from MCP initialize capabilities
+   *      (capabilities.vision.url / capabilities.vision.token)
+   *   2. POSTs multipart/form-data to that URL with:
+   *        --<boundary>
+   *        Content-Disposition: form-data; name="question"
+   *
+   *        <text question>
+   *        --<boundary>
+   *        Content-Disposition: form-data; name="file"; filename="camera.jpg"
+   *        Content-Type: image/jpeg
+   *
+   *        <jpeg bytes>
+   *        --<boundary>--
+   *   3. Request headers: Authorization: Bearer <token>, Device-Id, Client-Id
+   *   4. Response: plain text AI description
+   *   5. Description is then used as context for the LLM (sent via listen{detect})
+   *
+   * IMPORTANT NOTES:
+   *   - The server sends the URL as http:// but it's an https:// endpoint.
+   *     The Hono proxy normalises http:// → https:// when forwarding.
+   *   - The "Vision URL host is not allowed" error was caused by the proxy
+   *     rejecting http:// URLs. This is now fixed in src/index.tsx.
+   *   - Upload is NOT through WebSocket — it's a separate HTTP request.
+   *   - Upload is NOT through MCP tool calls.
+   *   - The image is NOT base64 — it's raw binary JPEG in multipart form.
+   *   - There is no signed URL pre-step — direct POST to vision endpoint.
+   *
+   * @param {File|Blob} imageFile - The image to analyze
+   * @param {string} [promptText] - Optional user question
+   * @param {string} [displayName] - Filename for display in chat bubble
+   * @param {string} [dataUrl] - Data URL for thumbnail display in chat bubble
+   */
+  async function sendImageMessage(imageFile, promptText, displayName, dataUrl) {
+    if (!ProtocolClient.isConnected()) {
+      Logger.warn('Cannot send image: not connected');
+      showToast('Not connected to server', 'error');
+      return false;
+    }
+
+    const question = (promptText && promptText.trim()) || 'Please describe this image.';
+    const filename  = displayName || 'photo.jpg';
+
+    // ── VERBOSE VISION LOGGING ──────────────────────────────────────
+    Logger.chat('=== VISION IMAGE SEND START ===');
+    Logger.chat(`Question: "${question}"`);
+    Logger.chat(`Filename: ${filename}`);
+    Logger.chat(`Image size: ${Math.round(imageFile.size / 1024)} KB (${imageFile.size} bytes)`);
+    Logger.chat(`Image type: ${imageFile.type}`);
+    Logger.chat(`Vision capability available: ${VisionCapability.isAvailable()}`);
+    Logger.chat(`Vision URL: ${VisionCapability.getUrl() || '(not set)'}`);
+    Logger.chat(`Vision token: ${VisionCapability.getToken() ? ('...' + VisionCapability.getToken().slice(-8)) : '(none)'}`);
+
+    // Show user message with thumbnail immediately
+    const userMsgText = question;
+    pendingUserMessage = userMsgText;
+    addMessage('user', userMsgText, { imageThumb: dataUrl, imageName: filename });
+    conversationCount++;
+
+    UIController.showTypingIndicator('Sending to AI...');
+
+    if (!VisionCapability.isAvailable()) {
+      Logger.warn('Vision URL not available — server has not advertised vision capability yet');
+      Logger.warn('Make sure you are connected and the server sent an MCP initialize with vision capabilities');
+      UIController.hideTypingIndicator();
+      showToast('Vision not available. Connect to server first.', 'error');
+      return false;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // OFFICIAL FIRMWARE FLOW — User-initiated image send
+    // ══════════════════════════════════════════════════════════════════════
+    //
+    // Reference: mcp_server.cc + protocol.cc + application.cc
+    //
+    // The official ESP32 firmware does NOT upload images on user initiative.
+    // It NEVER directly calls Explain() from user-space.
+    //
+    // The correct flow is:
+    //   1. Device advertises self.camera.take_photo in tools/list response.
+    //      (McpServer::AddCommonTools(), mcp_server.cc lines 100–121)
+    //
+    //   2. The server decides WHEN to call the tool based on LLM reasoning.
+    //      It sends: {"type":"mcp","payload":{"method":"tools/call",...}}
+    //
+    //   3. The device executes Capture() + Explain(), wraps result in
+    //      JSON-RPC result, sends back via Protocol::SendMcpMessage()
+    //      → {"type":"mcp","payload":{"result":{...}}}
+    //
+    //   4. The server injects the tool result into the LLM conversation
+    //      and generates the TTS response.
+    //
+    // Therefore, when the user attaches an image and clicks Send, we:
+    //   1. Keep the blob in ImageInput (getPendingBlob() returns it).
+    //   2. Send the user's question via listen{detect} — this triggers
+    //      the LLM to decide it needs vision and calls self.camera.take_photo.
+    //   3. The tools/call handler (handleMCP → tools/call branch above)
+    //      picks up the blob, uploads it, and sends the MCP result back.
+    //   4. The server feeds the result to the LLM and sends TTS events.
+    //
+    // The blob must REMAIN in ImageInput until the tools/call arrives.
+    // clearAttachment() is called AFTER the tool call completes or on error.
+    // ══════════════════════════════════════════════════════════════════════
+
+    Logger.vision('Image attached — sending question via listen{detect} to trigger tools/call');
+    Logger.vision(`Question: "${question}" | Blob size: ${imageFile.size} bytes`);
+
+    // The blob is already stored in ImageInput.pendingAttachment by the time
+    // this function is called (handleSendClick calls ImageInput.clearAttachment()
+    // after calling sendImageMessage — we need the blob to persist until tools/call).
+    // We keep the reference alive by re-storing it here just in case.
+    // (ImageInput.clearAttachment was NOT called yet at this point because
+    //  handleSendClick calls it before sendImageMessage — but we have imageFile.)
+    //
+    // We store the blob back so getPendingBlob() can access it during tools/call.
+    // This is safe because handleSendClick already cleared the UI attachment bar.
+    ImageInput._storePendingBlobForToolCall(imageFile);
+
+    // Send the question text via the standard text channel.
+    // The LLM will recognize it has vision capability (from tools/list) and
+    // issue a tools/call for self.camera.take_photo.
+    ProtocolClient.sendListenDetect(question.slice(0, 80));
+
+    return true;
+  }
+
+  /**
+   * Convert any image Blob to a JPEG Blob using an offscreen canvas.
+   */
+  async function convertToJpeg(blob) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const canvas = document.createElement('canvas');
+        canvas.width  = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob(jpegBlob => {
+          if (jpegBlob) resolve(jpegBlob);
+          else reject(new Error('Canvas toBlob failed'));
+        }, 'image/jpeg', 0.85);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Failed to load image for conversion'));
+      };
+      img.src = url;
+    });
+  }
+
   return {
     sendTextMessage,
+    sendImageMessage,
     startVoiceInput,
     stopVoiceInput,
     addMessage,
@@ -2117,6 +2562,9 @@ const UIController = (() => {
     el('micBtn').addEventListener('mouseup', handleMicMouseUp);
     el('micBtn').addEventListener('touchstart', handleMicMouseDown, { passive: true });
     el('micBtn').addEventListener('touchend', handleMicMouseUp, { passive: true });
+
+    // Image / Plus button
+    ImageInput.init();
 
     // Mobile sidebar toggle
     el('sidebarToggleMobile').addEventListener('click', () => {
@@ -2252,7 +2700,11 @@ const UIController = (() => {
   function handleSendClick() {
     const input = el('messageInput');
     const text = input.value.trim();
-    if (!text) return;
+
+    // Check if there's a pending image attachment
+    const attachment = ImageInput.getAttachment();
+
+    if (!attachment && !text) return;
 
     input.value = '';
     input.style.height = 'auto';
@@ -2262,7 +2714,18 @@ const UIController = (() => {
     // BUG #4 FIX: Close mobile sidebar when user sends a message
     closeMobileSidebar();
 
-    ChatEngine.sendTextMessage(text);
+    // Close plus popup if open
+    ImageInput.closePopup();
+
+    if (attachment) {
+      // Image message: upload via vision API, then send text prompt
+      const promptText = text || 'Please describe this image.';
+      ImageInput.clearAttachment();  // Remove the preview bar
+      ChatEngine.sendImageMessage(attachment.blob, promptText, attachment.name, attachment.dataUrl);
+    } else {
+      // Text-only message — unchanged behavior
+      ChatEngine.sendTextMessage(text);
+    }
   }
 
   function switchTab(tab) {
@@ -2572,7 +3035,7 @@ const UIController = (() => {
     }
 
     msgEl.id = msg.id;
-    msgEl.className = `message ${isOutgoing ? 'outgoing' : 'incoming'}`;
+    msgEl.className = `message ${isOutgoing ? 'outgoing' : 'incoming'}${msg.imageThumb ? ' has-image' : ''}`;
 
     const isGrouped = prevSender === msg.sender;
     if (isGrouped) {
@@ -2587,10 +3050,27 @@ const UIController = (() => {
 
     const timeStr = msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+    // Build image thumbnail HTML for messages that include an image
+    let imageHtml = '';
+    if (msg.imageThumb) {
+      imageHtml = `
+        <div class="message-image-thumb">
+          <img src="${escapeHtml(msg.imageThumb)}" alt="${escapeHtml(msg.imageName || 'image')}" />
+        </div>
+      `;
+    }
+
+    // When an image thumbnail is present, wrap the caption text in its own
+    // element so the bubble can shrink-wrap the image while still applying
+    // proper padding around any accompanying caption text.
+    const textHtml = msg.imageThumb
+      ? (msg.text ? `<div class="message-caption-text">${escapeHtml(msg.text)}</div>` : '')
+      : escapeHtml(msg.text);
+
     msgEl.innerHTML = `
       ${avatar}
       <div class="message-content">
-        <div class="message-bubble">${escapeHtml(msg.text)}</div>
+        <div class="message-bubble">${imageHtml}${textHtml}</div>
         <div class="message-meta">
           <span class="message-time">${timeStr}</span>
           ${isOutgoing ? '<span class="message-status"><i class="fas fa-check-double"></i></span>' : ''}
@@ -2796,6 +3276,354 @@ function showToast(message, type = 'info', title = null, duration = 4000) {
     setTimeout(() => toast.remove(), 300);
   }, duration);
 }
+
+// ================================================================
+// MODULE: ImageInput
+// Manages the + button, camera, photo gallery, and image attachment.
+//
+// Architecture mirrors the official Esp32Camera firmware:
+//   1. User selects image (camera or gallery)
+//   2. Image is previewed — NOT sent yet
+//   3. User optionally types a question
+//   4. On Send: ImageFile + question → ChatEngine.sendImageMessage()
+//      which POSTs multipart to /api/vision/explain (proxy)
+//      parses the JSON response, extracts the .text field,
+//      builds a single conversational prompt, and sends it via
+//      the standard sendTextMessage chunked-detect path
+// ================================================================
+const ImageInput = (() => {
+
+  // ── State ────────────────────────────────────────────────────────
+  let pendingAttachment = null;  // { blob, name, dataUrl }
+  let cameraStream      = null;
+  let facingMode        = 'environment';  // 'user' = front, 'environment' = rear
+
+  // ── Helper ───────────────────────────────────────────────────────
+  function el(id) { return document.getElementById(id); }
+
+  // ── Init — wire up all DOM events ────────────────────────────────
+  function init() {
+    const plusBtn          = el('plusBtn');
+    const plusPopup        = el('plusPopup');
+    const menuCameraBtn    = el('menuCameraBtn');
+    const menuPhotosBtn    = el('menuPhotosBtn');
+    const galleryFileInput = el('galleryFileInput');
+    const attachRemoveBtn  = el('attachmentRemoveBtn');
+    const cameraCaptureBtn = el('cameraCaptureBtn');
+    const cameraRetakeBtn  = el('cameraRetakeBtn');
+    const cameraUsephotoBtn = el('cameraUsephotoBtn');
+    const cameraSwitchBtn  = el('cameraSwitchBtn');
+    const cameraCloseBtn   = el('cameraCloseBtn');
+    const cameraModalOverlay = el('cameraModalOverlay');
+
+    if (!plusBtn) return;  // Elements not in DOM yet — skip
+
+    // ── Plus button toggles popup ──────────────────────────────────
+    plusBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const popup = el('plusPopup');
+      const isOpen = popup.style.display !== 'none';
+      if (isOpen) closePopup();
+      else openPopup();
+    });
+
+    // ── Close popup when clicking outside ─────────────────────────
+    document.addEventListener('click', (e) => {
+      const wrapper = el('plusBtnWrapper');
+      if (wrapper && !wrapper.contains(e.target)) {
+        closePopup();
+      }
+    });
+
+    // ── Camera option ─────────────────────────────────────────────
+    if (menuCameraBtn) {
+      menuCameraBtn.addEventListener('click', () => {
+        closePopup();
+        openCamera();
+      });
+    }
+
+    // ── Photos / Gallery option ───────────────────────────────────
+    if (menuPhotosBtn) {
+      menuPhotosBtn.addEventListener('click', () => {
+        closePopup();
+        galleryFileInput && galleryFileInput.click();
+      });
+    }
+
+    // ── Gallery file selected ─────────────────────────────────────
+    if (galleryFileInput) {
+      galleryFileInput.addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        galleryFileInput.value = '';  // Reset so same file can be re-selected
+        setAttachmentFromFile(file);
+      });
+    }
+
+    // ── Remove attachment ─────────────────────────────────────────
+    if (attachRemoveBtn) {
+      attachRemoveBtn.addEventListener('click', () => {
+        clearAttachment();
+      });
+    }
+
+    // ── Camera: Capture button ────────────────────────────────────
+    if (cameraCaptureBtn) {
+      cameraCaptureBtn.addEventListener('click', capturePhoto);
+    }
+
+    // ── Camera: Retake ────────────────────────────────────────────
+    if (cameraRetakeBtn) {
+      cameraRetakeBtn.addEventListener('click', () => {
+        showCameraViewfinder();
+      });
+    }
+
+    // ── Camera: Use photo ─────────────────────────────────────────
+    if (cameraUsephotoBtn) {
+      cameraUsephotoBtn.addEventListener('click', () => {
+        useCapturedPhoto();
+      });
+    }
+
+    // ── Camera: Switch front/rear ─────────────────────────────────
+    if (cameraSwitchBtn) {
+      cameraSwitchBtn.addEventListener('click', () => {
+        facingMode = (facingMode === 'environment') ? 'user' : 'environment';
+        restartCamera();
+      });
+    }
+
+    // ── Camera: Close modal ───────────────────────────────────────
+    if (cameraCloseBtn) {
+      cameraCloseBtn.addEventListener('click', closeCamera);
+    }
+    if (cameraModalOverlay) {
+      cameraModalOverlay.addEventListener('click', closeCamera);
+    }
+  }
+
+  // ── Plus popup ───────────────────────────────────────────────────
+  function openPopup() {
+    const popup = el('plusPopup');
+    if (popup) popup.style.display = 'block';
+  }
+
+  function closePopup() {
+    const popup = el('plusPopup');
+    if (popup) popup.style.display = 'none';
+  }
+
+  // ── Image attachment ─────────────────────────────────────────────
+  /**
+   * Show the attachment preview bar above the text input.
+   * @param {Blob}   blob    - The image blob
+   * @param {string} name    - Display filename
+   * @param {string} dataUrl - Data URL for <img> thumbnail
+   */
+  function setAttachment(blob, name, dataUrl) {
+    pendingAttachment = { blob, name, dataUrl };
+
+    const bar       = el('imageAttachmentBar');
+    const thumb     = el('attachmentThumb');
+    const nameEl    = el('attachmentName');
+
+    if (bar)    bar.style.display    = 'block';
+    if (thumb)  thumb.src            = dataUrl;
+    if (nameEl) nameEl.textContent   = name;
+  }
+
+  function clearAttachment() {
+    pendingAttachment = null;
+
+    const bar = el('imageAttachmentBar');
+    if (bar) bar.style.display = 'none';
+
+    const thumb  = el('attachmentThumb');
+    const nameEl = el('attachmentName');
+    if (thumb)  thumb.src          = '';
+    if (nameEl) nameEl.textContent = '';
+  }
+
+  function getAttachment() {
+    return pendingAttachment;
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────
+  function setAttachmentFromFile(file) {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      setAttachment(file, file.name || 'photo.jpg', ev.target.result);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // ── Camera ───────────────────────────────────────────────────────
+  async function openCamera() {
+    const modal = el('cameraModal');
+    if (!modal) return;
+
+    modal.style.display = 'flex';
+    showCameraViewfinder();
+    await startCamera();
+  }
+
+  async function startCamera() {
+    try {
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(t => t.stop());
+        cameraStream = null;
+      }
+
+      const constraints = {
+        video: {
+          facingMode,
+          width:  { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      };
+
+      cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
+      const video = el('cameraVideo');
+      if (video) {
+        video.srcObject = cameraStream;
+      }
+
+      // Show switch button only if multiple cameras available
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cameras = devices.filter(d => d.kind === 'videoinput');
+        const switchBtn = el('cameraSwitchBtn');
+        if (switchBtn) {
+          switchBtn.style.display = cameras.length > 1 ? 'flex' : 'none';
+        }
+      } catch { /* ignore */ }
+
+    } catch (err) {
+      Logger.error('Camera access failed', err.message);
+      closeCamera();
+      showToast('Camera access denied or unavailable.', 'error');
+    }
+  }
+
+  async function restartCamera() {
+    await startCamera();
+  }
+
+  function closeCamera() {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(t => t.stop());
+      cameraStream = null;
+    }
+
+    const video = el('cameraVideo');
+    if (video) {
+      video.srcObject = null;
+    }
+
+    const modal = el('cameraModal');
+    if (modal) modal.style.display = 'none';
+
+    showCameraViewfinder();  // Reset to viewfinder for next time
+  }
+
+  function capturePhoto() {
+    const video  = el('cameraVideo');
+    const canvas = el('cameraCanvas');
+    if (!video || !canvas) return;
+
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+
+    // Show preview
+    const previewImg = el('cameraPreviewImg');
+    if (previewImg) previewImg.src = dataUrl;
+
+    showCameraPreview();
+  }
+
+  function useCapturedPhoto() {
+    const canvas = el('cameraCanvas');
+    if (!canvas) { closeCamera(); return; }
+
+    canvas.toBlob((blob) => {
+      if (!blob) { closeCamera(); return; }
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+      setAttachment(blob, 'Camera Photo.jpg', dataUrl);
+      closeCamera();
+    }, 'image/jpeg', 0.9);
+  }
+
+  function showCameraViewfinder() {
+    const viewfinder = el('cameraViewfinder');
+    const preview    = el('cameraPreview');
+    if (viewfinder) viewfinder.style.display = 'flex';
+    if (preview)    preview.style.display    = 'none';
+  }
+
+  function showCameraPreview() {
+    const viewfinder = el('cameraViewfinder');
+    const preview    = el('cameraPreview');
+    if (viewfinder) viewfinder.style.display = 'none';
+    if (preview)    preview.style.display    = 'flex';
+  }
+
+  /**
+   * Return just the pending blob (used by the MCP tools/call handler to fetch
+   * the image the user has attached but not yet sent).
+   * Returns null if no image is attached.
+   *
+   * Official firmware reference: mcp_server.cc line 115 — camera->Capture()
+   * is called synchronously before Explain().  In the browser the user has
+   * already "captured" by selecting from camera/gallery, so the blob is the
+   * equivalent of a captured camera frame.
+   */
+  function getPendingBlob() {
+    return pendingAttachment ? pendingAttachment.blob : null;
+  }
+
+  /**
+   * Store a blob reference for use by the MCP tools/call handler.
+   * Called by ChatEngine.sendImageMessage() after the UI attachment has
+   * already been cleared (the user clicked Send).
+   *
+   * The blob must remain available until the server issues a tools/call
+   * for self.camera.take_photo.  This function keeps it alive without
+   * re-showing the attachment bar UI.
+   *
+   * Official firmware reference: Esp32Camera maintains current_fb_ (the
+   * captured frame buffer) as a member variable, keeping it alive between
+   * Capture() and Explain().  This mirrors that pattern in browser-land.
+   */
+  function _storePendingBlobForToolCall(blob) {
+    if (blob) {
+      // Preserve any existing name/dataUrl but update the blob
+      if (pendingAttachment) {
+        pendingAttachment.blob = blob;
+      } else {
+        pendingAttachment = { blob, name: 'photo.jpg', dataUrl: null };
+      }
+      Logger.vision(`Blob stored for tools/call: ${blob.size} bytes`);
+    }
+  }
+
+  return {
+    init,
+    openPopup,
+    closePopup,
+    getAttachment,
+    clearAttachment,
+    getPendingBlob,
+    _storePendingBlobForToolCall,
+  };
+})();
 
 // ================================================================
 // MODULE: AppController

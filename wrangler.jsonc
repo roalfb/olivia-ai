@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "olivia-ai",
+  "name": "webapp",
   "compatibility_date": "2026-04-26",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
