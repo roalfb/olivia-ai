@@ -5,7 +5,7 @@
 <br/>
 <br/>
 
-# Olivia
+# O.L.I.V.I.A.
 
 ### Virtual ESP32 Device for Xiaozhi AI
 
