@@ -198,133 +198,794 @@ const Logger = (() => {
 })();
 
 // ================================================================
-// MODULE: Settings Manager
-// Persistent settings via localStorage
+// MODULE: AvatarStorage                                   [PHASE 4]
+// ----------------------------------------------------------------
+// Clean storage abstraction for assistant avatars.
+// Currently implemented with localStorage (base64 data URLs).
+// The interface is designed to be swapped out for Cloudflare R2
+// in Phase 5 without changing any UI code.
+//
+// API surface:
+//   AvatarStorage.save(assistantId, dataUrl) → void
+//   AvatarStorage.load(assistantId)          → dataUrl | null
+//   AvatarStorage.remove(assistantId)        → void
+//
+// Safety guarantee: ALL methods are wrapped in try/catch so avatar
+// failures can NEVER prevent Olivia from booting.
 // ================================================================
-const SettingsManager = (() => {
-  const STORAGE_KEY = 'xiaozhi_web_client_settings';
+const AvatarStorage = (() => {
+  const KEY_PREFIX = 'olivia_avatar_v1_';
 
-  const DEFAULTS = {
-    wsUrl:            'wss://api.xiaozhi.me/xiaozhi/v1/',
-    otaUrl:           'https://api.tenclass.net/xiaozhi/ota/',
-    token:            '',       // Populated by OTA provisioning, not user-entered
-    paired:           false,
-    deviceName:       'My Virtual ESP32',
-    deviceId:         '',       // Auto-generated on first use
-    clientId:         '',       // Auto-generated UUID on first use
-    protocolVersion:  1,
-    frameDuration:    60,       // ms
-    listeningMode:    'auto',
-    audioEnabled:     true,
-    ttsPlayback:      true,
-  };
+  function key(assistantId) {
+    return KEY_PREFIX + assistantId;
+  }
 
-  let settings = Object.assign({}, DEFAULTS);
-
-  function load() {
+  /** Save a data-URL avatar for an assistant. */
+  function save(assistantId, dataUrl) {
     try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        settings = Object.assign({}, DEFAULTS, parsed);
-      }
+      if (!assistantId || !dataUrl) return;
+      localStorage.setItem(key(assistantId), dataUrl);
     } catch (e) {
-      Logger.warn('Failed to load settings from localStorage', e.message);
+      Logger.warn('[AvatarStorage] save failed', e.message);
     }
+  }
 
-    // Auto-generate device ID (MAC-style: xx:xx:xx:xx:xx:xx)
-    if (!settings.deviceId) {
-      settings.deviceId = generateMacAddress();
-      save();
-    } else {
-      // Normalize existing deviceId to lowercase.
-      // CRITICAL: The Xiaozhi server authenticates Device-Id case-sensitively.
-      // The firmware always sends lowercase (uses %02x in snprintf).
-      // Old versions of this app saved UPPERCASE MACs — normalize them now.
-      const normalized = normalizeMacAddress(settings.deviceId);
-      if (normalized !== settings.deviceId) {
-        Logger.boot('Normalizing Device-Id to lowercase (firmware format)', normalized);
-        settings.deviceId = normalized;
-        // Also clear pairing state — the old uppercase ID was never accepted by the WS server,
-        // so any "paired" state from it is invalid. Force re-provision with the correct lowercase ID.
-        settings.paired = false;
-        settings.token = '';
-        save();
+  /** Load a data-URL avatar for an assistant. Returns null if not set. */
+  function load(assistantId) {
+    try {
+      if (!assistantId) return null;
+      return localStorage.getItem(key(assistantId)) || null;
+    } catch (e) {
+      Logger.warn('[AvatarStorage] load failed', e.message);
+      return null;
+    }
+  }
+
+  /** Remove an assistant's avatar from storage. */
+  function remove(assistantId) {
+    try {
+      if (!assistantId) return;
+      localStorage.removeItem(key(assistantId));
+    } catch (e) {
+      Logger.warn('[AvatarStorage] remove failed', e.message);
+    }
+  }
+
+  return { save, load, remove };
+})();
+
+// ================================================================
+// MODULE: AvatarSystem                                    [PHASE 4]
+// ----------------------------------------------------------------
+// High-level avatar management: resize + save, render everywhere,
+// open upload dialog, manage the hidden file input.
+//
+// Safety: all DOM access is guarded so avatar errors NEVER block boot.
+// ================================================================
+const AvatarSystem = (() => {
+  const DEFAULT_AVATAR = '/static/olivia-avatar-default.svg';
+  const TARGET_SIZE = 256;
+
+  /** Return cached data URL for an assistant, or null if none. */
+  function getAvatarDataUrl(assistantId) {
+    try {
+      return AvatarStorage.load(assistantId) || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Resize an image File/Blob to TARGET_SIZE x TARGET_SIZE using
+   * an off-screen canvas, then compress as JPEG.
+   * Returns a Promise<string> with the data URL.
+   */
+  function resizeImage(file) {
+    return new Promise((resolve, reject) => {
+      try {
+        const img = new Image();
+        const objectUrl = URL.createObjectURL(file);
+        img.onload = () => {
+          URL.revokeObjectURL(objectUrl);
+          const canvas = document.createElement('canvas');
+          canvas.width  = TARGET_SIZE;
+          canvas.height = TARGET_SIZE;
+          const ctx = canvas.getContext('2d');
+          // Center-crop to square, then scale
+          const size = Math.min(img.naturalWidth, img.naturalHeight);
+          const sx = (img.naturalWidth  - size) / 2;
+          const sy = (img.naturalHeight - size) / 2;
+          ctx.drawImage(img, sx, sy, size, size, 0, 0, TARGET_SIZE, TARGET_SIZE);
+          // Compress as JPEG at 85% quality
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+          resolve(dataUrl);
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          reject(new Error('Image failed to load'));
+        };
+        img.src = objectUrl;
+      } catch (e) {
+        reject(e);
       }
-    }
-
-    // Auto-generate client ID (UUID v4)
-    if (!settings.clientId) {
-      settings.clientId = generateUUID();
-      save();
-    }
-
-    Logger.boot('Settings loaded', {
-      deviceId: settings.deviceId,
-      clientId: settings.clientId,
-      wsUrl: settings.wsUrl
     });
   }
 
-  function save() {
+  /**
+   * Process a File, resize it, and save as avatar for the given assistant.
+   * Returns the data URL on success, or null on failure.
+   */
+  async function processAndSave(assistantId, file) {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      const dataUrl = await resizeImage(file);
+      AvatarStorage.save(assistantId, dataUrl);
+      Logger.info(`[AvatarSystem] Avatar saved for ${assistantId.slice(0, 8)}`);
+      return dataUrl;
     } catch (e) {
-      Logger.warn('Failed to save settings', e.message);
+      Logger.warn('[AvatarSystem] Failed to process avatar image', e.message);
+      return null;
     }
   }
 
-  function get(key) {
-    return settings[key];
+  /**
+   * Set an element's src safely.
+   * Uses the default avatar if dataUrl is falsy.
+   */
+  function setImgSrc(imgEl, dataUrl) {
+    if (!imgEl) return;
+    try {
+      imgEl.src = dataUrl || DEFAULT_AVATAR;
+    } catch (e) { /* ignore */ }
   }
 
-  function set(key, value) {
-    settings[key] = value;
-    save();
+  /**
+   * Refresh ALL avatar display locations for the active assistant:
+   * - chat header avatar
+   * - typing indicator avatar
+   * - settings panel avatar (if settings are open)
+   */
+  function refreshAllAvatarDisplays() {
+    try {
+      const activeId = AssistantManager.getActiveId();
+      const dataUrl  = getAvatarDataUrl(activeId);
+
+      setImgSrc(document.getElementById('chatHeaderAvatarImg'), dataUrl);
+      setImgSrc(document.getElementById('typingAvatarImg'), dataUrl);
+      // Settings avatar only if the settings panel is currently showing this assistant
+      // (it will be re-loaded by loadSettingsIntoForm() when opened anyway)
+    } catch (e) {
+      Logger.warn('[AvatarSystem] refreshAllAvatarDisplays error', e.message);
+    }
   }
 
-  function getAll() {
-    return Object.assign({}, settings);
+  /**
+   * Open the avatar upload dialog for a specific assistant.
+   * The hidden #avatarFileInput is used as the file picker.
+   */
+  function openUploadDialog(assistantId) {
+    try {
+      const input = document.getElementById('avatarFileInput');
+      if (!input) return;
+      // Store the target assistant id on the input element so the change
+      // handler knows who the upload is for.
+      input.dataset.targetAssistantId = assistantId;
+      input.value = '';
+      input.click();
+    } catch (e) {
+      Logger.warn('[AvatarSystem] openUploadDialog error', e.message);
+    }
   }
 
-  function reset() {
-    const genDeviceId = generateMacAddress();
-    const genClientId = generateUUID();
-    settings = Object.assign({}, DEFAULTS, { deviceId: genDeviceId, clientId: genClientId });
-    save();
+  /**
+   * Initialize: wire the hidden avatar file input to process uploads.
+   * Called once from UIController.init().
+   */
+  function init() {
+    try {
+      const input = document.getElementById('avatarFileInput');
+      if (!input) return;
+
+      input.addEventListener('change', async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const targetId = input.dataset.targetAssistantId || AssistantManager.getActiveId();
+        input.value = '';
+
+        // Show a brief loading toast
+        if (typeof showToast === 'function') showToast('Processing avatar...', 'info', null, 2000);
+
+        const dataUrl = await processAndSave(targetId, file);
+        if (!dataUrl) {
+          if (typeof showToast === 'function') showToast('Could not process image', 'error');
+          return;
+        }
+
+        // Refresh avatar in all display locations
+        refreshAllAvatarDisplays();
+
+        // Refresh sidebar list (re-renders all conv-avatars)
+        if (typeof UIController !== 'undefined') UIController.renderAssistantList();
+
+        // Refresh settings panel avatar if it's showing the same assistant
+        const settingsImg = document.getElementById('settingsAvatarImg');
+        if (settingsImg) {
+          const settingsPanel = document.getElementById('settingsPanel');
+          if (settingsPanel && settingsPanel.classList.contains('open')) {
+            // Check if settings panel is targeting this assistant
+            setImgSrc(settingsImg, dataUrl);
+          }
+        }
+
+        if (typeof showToast === 'function') showToast('Avatar updated!', 'success');
+      });
+
+      // Wire chat header avatar click
+      const chatHeaderAvatar = document.getElementById('chatHeaderAvatar');
+      if (chatHeaderAvatar) {
+        chatHeaderAvatar.addEventListener('click', () => {
+          openUploadDialog(AssistantManager.getActiveId());
+        });
+      }
+
+      // Wire settings upload button
+      const settingsUploadBtn = document.getElementById('settingsUploadAvatarBtn');
+      if (settingsUploadBtn) {
+        settingsUploadBtn.addEventListener('click', () => {
+          // Target the assistant currently shown in settings
+          const targetId = (typeof UIController !== 'undefined')
+            ? UIController.getSettingsTargetIdPublic()
+            : AssistantManager.getActiveId();
+          openUploadDialog(targetId);
+        });
+      }
+
+      // Wire settings remove button
+      const settingsRemoveBtn = document.getElementById('settingsRemoveAvatarBtn');
+      if (settingsRemoveBtn) {
+        settingsRemoveBtn.addEventListener('click', () => {
+          const targetId = (typeof UIController !== 'undefined')
+            ? UIController.getSettingsTargetIdPublic()
+            : AssistantManager.getActiveId();
+          AvatarStorage.remove(targetId);
+          const settingsImg = document.getElementById('settingsAvatarImg');
+          setImgSrc(settingsImg, null);
+          refreshAllAvatarDisplays();
+          if (typeof UIController !== 'undefined') UIController.renderAssistantList();
+          if (typeof showToast === 'function') showToast('Avatar removed', 'info');
+        });
+      }
+
+      Logger.boot('[AvatarSystem] Initialized');
+    } catch (e) {
+      // CRITICAL: avatar init MUST NOT prevent boot
+      Logger.warn('[AvatarSystem] init error (non-fatal)', e.message);
+    }
   }
 
-  function clearPairing() {
-    settings.token = '';
-    settings.paired = false;
-    save();
+  /**
+   * Load avatar into the settings panel for the given assistant.
+   * Called from UIController.loadSettingsIntoForm().
+   */
+  function loadSettingsAvatar(assistantId) {
+    try {
+      const dataUrl = getAvatarDataUrl(assistantId);
+      const settingsImg = document.getElementById('settingsAvatarImg');
+      setImgSrc(settingsImg, dataUrl);
+    } catch (e) {
+      Logger.warn('[AvatarSystem] loadSettingsAvatar error', e.message);
+    }
   }
 
-  function isPaired() {
-    return settings.paired === true && !!settings.token;
+  return {
+    init,
+    getAvatarDataUrl,
+    openUploadDialog,
+    processAndSave,
+    refreshAllAvatarDisplays,
+    loadSettingsAvatar,
+    DEFAULT_AVATAR,
+  };
+})();
+
+// ================================================================
+// MODULE: VolumeStorage                                   [OLIVIA FEATURE]
+// ----------------------------------------------------------------
+// Clean storage abstraction for per-assistant local speech volume.
+// Mirrors AvatarStorage exactly: one localStorage entry per assistant,
+// every method guarded so a storage failure can NEVER block boot or
+// break chat. Stores a single float 0.0–1.0.
+//
+// API surface:
+//   VolumeStorage.save(assistantId, volume)   → void
+//   VolumeStorage.load(assistantId)           → volume (0..1) | null
+//   VolumeStorage.remove(assistantId)         → void
+// ================================================================
+const VolumeStorage = (() => {
+  const KEY_PREFIX = 'olivia_volume_v1_';
+
+  function key(assistantId) {
+    return KEY_PREFIX + assistantId;
   }
 
+  /** Save this assistant's local playback volume (0.0 - 1.0). */
+  function save(assistantId, volume) {
+    try {
+      if (!assistantId) return;
+      const clamped = Math.max(0, Math.min(1, Number(volume)));
+      localStorage.setItem(key(assistantId), String(clamped));
+    } catch (e) {
+      Logger.warn('[VolumeStorage] save failed', e.message);
+    }
+  }
+
+  /** Load this assistant's saved volume. Returns null if never set
+   *  (caller should fall back to the 100% default). */
+  function load(assistantId) {
+    try {
+      if (!assistantId) return null;
+      const raw = localStorage.getItem(key(assistantId));
+      if (raw === null) return null;
+      const v = parseFloat(raw);
+      return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : null;
+    } catch (e) {
+      Logger.warn('[VolumeStorage] load failed', e.message);
+      return null;
+    }
+  }
+
+  /** Remove a saved volume (called when an assistant is deleted). */
+  function remove(assistantId) {
+    try {
+      if (!assistantId) return;
+      localStorage.removeItem(key(assistantId));
+    } catch (e) {
+      Logger.warn('[VolumeStorage] remove failed', e.message);
+    }
+  }
+
+  return { save, load, remove };
+})();
+
+// ================================================================
+// MODULE: VolumeSystem                                    [OLIVIA FEATURE]
+// ----------------------------------------------------------------
+// PER-ASSISTANT SPEECH VOLUME — local Olivia playback only.
+//
+// This module NEVER touches the Xiaozhi WebSocket protocol, ProtocolClient,
+// AssistantManager's persisted schema, SessionManager, pairing, or
+// provisioning. It is a self-contained add-on, structured exactly like
+// AvatarSystem/AvatarStorage above:
+//
+//   VolumeStorage (localStorage layer)  →  VolumeSystem (UI + logic layer)
+//     ├─ wires the Speaker button + floating slider popup in the chat header
+//     ├─ persists per-assistant volume, restores it on assistant switch
+//     ├─ applies volume LIVE to AudioEngine's shared TTS gain node — but,
+//     |    exactly like AudioEngine's mic capture / TTS queue elsewhere in
+//     |    this codebase, ONLY for the assistant currently on screen (a
+//     |    single shared speaker is a hardware resource, not per-session)
+//     ├─ parses natural-language volume commands ("lower your volume",
+//     |    "set your volume to 60%", "mute yourself", ...) and, if matched,
+//     |    intercepts them BEFORE ChatEngine.sendTextMessage() so Xiaozhi
+//     |    never sees them — see tryHandleLocalCommand(), called from
+//     |    UIController.handleSendClick()
+//     └─ exposes handleClientAction() as a clean, NOT-YET-WIRED extension
+//          point for a future structured `{"type":"client_action",
+//          "action":"set_volume","value":0.4}` message arriving from
+//          Xiaozhi over the EXISTING, unmodified 'custom' message type
+//          (see ProtocolClient's onCustom callback) — see HANDOFF.md.
+//
+// Safety: every public entry point is wrapped so a volume-feature bug
+// can NEVER prevent Olivia from booting, connecting, or chatting.
+// ================================================================
+const VolumeSystem = (() => {
+  const DEFAULT_VOLUME = 1.0;      // 100% — the spec's required default
+  const STEP = 0.15;               // relative step for "louder"/"quieter" style commands
+
+  // In-memory only (NOT persisted): remembers the volume an assistant had
+  // right before "mute yourself" so "unmute" can restore it. Deliberately
+  // not persisted — if the page reloads while muted, unmute falls back to
+  // the saved/default volume, which is a safe, simple behaviour to document
+  // in HANDOFF.md rather than growing the storage schema for an edge case.
+  const preMuteVolumes = {};
+
+  /** This assistant's effective volume: saved value, or 100% default. */
+  function getVolume(assistantId) {
+    const v = VolumeStorage.load(assistantId);
+    return v === null ? DEFAULT_VOLUME : v;
+  }
+
+  function el(id) { return document.getElementById(id); }
+
+  function iconClassFor(volume) {
+    if (volume <= 0) return 'fas fa-volume-xmark';
+    if (volume < 0.5) return 'fas fa-volume-low';
+    return 'fas fa-volume-high';
+  }
+
+  /** Paint the slider/label/header icon to match a volume (0..1). Purely
+   *  cosmetic — never touches storage or AudioEngine itself. */
+  function paintUI(volume) {
+    try {
+      const pct = Math.round(volume * 100);
+      const slider = el('volumeSlider');
+      const label  = el('volumeSliderLabel');
+      const icon   = el('speakerBtnIcon');
+      if (slider) slider.value = String(pct);
+      if (label) label.textContent = pct + '%';
+      if (icon) icon.className = iconClassFor(volume);
+    } catch (e) {
+      Logger.warn('[VolumeSystem] paintUI error (non-fatal)', e.message);
+    }
+  }
+
+  /**
+   * Set an assistant's local playback volume. Always persists. Only
+   * applies to the live AudioEngine gain node + repaints the UI when
+   * `assistantId` is the assistant currently on screen — matches the
+   * existing rule elsewhere in this app that the shared speaker/mic
+   * hardware resources are gated by "is this the active assistant?".
+   */
+  function setVolume(assistantId, volume, opts = {}) {
+    const clamped = Math.max(0, Math.min(1, Number(volume) || 0));
+    VolumeStorage.save(assistantId, clamped);
+    if (assistantId === AssistantManager.getActiveId()) {
+      AudioEngine.setVolume(clamped);
+      if (opts.paint !== false) paintUI(clamped);
+    }
+    return clamped;
+  }
+
+  /** Re-sync the slider/icon + live gain node for whichever assistant is
+   *  NOW active. Call this after every assistant switch — mirrors
+   *  AvatarSystem.refreshAllAvatarDisplays(). Safe / non-fatal on error. */
+  function refreshActiveVolume() {
+    try {
+      const activeId = AssistantManager.getActiveId();
+      if (!activeId) return;
+      const volume = getVolume(activeId);
+      AudioEngine.setVolume(volume);
+      paintUI(volume);
+    } catch (e) {
+      Logger.warn('[VolumeSystem] refreshActiveVolume error (non-fatal)', e.message);
+    }
+  }
+
+  // ── Floating popup open/close ───────────────────────────────────────
+  function openPopup() {
+    const popup = el('volumePopup');
+    if (popup) popup.style.display = 'block';
+  }
+  function closePopup() {
+    const popup = el('volumePopup');
+    if (popup) popup.style.display = 'none';
+  }
+  function isPopupOpen() {
+    const popup = el('volumePopup');
+    return !!popup && popup.style.display !== 'none';
+  }
+
+  /**
+   * Initialize: wire the Speaker button, its floating slider popup, and
+   * outside-click-to-close. Called once from UIController.init(), inside
+   * a try/catch — a failure here MUST NOT prevent the rest of the app
+   * from booting (same guarantee AvatarSystem.init() makes).
+   */
+  function init() {
+    try {
+      const speakerBtn = el('speakerBtn');
+      const popup       = el('volumePopup');
+      const slider      = el('volumeSlider');
+      const wrapper     = el('speakerBtnWrapper');
+      if (!speakerBtn || !popup || !slider || !wrapper) {
+        Logger.warn('[VolumeSystem] UI elements missing — skipping init');
+        return;
+      }
+
+      speakerBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (isPopupOpen()) closePopup();
+        else openPopup();
+      });
+
+      // Click outside the speaker button/popup closes it (spec requirement).
+      document.addEventListener('click', (e) => {
+        if (!isPopupOpen()) return;
+        if (wrapper.contains(e.target)) return;
+        closePopup();
+      });
+
+      // Live update as the slider moves — no Save button, per spec.
+      slider.addEventListener('input', () => {
+        const pct = parseInt(slider.value, 10);
+        if (Number.isNaN(pct)) return;
+        const activeId = AssistantManager.getActiveId();
+        if (!activeId) return;
+        setVolume(activeId, pct / 100, { paint: false }); // slider is already correct; just persist+apply gain
+        const label = el('volumeSliderLabel');
+        if (label) label.textContent = pct + '%';
+        const icon = el('speakerBtnIcon');
+        if (icon) icon.className = iconClassFor(pct / 100);
+      });
+
+      // Paint initial state for whichever assistant loads first.
+      refreshActiveVolume();
+
+      Logger.boot('[VolumeSystem] Initialized');
+    } catch (e) {
+      // CRITICAL: volume feature init MUST NOT prevent boot.
+      Logger.warn('[VolumeSystem] init error (non-fatal)', e.message);
+    }
+  }
+
+  // ── Natural-language local volume command parsing ──────────────────
+  /**
+   * Try to recognize `rawText` as a LOCAL volume command (handled
+   * entirely by Olivia, never sent to Xiaozhi). Returns a small
+   * descriptor object on match, or null if this is ordinary chat text.
+   *
+   * Deliberately anchored (^...$) against the whole (trimmed, lowercased)
+   * message rather than matched as a substring — so normal conversation
+   * that happens to mention the word "volume" (e.g. "turn the volume up
+   * on the story you're telling me") is never misfired as a command.
+   */
+  function parseVolumeCommand(rawText) {
+    if (!rawText || typeof rawText !== 'string') return null;
+
+    let text = rawText.trim().toLowerCase();
+    if (!text) return null;
+    // Strip trailing punctuation and common polite prefixes.
+    text = text.replace(/[.!?]+$/, '').trim();
+    text = text.replace(/^(please|hey olivia|olivia|can you|could you|would you)[,:]?\s+/i, '').trim();
+
+    const pct = (n) => Math.max(0, Math.min(100, parseInt(n, 10))) / 100;
+
+    // ── Mute / Unmute ──────────────────────────────────────────────
+    if (/^mute(\s+yourself)?$/.test(text)) {
+      return { action: 'mute' };
+    }
+    if (/^unmute(\s+yourself)?$/.test(text) || /^turn\s+(the\s+)?sound\s+back\s+on$/.test(text)) {
+      return { action: 'unmute' };
+    }
+
+    // ── Extremes: "maximum volume", "volume max", "set volume to 100%" ──
+    if (/^(set\s+)?(your\s+|the\s+)?volume\s+to\s+(max(imum)?|100\s*%?)$/.test(text) ||
+        /^(max(imum)?\s+volume|volume\s+max(imum)?)$/.test(text)) {
+      return { action: 'set', value: 1.0 };
+    }
+    if (/^(set\s+)?(your\s+|the\s+)?volume\s+to\s+(min(imum)?|0\s*%?)$/.test(text) ||
+        /^(min(imum)?\s+volume|volume\s+min(imum)?)$/.test(text)) {
+      return { action: 'set', value: 0.0 };
+    }
+
+    // ── Explicit percent/number: "set your volume to 25 percent",
+    //    "set volume to 80%", "volume 60", "turn your volume to 60" ──
+    let m = text.match(/^set\s+(?:your\s+|the\s+)?volume\s+to\s+(\d{1,3})\s*(?:%|percent)?$/);
+    if (m) return { action: 'set', value: pct(m[1]) };
+
+    m = text.match(/^turn\s+(?:your\s+|the\s+)?volume\s+to\s+(\d{1,3})\s*(?:%|percent)?$/);
+    if (m) return { action: 'set', value: pct(m[1]) };
+
+    m = text.match(/^volume\s+(?:to\s+)?(\d{1,3})\s*(?:%|percent)?$/);
+    if (m) return { action: 'set', value: pct(m[1]) };
+
+    // ── Relative step commands ──────────────────────────────────────
+    if (/^(lower\s+your\s+volume|turn\s+yourself\s+down|turn\s+(?:your\s+|the\s+)?volume\s+down|decrease\s+your\s+volume|volume\s+down|quiet(?:er)?(?:\s+please)?|be\s+quieter)$/.test(text)) {
+      return { action: 'delta', direction: 'down' };
+    }
+    if (/^(increase\s+your\s+volume|turn\s+yourself\s+up|turn\s+(?:your\s+|the\s+)?volume\s+up|raise\s+your\s+volume|volume\s+up|louder(?:\s+please)?|be\s+louder)$/.test(text)) {
+      return { action: 'delta', direction: 'up' };
+    }
+
+    return null;
+  }
+
+  /**
+   * Attempt to handle `text` as a local volume command for the CURRENTLY
+   * ACTIVE assistant. Returns true if it was recognized and fully handled
+   * (volume changed, UI updated, confirmation shown) — the caller
+   * (UIController.handleSendClick) must then SKIP sending the message to
+   * Xiaozhi. Returns false for ordinary chat text, which the caller
+   * should send exactly as before.
+   */
+  function tryHandleLocalCommand(text) {
+    try {
+      const parsed = parseVolumeCommand(text);
+      if (!parsed) return false;
+
+      const activeId = AssistantManager.getActiveId();
+      const active    = AssistantManager.getActiveAssistant();
+      if (!activeId || !active) return false;
+
+      let newVolume;
+      switch (parsed.action) {
+        case 'mute':
+          preMuteVolumes[activeId] = getVolume(activeId);
+          newVolume = 0;
+          break;
+        case 'unmute': {
+          const remembered = preMuteVolumes[activeId];
+          newVolume = (typeof remembered === 'number' && remembered > 0) ? remembered : DEFAULT_VOLUME;
+          break;
+        }
+        case 'set':
+          newVolume = parsed.value;
+          break;
+        case 'delta': {
+          const current = getVolume(activeId);
+          newVolume = parsed.direction === 'up' ? current + STEP : current - STEP;
+          break;
+        }
+        default:
+          return false;
+      }
+
+      const applied = setVolume(activeId, newVolume);
+      const appliedPct = Math.round(applied * 100);
+
+      const confirmation = parsed.action === 'mute'
+        ? `${active.name} volume muted.`
+        : `${active.name} volume set to ${appliedPct}%.`;
+
+      // Local confirmation — rendered via the SAME "system" message style
+      // used for "Connected to server" / "Chat cleared" etc, so it is
+      // visually distinct from a real AI reply bubble (spec requirement).
+      if (typeof UIController !== 'undefined') {
+        UIController.addSystemMessage(confirmation, 'fa-volume-high');
+      }
+      if (typeof showToast === 'function') {
+        showToast(confirmation, 'info');
+      }
+
+      Logger.info(`[VolumeSystem] Local command intercepted: "${text}" → ${JSON.stringify(parsed)} ⇒ ${appliedPct}%`);
+      return true;
+    } catch (e) {
+      Logger.warn('[VolumeSystem] tryHandleLocalCommand error (non-fatal)', e.message);
+      return false; // fail open — never block a real chat message on a bug here
+    }
+  }
+
+  /**
+   * ── FUTURE EXTENSION POINT (not wired to any protocol handler yet) ──
+   * Structured client_action commands from Xiaozhi, e.g.:
+   *   { "type": "client_action", "action": "set_volume", "value": 0.4 }
+   *
+   * ProtocolClient already has an unused 'custom' message type +
+   * onCustom callback (see MODULE: ProtocolClient, handleTextMessage's
+   * `case 'custom'` branch) — that plumbing is NOT touched by this
+   * feature. A future phase can, WITHOUT inventing any new protocol
+   * message type, forward a `custom` payload shaped like the above into
+   * this function from SessionManager's `protocol.on('custom', ...)`
+   * wiring. See HANDOFF.md → "Future AI-controlled client action
+   * architecture" for the exact call site to add.
+   *
+   * This function is intentionally NOT called anywhere in this phase.
+   */
+  function handleClientAction(assistantId, action) {
+    try {
+      if (!assistantId || !action || action.type !== 'client_action') return false;
+      switch (action.action) {
+        case 'set_volume':
+          if (typeof action.value === 'number') {
+            setVolume(assistantId, action.value);
+            return true;
+          }
+          return false;
+        default:
+          return false; // Unknown action — ignore. No protocol change.
+      }
+    } catch (e) {
+      Logger.warn('[VolumeSystem] handleClientAction error (non-fatal)', e.message);
+      return false;
+    }
+  }
+
+  return {
+    init,
+    getVolume,
+    setVolume,
+    refreshActiveVolume,
+    tryHandleLocalCommand,
+    parseVolumeCommand,      // exposed for debugging/testing (XiaozhiDebug)
+    handleClientAction,      // future extension point — see HANDOFF.md
+    DEFAULT_VOLUME,
+  };
+})();
+
+// ================================================================
+// MODULE: AssistantManager  (PHASE 1 — Multi-Assistant Foundation)
+// ================================================================
+// Olivia now models every paired "device" as an independent Assistant
+// record. Each Assistant is a self-contained Olivia instance: its own
+// name, device identity (Device-Id / Client-Id), pairing/token state,
+// connection endpoints, protocol + audio preferences, and a reserved
+// slot for conversation history (wired up in a later phase).
+//
+// AssistantManager persists the full list + the currently active
+// assistant id under a NEW localStorage key so we never collide with
+// (or destroy) the legacy single-assistant storage format. On first
+// load, if the new key is empty but the legacy key has data, the
+// existing single assistant/device/pairing is migrated automatically
+// into Assistant #1 — no user loses their current pairing.
+//
+// IMPORTANT: This module intentionally knows NOTHING about the
+// Xiaozhi WebSocket/OTA/MCP protocol. It is a pure data + persistence
+// layer. SettingsManager (below) is rewritten as a thin compatibility
+// shim on top of AssistantManager's "active assistant" so that every
+// existing call site (ProtocolClient, AudioEngine, ChatEngine,
+// ProvisioningManager, UIController, DeviceEmulator, ...) keeps
+// working completely unchanged.
+// ================================================================
+const AssistantManager = (() => {
+  const STORAGE_KEY = 'olivia_assistants_v1';
+  const LEGACY_SETTINGS_KEY = 'xiaozhi_web_client_settings';
+
+  /** Flat legacy-key → nested Assistant-record path, used by the
+   *  SettingsManager compatibility shim so old call sites keep working. */
+  const FLAT_KEY_MAP = {
+    wsUrl:            ['connection', 'wsUrl'],
+    otaUrl:           ['connection', 'otaUrl'],
+    connectionStatus: ['connection', 'status'],
+    token:            ['pairing', 'token'],
+    paired:           ['pairing', 'paired'],
+    deviceName:       ['device', 'deviceName'],
+    deviceId:         ['device', 'deviceId'],
+    clientId:         ['device', 'clientId'],
+    protocolVersion:  ['protocol', 'protocolVersion'],
+    frameDuration:    ['protocol', 'frameDuration'],
+    listeningMode:    ['protocol', 'listeningMode'],
+    audioEnabled:     ['audio', 'audioEnabled'],
+    ttsPlayback:      ['audio', 'ttsPlayback'],
+    assistantName:    null, // top-level 'name' — special-cased below
+  };
+
+  const ASSISTANT_DEFAULTS = () => ({
+    connection: {
+      wsUrl:  'wss://api.xiaozhi.me/xiaozhi/v1/',
+      otaUrl: 'https://api.tenclass.net/xiaozhi/ota/',
+      status: 'disconnected', // idle|connecting|connected|listening|speaking|disconnected|error
+    },
+    pairing: {
+      token:  '',    // Populated by OTA provisioning, not user-entered
+      paired: false,
+    },
+    device: {
+      deviceName: 'My Virtual ESP32',
+      deviceId:   '', // Auto-generated on first use
+      clientId:   '', // Auto-generated UUID on first use
+    },
+    protocol: {
+      protocolVersion: 1,
+      frameDuration:   60, // ms
+      listeningMode:   'auto',
+    },
+    audio: {
+      audioEnabled: true,
+      ttsPlayback:  true,
+    },
+    conversationHistory: [], // reserved for Phase 3 (per-assistant chat log)
+  });
+
+  /** In-memory state: the full list + which assistant is active */
+  let assistants = [];
+  let activeId = null;
+  let listeners = [];
+
+  // ── Generators (unchanged logic from the original SettingsManager) ──
   /** Generate a MAC-address-style device ID (12 hex chars with colons)
    * MUST be lowercase to match ESP32 firmware format (uses %02x in snprintf).
    * The Xiaozhi server authenticates Device-Id case-sensitively:
    * it sends a WS close frame immediately if the Device-Id is uppercase.
    */
   function generateMacAddress() {
-    // Use a persistent seed based on current time + random
     const hex = () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0');
-    // First byte: locally administered, unicast (set bit 1, clear bit 0 of first byte)
     const first = (Math.floor(Math.random() * 64) * 4 + 2).toString(16).padStart(2, '0');
-    // NOTE: NO .toUpperCase() — firmware uses %02x (lowercase) and server requires it
     return [first, hex(), hex(), hex(), hex(), hex()].join(':');
   }
 
-  /** Normalize a MAC address to lowercase (fix uppercase MACs from older app versions) */
   function normalizeMacAddress(mac) {
-    if (typeof mac !== 'string') return mac;
-    return mac.toLowerCase();
+    return typeof mac === 'string' ? mac.toLowerCase() : mac;
   }
 
-  /** Generate a UUID v4 */
   function generateUUID() {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
       return crypto.randomUUID();
@@ -336,12 +997,450 @@ const SettingsManager = (() => {
     });
   }
 
+  /** Build a brand-new Assistant record with auto-generated device identity */
+  function buildNewAssistant(name) {
+    const base = ASSISTANT_DEFAULTS();
+    base.device.deviceId = generateMacAddress();
+    base.device.clientId = generateUUID();
+    return {
+      id: generateUUID(),
+      name: name || 'My Assistant',
+      createdAt: new Date().toISOString(),
+      ...base,
+    };
+  }
+
+  /** One-time migration of the legacy single-assistant settings blob */
+  function migrateLegacySettings() {
+    let legacy = null;
+    try {
+      const raw = localStorage.getItem(LEGACY_SETTINGS_KEY);
+      if (raw) legacy = JSON.parse(raw);
+    } catch (e) {
+      Logger.warn('Failed to parse legacy settings during migration', e.message);
+    }
+
+    if (!legacy) return null;
+
+    Logger.boot('Migrating legacy single-assistant settings into Assistant #1', {
+      deviceId: legacy.deviceId,
+      wsUrl: legacy.wsUrl,
+    });
+
+    const base = ASSISTANT_DEFAULTS();
+    const migrated = {
+      id: generateUUID(),
+      name: legacy.deviceName || 'My Assistant',
+      createdAt: new Date().toISOString(),
+      connection: {
+        wsUrl:  legacy.wsUrl  || base.connection.wsUrl,
+        otaUrl: legacy.otaUrl || base.connection.otaUrl,
+        status: 'disconnected',
+      },
+      pairing: {
+        token:  legacy.token  || '',
+        paired: legacy.paired === true,
+      },
+      device: {
+        deviceName: legacy.deviceName || base.device.deviceName,
+        deviceId:   legacy.deviceId   || generateMacAddress(),
+        clientId:   legacy.clientId   || generateUUID(),
+      },
+      protocol: {
+        protocolVersion: legacy.protocolVersion || base.protocol.protocolVersion,
+        frameDuration:    legacy.frameDuration    || base.protocol.frameDuration,
+        listeningMode:    legacy.listeningMode    || base.protocol.listeningMode,
+      },
+      audio: {
+        audioEnabled: legacy.audioEnabled !== false,
+        ttsPlayback:  legacy.ttsPlayback  !== false,
+      },
+      conversationHistory: [],
+    };
+
+    return migrated;
+  }
+
+  function load() {
+    let loaded = false;
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed.assistants) && parsed.assistants.length > 0) {
+          assistants = parsed.assistants;
+          activeId = parsed.activeId || assistants[0].id;
+          loaded = true;
+        }
+      }
+    } catch (e) {
+      Logger.warn('Failed to load assistants from localStorage', e.message);
+    }
+
+    if (!loaded) {
+      // No multi-assistant storage yet — try migrating the legacy single
+      // assistant blob so no existing user loses their pairing.
+      const migrated = migrateLegacySettings();
+      if (migrated) {
+        assistants = [migrated];
+        activeId = migrated.id;
+      } else {
+        // Brand-new install — create a single default assistant.
+        const fresh = buildNewAssistant('My Assistant');
+        assistants = [fresh];
+        activeId = fresh.id;
+        Logger.boot('No existing settings found — created default assistant', {
+          deviceId: fresh.device.deviceId,
+        });
+      }
+      save();
+    }
+
+    // Normalize every assistant's Device-Id to lowercase (fixes older
+    // uppercase MACs saved by pre-multi-assistant app versions). Any
+    // assistant whose id had to be normalized is force-unpaired since
+    // the Xiaozhi server never accepted the uppercase form.
+    let anyNormalized = false;
+    assistants.forEach(a => {
+      const normalized = normalizeMacAddress(a.device.deviceId);
+      if (normalized !== a.device.deviceId) {
+        Logger.boot(`Normalizing Device-Id to lowercase for "${a.name}"`, normalized);
+        a.device.deviceId = normalized;
+        a.pairing.paired = false;
+        a.pairing.token = '';
+        anyNormalized = true;
+      }
+      if (!a.device.clientId) {
+        a.device.clientId = generateUUID();
+        anyNormalized = true;
+      }
+    });
+    if (anyNormalized) save();
+
+    if (!assistants.find(a => a.id === activeId)) {
+      activeId = assistants[0].id;
+    }
+
+    Logger.boot(`Assistants loaded (${assistants.length})`, {
+      activeId,
+      names: assistants.map(a => a.name),
+    });
+  }
+
+  function save() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ assistants, activeId }));
+    } catch (e) {
+      Logger.warn('Failed to save assistants', e.message);
+    }
+  }
+
+  function notify() {
+    listeners.forEach(cb => {
+      try { cb(); } catch (e) { Logger.warn('AssistantManager listener error', e.message); }
+    });
+  }
+
+  /** Subscribe to any change in assistants/activeId (list edits, status, switch) */
+  function onChange(cb) {
+    if (typeof cb === 'function') listeners.push(cb);
+  }
+
+  function getAllAssistants() {
+    return assistants.map(a => JSON.parse(JSON.stringify(a)));
+  }
+
+  function getActiveAssistant() {
+    return assistants.find(a => a.id === activeId) || null;
+  }
+
+  function getActiveId() { return activeId; }
+
+  function getById(id) {
+    return assistants.find(a => a.id === id) || null;
+  }
+
+  /** Switch the active assistant. UI-only — no reconnect/disconnect/pairing. */
+  function setActive(id) {
+    if (!assistants.find(a => a.id === id)) return false;
+    activeId = id;
+    save();
+    notify();
+    return true;
+  }
+
+  /**
+   * Create and persist a brand-new assistant.
+   * NOTE: exists for architectural completeness (Phase 2 will wire this to
+   * a working "＋ Add Assistant" flow). Not called by the Phase 1 UI yet.
+   */
+  function createAssistant(name) {
+    const created = buildNewAssistant(name);
+    assistants.push(created);
+    save();
+    notify();
+    return JSON.parse(JSON.stringify(created));
+  }
+
+  /**
+   * PHASE 2: Never allow deleting the last remaining assistant — the app
+   * always needs at least one. Callers (UI) should check the return value
+   * and inform the user; this is the hard backstop.
+   */
+  function removeAssistant(id) {
+    if (assistants.length <= 1) return false;
+    const idx = assistants.findIndex(a => a.id === id);
+    if (idx === -1) return false;
+    assistants.splice(idx, 1);
+    if (activeId === id) {
+      activeId = assistants.length ? assistants[0].id : null;
+    }
+    save();
+    notify();
+    return true;
+  }
+
+  function renameAssistant(id, name) {
+    const a = getById(id);
+    if (!a || !name || !name.trim()) return false;
+    a.name = name.trim();
+    save();
+    notify();
+    return true;
+  }
+
+  // ── Generic by-id flat get/set helpers (PHASE 2) ────────────────────
+  // These are the foundation for true per-assistant independence: every
+  // module that used to read/write "the active assistant's settings" via
+  // SettingsManager can now target ANY assistant by id, which is what lets
+  // ProtocolClient/ProvisioningManager/ChatEngine run one fully independent
+  // instance per assistant (see SessionManager below) instead of always
+  // operating on whichever assistant happens to be visible in the UI.
+  function getFlatField(id, flatKey) {
+    const a = getById(id);
+    if (!a) return undefined;
+    if (flatKey === 'assistantName') return a.name;
+    const path = FLAT_KEY_MAP[flatKey];
+    if (!path) return undefined;
+    return a[path[0]][path[1]];
+  }
+
+  function setFlatField(id, flatKey, value) {
+    const a = getById(id);
+    if (!a) return;
+    if (flatKey === 'assistantName') {
+      a.name = value;
+      save();
+      notify();
+      return;
+    }
+    const path = FLAT_KEY_MAP[flatKey];
+    if (!path) return;
+    a[path[0]][path[1]] = value;
+    save();
+    notify();
+  }
+
+  /** Flat snapshot of any assistant by id, same shape as the old
+   *  single-assistant SettingsManager.getAll() used to return. */
+  function getFlatSnapshot(id) {
+    const a = getById(id);
+    if (!a) return {};
+    const flat = { assistantName: a.name };
+    Object.keys(FLAT_KEY_MAP).forEach(flatKey => {
+      const path = FLAT_KEY_MAP[flatKey];
+      if (path) flat[flatKey] = a[path[0]][path[1]];
+    });
+    return flat;
+  }
+
+  function resetById(id) {
+    const a = getById(id);
+    if (!a) return;
+    const fresh = ASSISTANT_DEFAULTS();
+    fresh.device.deviceId = generateMacAddress();
+    fresh.device.clientId = generateUUID();
+    a.connection = fresh.connection;
+    a.pairing = fresh.pairing;
+    a.device = fresh.device;
+    a.protocol = fresh.protocol;
+    a.audio = fresh.audio;
+    save();
+    notify();
+  }
+
+  function clearPairingById(id) {
+    const a = getById(id);
+    if (!a) return;
+    a.pairing.token = '';
+    a.pairing.paired = false;
+    save();
+    notify();
+  }
+
+  function isPairedById(id) {
+    const a = getById(id);
+    return !!a && a.pairing.paired === true && !!a.pairing.token;
+  }
+
+  function setConnectionStatus(id, status) {
+    const a = getById(id);
+    if (!a) return;
+    a.connection.status = status;
+    save();
+    notify();
+  }
+
+  /**
+   * PHASE 2: Append one finalized chat message onto an assistant's
+   * persisted conversationHistory (capped at the last 200 entries so
+   * localStorage doesn't grow unbounded). This is how each assistant's
+   * chat survives a page refresh — ChatEngine's per-assistant instance
+   * calls this after every user/AI message so switching assistants (or
+   * reloading the page) always shows the correct, isolated history.
+   */
+  function appendConversationMessage(id, msg) {
+    const a = getById(id);
+    if (!a) return;
+    if (!Array.isArray(a.conversationHistory)) a.conversationHistory = [];
+    a.conversationHistory.push({
+      id: msg.id,
+      sender: msg.sender,
+      text: msg.text,
+      timestamp: msg.timestamp instanceof Date ? msg.timestamp.toISOString() : msg.timestamp,
+      status: msg.status || 'sent',
+      emotion: msg.emotion || null,
+      imageThumb: msg.imageThumb || null,
+      imageName: msg.imageName || null,
+    });
+    // Cap history so storage doesn't grow unbounded across long sessions.
+    if (a.conversationHistory.length > 200) {
+      a.conversationHistory = a.conversationHistory.slice(-200);
+    }
+    save();
+    // NOTE: no notify() here — appending a message doesn't change anything
+    // the sidebar/header render (name/status), and firing on every single
+    // chat message would be wasteful. Message rendering itself is handled
+    // directly by ChatEngine/UIController, not via the onChange subscription.
+  }
+
+  /** Clear an assistant's persisted conversation history (used by "Clear chat"). */
+  function clearConversationHistory(id) {
+    const a = getById(id);
+    if (!a) return;
+    a.conversationHistory = [];
+    save();
+  }
+
+  // ── Active-assistant convenience wrappers (kept for the SettingsManager
+  //    shim, which several not-yet-multi-instance call sites still use) ──
+  function getActiveFlatField(flatKey)        { return getFlatField(activeId, flatKey); }
+  function setActiveFlatField(flatKey, value) { return setFlatField(activeId, flatKey, value); }
+  function getActiveFlatSnapshot()            { return getFlatSnapshot(activeId); }
+  function resetActive()                      { return resetById(activeId); }
+  function clearActivePairing()               { return clearPairingById(activeId); }
+  function isActivePaired()                   { return isPairedById(activeId); }
+  function setActiveConnectionStatus(status)  { return setConnectionStatus(activeId, status); }
+
+  return {
+    load,
+    save,
+    onChange,
+    getAllAssistants,
+    getActiveAssistant,
+    getActiveId,
+    getById,
+    setActive,
+    createAssistant,
+    removeAssistant,
+    renameAssistant,
+    getActiveFlatField,
+    setActiveFlatField,
+    getActiveFlatSnapshot,
+    resetActive,
+    clearActivePairing,
+    isActivePaired,
+    setActiveConnectionStatus,
+    // PHASE 2 — generic by-id accessors (multi-session foundation)
+    getFlatField,
+    setFlatField,
+    getFlatSnapshot,
+    resetById,
+    clearPairingById,
+    isPairedById,
+    setConnectionStatus,
+    appendConversationMessage,
+    clearConversationHistory,
+    generateMacAddress,
+    generateUUID,
+  };
+})();
+
+// ================================================================
+// MODULE: Settings Manager
+// ----------------------------------------------------------------
+// PHASE 1 NOTE: This module is now a thin compatibility shim over
+// AssistantManager's "active assistant". Every method keeps its
+// original signature and behaviour so ProtocolClient, AudioEngine,
+// ChatEngine, ProvisioningManager, DeviceEmulator, and UIController
+// continue to work completely unchanged — they simply always read
+// and write the currently *active* assistant's settings.
+// ================================================================
+const SettingsManager = (() => {
+  function load() {
+    AssistantManager.load();
+  }
+
+  function save() {
+    AssistantManager.save();
+  }
+
+  function get(key) {
+    return AssistantManager.getActiveFlatField(key);
+  }
+
+  function set(key, value) {
+    AssistantManager.setActiveFlatField(key, value);
+  }
+
+  function getAll() {
+    return AssistantManager.getActiveFlatSnapshot();
+  }
+
+  function reset() {
+    AssistantManager.resetActive();
+  }
+
+  function clearPairing() {
+    AssistantManager.clearActivePairing();
+  }
+
+  function isPaired() {
+    return AssistantManager.isActivePaired();
+  }
+
+  function generateMacAddress() {
+    return AssistantManager.generateMacAddress();
+  }
+
+  function generateUUID() {
+    return AssistantManager.generateUUID();
+  }
+
   return { load, save, get, set, getAll, reset, clearPairing, isPaired, generateMacAddress, generateUUID };
 })();
 
 // ================================================================
 // MODULE: DeviceEmulator
 // Manages virtual device state machine, mirroring ESP32 behavior
+// ----------------------------------------------------------------
+// PHASE 2 CHANGE: This module used to be a single global singleton
+// (one state machine for "the" device). Since every assistant is now
+// its own independent virtual ESP32, DeviceEmulator is rewritten as a
+// factory: DeviceEmulator.create(assistantId) returns a brand-new,
+// fully independent state machine instance. The STATES enum stays a
+// shared static (it's just constant strings, not state) so existing
+// code that does `DeviceEmulator.STATES.IDLE` keeps working unchanged.
 // ================================================================
 const DeviceEmulator = (() => {
   const STATES = {
@@ -354,41 +1453,60 @@ const DeviceEmulator = (() => {
     ERROR:       'error',
   };
 
-  let currentState = STATES.UNKNOWN;
-  const listeners = [];
+  function create(assistantId) {
+    let currentState = STATES.UNKNOWN;
+    const listeners = [];
 
-  function setState(newState, reason = '') {
-    if (newState === currentState) return;
-    const prev = currentState;
-    currentState = newState;
-    Logger.state(`${prev.toUpperCase()} → ${newState.toUpperCase()}${reason ? ' (' + reason + ')' : ''}`);
-    listeners.forEach(fn => fn(newState, prev, reason));
+    function setState(newState, reason = '') {
+      if (newState === currentState) return;
+      const prev = currentState;
+      currentState = newState;
+      Logger.state(`[${assistantId.slice(0, 8)}] ${prev.toUpperCase()} → ${newState.toUpperCase()}${reason ? ' (' + reason + ')' : ''}`);
+      listeners.forEach(fn => fn(newState, prev, reason));
+    }
+
+    function getState() { return currentState; }
+
+    function onStateChange(fn) { listeners.push(fn); }
+
+    function getIdentityInfo() {
+      const s = AssistantManager.getFlatSnapshot(assistantId);
+      return {
+        'Device-Id':    s.deviceId,
+        'Client-Id':    s.clientId,
+        'Device Name':  s.deviceName,
+        'Pairing':      AssistantManager.isPairedById(assistantId) ? 'Paired' : 'Not paired',
+        'WS URL':       s.wsUrl,
+        'OTA URL':      s.otaUrl,
+        'Protocol Ver': s.protocolVersion,
+        'Frame Duration (ms)': s.frameDuration,
+      };
+    }
+
+    return { STATES, setState, getState, onStateChange, getIdentityInfo };
   }
 
-  function getState() { return currentState; }
-
-  function onStateChange(fn) { listeners.push(fn); }
-
-  function getIdentityInfo() {
-    return {
-      'Device-Id':    SettingsManager.get('deviceId'),
-      'Client-Id':    SettingsManager.get('clientId'),
-      'Device Name':  SettingsManager.get('deviceName'),
-      'Pairing':      SettingsManager.isPaired() ? 'Paired' : 'Not paired',
-      'WS URL':       SettingsManager.get('wsUrl'),
-      'OTA URL':      SettingsManager.get('otaUrl'),
-      'Protocol Ver': SettingsManager.get('protocolVersion'),
-      'Frame Duration (ms)': SettingsManager.get('frameDuration'),
-    };
-  }
-
-  return { STATES, setState, getState, onStateChange, getIdentityInfo };
+  return { STATES, create };
 })();
 
 // ================================================================
 // MODULE: ProvisioningManager
 // ESP32-style OTA registration + 6-digit activation flow
 // Source: xiaozhi-esp32/main/ota.cc + application.cc
+// ----------------------------------------------------------------
+// PHASE 2 CHANGE: Rewritten as a factory — ProvisioningManager.create(id)
+// returns an independent provisioning/pairing flow bound to ONE assistant
+// (by id), reading/writing that assistant's fields directly via
+// AssistantManager's by-id accessors rather than always "whichever
+// assistant is active". This is what allows one assistant to be paired
+// while another is mid-pairing or unpaired, all at the same time, and
+// lets us provision a brand-new assistant without first switching the
+// visible/active assistant.
+//
+// `UIController.updatePairingStatus` (pairing modal) only reflects the
+// flow for the assistant currently visible in the UI — SessionManager
+// (below) guards this by only forwarding modal updates when the
+// provisioning target IS the active assistant.
 // ================================================================
 const ProvisioningManager = (() => {
   const PAIRING_STATES = {
@@ -399,281 +1517,294 @@ const ProvisioningManager = (() => {
     EXPIRED:         'expired',
   };
 
-  let pairingState = PAIRING_STATES.UNPAIRED;
-  let activationCode = '';
-  let activationMessage = '';
-  let activationChallenge = '';
-  let activationTimeoutMs = 300000;
-  let pollTimerId = null;
-  let pollAbort = false;
-  let pollAttempts = 0;
-  const MAX_POLL_ATTEMPTS = 100; // ~5 min at 3s intervals
+  function create(assistantId) {
+    let pairingState = PAIRING_STATES.UNPAIRED;
+    let activationCode = '';
+    let activationMessage = '';
+    let activationChallenge = '';
+    let activationTimeoutMs = 300000;
+    let pollTimerId = null;
+    let pollAbort = false;
+    let pollAttempts = 0;
+    const MAX_POLL_ATTEMPTS = 100; // ~5 min at 3s intervals
+    const stateListeners = [];
 
-  function getState() { return pairingState; }
+    function getState() { return pairingState; }
 
-  function setState(state) {
-    pairingState = state;
-    Logger.auth(`Pairing state → ${state}`);
-    if (UIController.updatePairingStatus) {
-      UIController.updatePairingStatus(state, activationCode);
-    }
-  }
+    function onStateChange(fn) { stateListeners.push(fn); }
 
-  /** Build the device info JSON body (mirrors ESP32 CheckVersion POST) */
-  function buildDeviceInfoPayload() {
-    const s = SettingsManager.getAll();
-    return {
-      version: 2,
-      language: navigator.language || 'en-US',
-      flash_size: 0,
-      minimum_free_heap_size: 0,
-      mac_address: s.deviceId,
-      uuid: s.clientId,
-      chip_model_name: 'web-client',
-      application: {
-        name: 'xiaozhi-web-client',
-        version: '1.0.0',
-        compile_time: new Date().toISOString().slice(0, 19).replace('T', ' '),
-        idf_version: '5.0',
-        elf_sha256: '',
-      },
-      board: {
-        type: 'web-client',
-        name: s.deviceName || 'Virtual ESP32',
-        ip: '127.0.0.1',
-        mac: s.deviceId,
-      },
-    };
-  }
-
-  /** Apply websocket config returned by OTA check */
-  function applyServerConfig(data) {
-    if (data.websocket) {
-      if (data.websocket.url) {
-        SettingsManager.set('wsUrl', data.websocket.url);
-        Logger.auth('WebSocket URL from OTA', data.websocket.url);
-      }
-      if (data.websocket.token) {
-        SettingsManager.set('token', data.websocket.token);
-        Logger.auth('Access token received from OTA');
-      }
-      if (data.websocket.version) {
-        SettingsManager.set('protocolVersion', data.websocket.version);
-      }
-    }
-  }
-
-  /** POST /api/ota/check — proxied version of ESP32 Ota::CheckVersion() */
-  async function checkVersion() {
-    const s = SettingsManager.getAll();
-    Logger.auth('OTA check starting', { otaUrl: s.otaUrl, deviceId: s.deviceId });
-
-    const res = await fetch('/api/ota/check', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        otaUrl: s.otaUrl,
-        deviceId: s.deviceId,
-        clientId: s.clientId,
-        payload: buildDeviceInfoPayload(),
-      }),
-    });
-
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data.error || `OTA check failed (${res.status})`);
+    function setState(state) {
+      pairingState = state;
+      Logger.auth(`[${assistantId.slice(0, 8)}] Pairing state → ${state}`);
+      stateListeners.forEach(fn => {
+        try { fn(state, activationCode); } catch (e) { /* ignore */ }
+      });
     }
 
-    Logger.auth('OTA check response', data);
-    applyServerConfig(data);
+    // Local helpers bound to THIS assistant only (never "the active one")
+    const get = (key) => AssistantManager.getFlatField(assistantId, key);
+    const set = (key, value) => AssistantManager.setFlatField(assistantId, key, value);
+    const getAll = () => AssistantManager.getFlatSnapshot(assistantId);
 
-    activationCode = '';
-    activationMessage = '';
-    activationChallenge = '';
-
-    if (data.activation && typeof data.activation === 'object') {
-      if (data.activation.code) activationCode = String(data.activation.code);
-      if (data.activation.message) activationMessage = String(data.activation.message);
-      if (data.activation.challenge) activationChallenge = String(data.activation.challenge);
-      if (data.activation.timeout_ms) activationTimeoutMs = Number(data.activation.timeout_ms);
-    }
-
-    return data;
-  }
-
-  /** POST /api/ota/activate — proxied version of ESP32 Ota::Activate() */
-  async function activateOnce() {
-    const s = SettingsManager.getAll();
-    const res = await fetch('/api/ota/activate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        otaUrl: s.otaUrl,
-        deviceId: s.deviceId,
-        clientId: s.clientId,
-        payload: {},  // Activation-Version 1 (no serial/HMAC)
-      }),
-    });
-
-    return { status: res.status, data: await res.json().catch(() => ({})) };
-  }
-
-  function stopPolling() {
-    pollAbort = true;
-    if (pollTimerId) {
-      clearTimeout(pollTimerId);
-      pollTimerId = null;
-    }
-  }
-
-  /** Poll activate endpoint until paired (HTTP 200) or timeout (HTTP 202) */
-  function waitForActivation() {
-    return new Promise((resolve, reject) => {
-      pollAbort = false;
-      pollAttempts = 0;
-
-      async function poll() {
-        if (pollAbort) {
-          reject(new Error('Pairing cancelled'));
-          return;
-        }
-
-        pollAttempts++;
-        if (pollAttempts > MAX_POLL_ATTEMPTS) {
-          setState(PAIRING_STATES.EXPIRED);
-          reject(new Error('Activation timed out'));
-          return;
-        }
-
-        try {
-          const { status, data } = await activateOnce();
-
-          if (status === 200) {
-            // Activation confirmed by server (HTTP 200).
-            // DO NOT set paired=true yet — call checkVersion() one more time
-            // (mirrors real ESP32 firmware CheckNewVersion() loop: after Activate()
-            // returns ESP_OK, it loops back to call CheckVersion() again to get
-            // the final token and confirm the device is registered).
-            Logger.auth('Activation HTTP 200 — calling CheckVersion to confirm registration');
-            setState(PAIRING_STATES.PAIRING_PENDING);
-
-            try {
-              await checkVersion();
-              // If OTA now returns NO activation code, device is registered.
-              // If it still has activation code, server hasn't processed yet — retry.
-              if (!activationCode && !activationChallenge) {
-                Logger.auth('Post-activation OTA confirms device is registered');
-                SettingsManager.set('paired', true);
-                setState(PAIRING_STATES.PAIRED);
-                resolve(true);
-              } else {
-                // Server hasn't processed yet — wait and retry activation poll
-                Logger.auth('Post-activation OTA still shows activation code — server processing delay, retrying...');
-                pollTimerId = setTimeout(poll, 3000);
-              }
-            } catch (otaErr) {
-              // OTA check failed after activation — still mark as paired since
-              // activate returned 200. Use token we already have.
-              Logger.warn('Post-activation OTA check failed, proceeding with cached token', otaErr.message);
-              SettingsManager.set('paired', true);
-              setState(PAIRING_STATES.PAIRED);
-              resolve(true);
-            }
-            return;
-          }
-
-          if (status === 202) {
-            setState(PAIRING_STATES.PAIRING_PENDING);
-            pollTimerId = setTimeout(poll, 3000);
-            return;
-          }
-
-          setState(PAIRING_STATES.FAILED);
-          reject(new Error(`Activation failed (HTTP ${status})`));
-        } catch (err) {
-          setState(PAIRING_STATES.FAILED);
-          reject(err);
-        }
-      }
-
-      poll();
-    });
-  }
-
-  /**
-   * Full provisioning flow — called before first WebSocket connect.
-   * Mirrors the real ESP32 firmware CheckNewVersion() outer loop.
-   * Returns { needsUserAction: bool, code?: string }
-   *
-   * @param {boolean} [silent=false] - if true, don't reset pairing state UI
-   *        (used when re-checking OTA for an already-paired device)
-   */
-  async function provision(silent = false) {
-    stopPolling();
-    if (!silent) {
-      setState(PAIRING_STATES.UNPAIRED);
-    }
-
-    const data = await checkVersion();
-
-    // Server returned NO activation requirement — device is already registered.
-    // (Real firmware: HasActivationCode() == false → break the while loop)
-    if (!activationCode && !activationChallenge) {
-      if (SettingsManager.get('token')) {
-        SettingsManager.set('paired', true);
-        setState(PAIRING_STATES.PAIRED);
-        Logger.auth('Device already registered (no activation code in OTA response)');
-        return { needsUserAction: false };
-      }
-      // Has no activation and no token — shouldn't happen but handle gracefully
-      Logger.warn('OTA response has no activation block and no token — proceeding anyway');
-      SettingsManager.set('paired', true);
-      setState(PAIRING_STATES.PAIRED);
-      return { needsUserAction: false };
-    }
-
-    // Server requires activation — show the code to the user.
-    // (Real firmware: HasActivationCode() == true → ShowActivationCode())
-    if (activationCode) {
-      setState(PAIRING_STATES.PAIRING_PENDING);
-      Logger.auth(`Activation required. Code: ${activationCode}. Challenge: ${activationChallenge}`);
+    /** Build the device info JSON body (mirrors ESP32 CheckVersion POST) */
+    function buildDeviceInfoPayload() {
+      const s = getAll();
       return {
-        needsUserAction: true,
-        code: activationCode,
-        message: activationMessage || 'Go to xiaozhi.me and enter this code.',
-        timeoutMs: activationTimeoutMs,
+        version: 2,
+        language: navigator.language || 'en-US',
+        flash_size: 0,
+        minimum_free_heap_size: 0,
+        mac_address: s.deviceId,
+        uuid: s.clientId,
+        chip_model_name: 'web-client',
+        application: {
+          name: 'xiaozhi-web-client',
+          version: '1.0.0',
+          compile_time: new Date().toISOString().slice(0, 19).replace('T', ' '),
+          idf_version: '5.0',
+          elf_sha256: '',
+        },
+        board: {
+          type: 'web-client',
+          name: s.deviceName || 'Virtual ESP32',
+          ip: '127.0.0.1',
+          mac: s.deviceId,
+        },
       };
     }
 
-    // Has challenge but no code (unusual) — treat as activation needed but no display code
-    if (activationChallenge) {
-      setState(PAIRING_STATES.PAIRING_PENDING);
-      Logger.warn('OTA has activation challenge but no display code — proceeding as paired');
-      SettingsManager.set('paired', true);
+    /** Apply websocket config returned by OTA check */
+    function applyServerConfig(data) {
+      if (data.websocket) {
+        if (data.websocket.url) {
+          set('wsUrl', data.websocket.url);
+          Logger.auth('WebSocket URL from OTA', data.websocket.url);
+        }
+        if (data.websocket.token) {
+          set('token', data.websocket.token);
+          Logger.auth('Access token received from OTA');
+        }
+        if (data.websocket.version) {
+          set('protocolVersion', data.websocket.version);
+        }
+      }
+    }
+
+    /** POST /api/ota/check — proxied version of ESP32 Ota::CheckVersion() */
+    async function checkVersion() {
+      const s = getAll();
+      Logger.auth('OTA check starting', { otaUrl: s.otaUrl, deviceId: s.deviceId });
+
+      const res = await fetch('/api/ota/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          otaUrl: s.otaUrl,
+          deviceId: s.deviceId,
+          clientId: s.clientId,
+          payload: buildDeviceInfoPayload(),
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || `OTA check failed (${res.status})`);
+      }
+
+      Logger.auth('OTA check response', data);
+      applyServerConfig(data);
+
+      activationCode = '';
+      activationMessage = '';
+      activationChallenge = '';
+
+      if (data.activation && typeof data.activation === 'object') {
+        if (data.activation.code) activationCode = String(data.activation.code);
+        if (data.activation.message) activationMessage = String(data.activation.message);
+        if (data.activation.challenge) activationChallenge = String(data.activation.challenge);
+        if (data.activation.timeout_ms) activationTimeoutMs = Number(data.activation.timeout_ms);
+      }
+
+      return data;
+    }
+
+    /** POST /api/ota/activate — proxied version of ESP32 Ota::Activate() */
+    async function activateOnce() {
+      const s = getAll();
+      const res = await fetch('/api/ota/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          otaUrl: s.otaUrl,
+          deviceId: s.deviceId,
+          clientId: s.clientId,
+          payload: {},  // Activation-Version 1 (no serial/HMAC)
+        }),
+      });
+
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    }
+
+    function stopPolling() {
+      pollAbort = true;
+      if (pollTimerId) {
+        clearTimeout(pollTimerId);
+        pollTimerId = null;
+      }
+    }
+
+    /** Poll activate endpoint until paired (HTTP 200) or timeout (HTTP 202) */
+    function waitForActivation() {
+      return new Promise((resolve, reject) => {
+        pollAbort = false;
+        pollAttempts = 0;
+
+        async function poll() {
+          if (pollAbort) {
+            reject(new Error('Pairing cancelled'));
+            return;
+          }
+
+          pollAttempts++;
+          if (pollAttempts > MAX_POLL_ATTEMPTS) {
+            setState(PAIRING_STATES.EXPIRED);
+            reject(new Error('Activation timed out'));
+            return;
+          }
+
+          try {
+            const { status, data } = await activateOnce();
+
+            if (status === 200) {
+              // Activation confirmed by server (HTTP 200).
+              // DO NOT set paired=true yet — call checkVersion() one more time
+              // (mirrors real ESP32 firmware CheckNewVersion() loop: after Activate()
+              // returns ESP_OK, it loops back to call CheckVersion() again to get
+              // the final token and confirm the device is registered).
+              Logger.auth('Activation HTTP 200 — calling CheckVersion to confirm registration');
+              setState(PAIRING_STATES.PAIRING_PENDING);
+
+              try {
+                await checkVersion();
+                // If OTA now returns NO activation code, device is registered.
+                // If it still has activation code, server hasn't processed yet — retry.
+                if (!activationCode && !activationChallenge) {
+                  Logger.auth('Post-activation OTA confirms device is registered');
+                  set('paired', true);
+                  setState(PAIRING_STATES.PAIRED);
+                  resolve(true);
+                } else {
+                  // Server hasn't processed yet — wait and retry activation poll
+                  Logger.auth('Post-activation OTA still shows activation code — server processing delay, retrying...');
+                  pollTimerId = setTimeout(poll, 3000);
+                }
+              } catch (otaErr) {
+                // OTA check failed after activation — still mark as paired since
+                // activate returned 200. Use token we already have.
+                Logger.warn('Post-activation OTA check failed, proceeding with cached token', otaErr.message);
+                set('paired', true);
+                setState(PAIRING_STATES.PAIRED);
+                resolve(true);
+              }
+              return;
+            }
+
+            if (status === 202) {
+              setState(PAIRING_STATES.PAIRING_PENDING);
+              pollTimerId = setTimeout(poll, 3000);
+              return;
+            }
+
+            setState(PAIRING_STATES.FAILED);
+            reject(new Error(`Activation failed (HTTP ${status})`));
+          } catch (err) {
+            setState(PAIRING_STATES.FAILED);
+            reject(err);
+          }
+        }
+
+        poll();
+      });
+    }
+
+    /**
+     * Full provisioning flow — called before first WebSocket connect.
+     * Mirrors the real ESP32 firmware CheckNewVersion() outer loop.
+     * Returns { needsUserAction: bool, code?: string }
+     *
+     * @param {boolean} [silent=false] - if true, don't reset pairing state UI
+     *        (used when re-checking OTA for an already-paired device)
+     */
+    async function provision(silent = false) {
+      stopPolling();
+      if (!silent) {
+        setState(PAIRING_STATES.UNPAIRED);
+      }
+
+      const data = await checkVersion();
+
+      // Server returned NO activation requirement — device is already registered.
+      // (Real firmware: HasActivationCode() == false → break the while loop)
+      if (!activationCode && !activationChallenge) {
+        if (get('token')) {
+          set('paired', true);
+          setState(PAIRING_STATES.PAIRED);
+          Logger.auth('Device already registered (no activation code in OTA response)');
+          return { needsUserAction: false };
+        }
+        // Has no activation and no token — shouldn't happen but handle gracefully
+        Logger.warn('OTA response has no activation block and no token — proceeding anyway');
+        set('paired', true);
+        setState(PAIRING_STATES.PAIRED);
+        return { needsUserAction: false };
+      }
+
+      // Server requires activation — show the code to the user.
+      // (Real firmware: HasActivationCode() == true → ShowActivationCode())
+      if (activationCode) {
+        setState(PAIRING_STATES.PAIRING_PENDING);
+        Logger.auth(`Activation required. Code: ${activationCode}. Challenge: ${activationChallenge}`);
+        return {
+          needsUserAction: true,
+          code: activationCode,
+          message: activationMessage || 'Go to xiaozhi.me and enter this code.',
+          timeoutMs: activationTimeoutMs,
+        };
+      }
+
+      // Has challenge but no code (unusual) — treat as activation needed but no display code
+      if (activationChallenge) {
+        setState(PAIRING_STATES.PAIRING_PENDING);
+        Logger.warn('OTA has activation challenge but no display code — proceeding as paired');
+        set('paired', true);
+        setState(PAIRING_STATES.PAIRED);
+        return { needsUserAction: false };
+      }
+
+      // Fallback: should not reach here
+      set('paired', true);
       setState(PAIRING_STATES.PAIRED);
       return { needsUserAction: false };
     }
 
-    // Fallback: should not reach here
-    SettingsManager.set('paired', true);
-    setState(PAIRING_STATES.PAIRED);
-    return { needsUserAction: false };
+    function cancel() {
+      stopPolling();
+      setState(PAIRING_STATES.UNPAIRED);
+    }
+
+    return {
+      PAIRING_STATES,
+      getState,
+      onStateChange,
+      provision,
+      waitForActivation,
+      cancel,
+      stopPolling,
+      getActivationCode: () => activationCode,
+    };
   }
 
-  function cancel() {
-    stopPolling();
-    setState(PAIRING_STATES.UNPAIRED);
-  }
-
-  return {
-    PAIRING_STATES,
-    getState,
-    provision,
-    waitForActivation,
-    cancel,
-    stopPolling,
-    getActivationCode: () => activationCode,
-  };
+  return { PAIRING_STATES, create };
 })();
 
 // ================================================================
@@ -696,6 +1827,54 @@ const AudioEngine = (() => {
   let onAudioChunkCallback = null;
   let ttsQueue = [];
   let isTTSPlaying = false;
+
+  // ── PER-ASSISTANT SPEECH VOLUME  [OLIVIA FEATURE] ──────────────────
+  // A single GainNode sits between every decoded TTS source and the
+  // AudioContext's speaker output. ALL TTS playback (both the libopus
+  // decode path and the Web Audio decodeAudioData fallback path) routes
+  // through this one node instead of connecting straight to
+  // `audioContext.destination`, so changing its gain takes effect
+  // instantly on whatever is currently queued/playing — no need to
+  // re-decode or restart anything.
+  //
+  // This node ONLY affects local Olivia playback. It never touches the
+  // Xiaozhi WebSocket protocol, the mic-capture pipeline, or anything
+  // sent to the server — see VolumeSystem below for the higher-level
+  // per-assistant persistence + UI wrapper around this raw gain control.
+  let ttsGainNode = null;
+  let currentVolume = 1.0;   // 0.0 (silent) .. 1.0 (100%), applied to ttsGainNode.gain
+
+  /** Lazily create the shared gain node once the AudioContext exists,
+   *  wired GainNode -> destination. Safe to call repeatedly. */
+  function ensureGainNode() {
+    if (!audioContext) return null;
+    if (!ttsGainNode || ttsGainNode.context !== audioContext) {
+      ttsGainNode = audioContext.createGain();
+      ttsGainNode.gain.value = currentVolume;
+      ttsGainNode.connect(audioContext.destination);
+    }
+    return ttsGainNode;
+  }
+
+  /** Set local TTS playback volume immediately (0.0 - 1.0). Does not
+   *  persist anything itself — VolumeSystem owns persistence. */
+  function setVolume(vol) {
+    currentVolume = Math.max(0, Math.min(1, Number(vol)));
+    if (ttsGainNode) {
+      // Use setTargetAtTime for a tiny declick ramp instead of an
+      // instant step, but effectively "immediate" (25ms time constant).
+      try {
+        ttsGainNode.gain.setTargetAtTime(currentVolume, audioContext.currentTime, 0.01);
+      } catch (e) {
+        ttsGainNode.gain.value = currentVolume;
+      }
+    }
+    return currentVolume;
+  }
+
+  function getVolume() {
+    return currentVolume;
+  }
 
   // Opus encoder/decoder instances (loaded lazily from libopus-wasm)
   let opusEncoder = null;
@@ -797,10 +1976,12 @@ const AudioEngine = (() => {
         sampleRate: TTS_SAMPLE_RATE,
         latencyHint: 'interactive',
       });
+      ttsGainNode = null; // force re-creation against the fresh context
     }
     if (audioContext.state === 'suspended') {
       await audioContext.resume();
     }
+    ensureGainNode();
     return audioContext;
   }
 
@@ -1080,7 +2261,10 @@ const AudioEngine = (() => {
           // Schedule this frame back-to-back with the previous one
           const source = audioContext.createBufferSource();
           source.buffer = audioBuffer;
-          source.connect(audioContext.destination);
+          // OLIVIA FEATURE: route through the per-assistant volume gain
+          // node instead of straight to destination, so the slider/NL
+          // volume commands affect this fallback path too.
+          source.connect(ensureGainNode() || audioContext.destination);
           source.start(ttsNextStartTime);
           ttsNextStartTime += audioBuffer.duration;
           Logger.audio(`TTS (Web Audio fallback): ${audioBuffer.duration.toFixed(3)}s @ t=${ttsNextStartTime.toFixed(3)}`);
@@ -1097,7 +2281,10 @@ const AudioEngine = (() => {
       audioBuffer.copyToChannel(pcmFloat, 0);
       const source = audioContext.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(audioContext.destination);
+      // OLIVIA FEATURE: route through the shared per-assistant volume
+      // gain node (see ensureGainNode / setVolume above) instead of
+      // connecting straight to destination.
+      source.connect(ensureGainNode() || audioContext.destination);
       source.start(ttsNextStartTime);
       ttsNextStartTime += frameDurationS;
       Logger.audio(`TTS chunk: ${pcmFloat.length} samples (${(frameDurationS * 1000).toFixed(0)}ms) @ t=${ttsNextStartTime.toFixed(3)}`);
@@ -1142,6 +2329,14 @@ const AudioEngine = (() => {
     loadOpus,           // expose so AppController can pre-warm
     INPUT_SAMPLE_RATE,
     TTS_SAMPLE_RATE,
+    // OLIVIA FEATURE: per-assistant local speech volume control.
+    // setVolume() takes effect immediately on the shared TTS gain node —
+    // it does NOT touch the Xiaozhi protocol, mic capture, or anything
+    // sent to the server. VolumeSystem (below) is the higher-level
+    // wrapper that persists this value per-assistant and calls setVolume()
+    // whenever the active assistant changes or the user adjusts it.
+    setVolume,
+    getVolume,
   };
 })();
 
@@ -1155,35 +2350,84 @@ const AudioEngine = (() => {
 // IMPORTANT: The server sends the vision URL as http:// (not https://).
 // Example: http://api.xiaozhi.me/vision/explain
 // The Hono proxy normalises this to https:// before forwarding.
+//
+// PHASE 2 CHANGE: Rewritten as a factory (one vision capability holder
+// per assistant/session) since each assistant has its own MCP session
+// with the server and may or may not have vision enabled independently.
 // ================================================================
 const VisionCapability = (() => {
-  let visionUrl   = '';
-  let visionToken = '';
+  function create(assistantId) {
+    let visionUrl   = '';
+    let visionToken = '';
 
-  function setUrl(url, token) {
-    visionUrl   = url;
-    visionToken = token || '';
-    // ── VERBOSE VISION LOGGING ──
-    Logger.mcp('=== VISION CAPABILITY RECEIVED ===');
-    Logger.mcp(`Vision URL: ${url}`);
-    Logger.mcp(`Vision token present: ${!!token}`);
-    Logger.mcp(`Vision token value: ${token ? ('...' + String(token).slice(-8)) : '(none)'}`);
-    Logger.mcp('==================================');
+    function setUrl(url, token) {
+      visionUrl   = url;
+      visionToken = token || '';
+      // ── VERBOSE VISION LOGGING ──
+      Logger.mcp('=== VISION CAPABILITY RECEIVED ===');
+      Logger.mcp(`[${assistantId.slice(0, 8)}] Vision URL: ${url}`);
+      Logger.mcp(`Vision token present: ${!!token}`);
+      Logger.mcp(`Vision token value: ${token ? ('...' + String(token).slice(-8)) : '(none)'}`);
+      Logger.mcp('==================================');
+    }
+
+    function getUrl()   { return visionUrl; }
+    function getToken() { return visionToken; }
+    function isAvailable() { return !!visionUrl; }
+
+    return { setUrl, getUrl, getToken, isAvailable };
   }
 
-  function getUrl()   { return visionUrl; }
-  function getToken() { return visionToken; }
-  function isAvailable() { return !!visionUrl; }
-
-  return { setUrl, getUrl, getToken, isAvailable };
+  return { create };
 })();
 
 // ================================================================
 // MODULE: ProtocolClient
 // Core ESP32 WebSocket protocol implementation
 // This is the heart of the device emulator.
+// ----------------------------------------------------------------
+// PHASE 2 CHANGE: Rewritten as a factory — ProtocolClient.create(id, deps)
+// returns an INDEPENDENT WebSocket connection + protocol state machine
+// bound to ONE assistant. This is the central piece that makes "every
+// assistant is its own virtual ESP32" real: two assistants can now hold
+// two live `ws` connections simultaneously, each with its own sessionId,
+// hello handshake, reconnect counter, etc. Switching the active assistant
+// in the UI never touches any of these — see SessionManager below, which
+// owns one { deviceEmulator, provisioning, vision, protocol, chat } bundle
+// per assistant and never tears one down just because the UI stopped
+// showing it.
+//
+// `deps.deviceEmulator` / `deps.vision` are THIS assistant's own
+// DeviceEmulator / VisionCapability instances. `deps.chat` is wired in
+// after creation via setChatEngine() (see SessionManager) to break the
+// circular dependency: ChatEngine needs a ProtocolClient instance to send
+// messages, and ProtocolClient needs a ChatEngine instance to render the
+// vision (take_photo) tool-call result into the chat bubble.
+//
+// Fixes an inherited bug: the take_photo MCP handler used to call bare
+// `beginAIResponse(null)` / `appendAIResponseSentence(...)` /
+// `finalizeAIResponse()` — identifiers that only exist inside ChatEngine's
+// closure, not ProtocolClient's, so this threw a ReferenceError any time
+// vision-via-MCP actually fired. Now correctly routed through `chat.`.
 // ================================================================
 const ProtocolClient = (() => {
+
+  function create(assistantId, deps) {
+  const { deviceEmulator, vision } = deps;
+  let chat = null; // wired in by setChatEngine() after ChatEngine.create()
+  function setChatEngine(chatInstance) { chat = chatInstance; }
+
+  /** True only when this assistant is the one currently shown on screen.
+   *  Used to gate the handful of UI/hardware side-effects that must only
+   *  ever apply to the assistant the user is actually looking at (typing
+   *  indicator, TTS audio playback, take_photo image lookup). */
+  function isActive() { return assistantId === AssistantManager.getActiveId(); }
+
+  /** Snapshot of THIS assistant's flat settings — replaces the old
+   *  SettingsManager.getAll() (which always read the active assistant). */
+  const getSettings = () => AssistantManager.getFlatSnapshot(assistantId);
+  const getSetting  = (key) => AssistantManager.getFlatField(assistantId, key);
+
   let ws = null;
   let sessionId = '';
   let helloReceived = false;
@@ -1243,7 +2487,7 @@ const ProtocolClient = (() => {
    * This mimics ESP32 WebsocketProtocol::OpenAudioChannel()
    */
   async function connect() {
-    const s = SettingsManager.getAll();
+    const s = getSettings();
 
     if (!s.wsUrl) {
       Logger.error('No WebSocket URL configured');
@@ -1262,10 +2506,10 @@ const ProtocolClient = (() => {
     //   1. The device is registered (paired via activation code)
     //   2. Device-Id is LOWERCASE (firmware uses %02x in snprintf, e.g. "aa:bb:cc:dd:ee:ff")
     //      CRITICAL: The server rejects uppercase Device-Id with an immediate close frame!
-    Logger.auth(`Using token: ${s.token === 'test-token' ? 'test-token (Xiaozhi cloud token)' : '***' + s.token.slice(-8)}`);
+    Logger.auth(`[${assistantId.slice(0,8)}] Using token: ${s.token === 'test-token' ? 'test-token (Xiaozhi cloud token)' : '***' + s.token.slice(-8)}`);
 
     isIntentionalClose = false;
-    DeviceEmulator.setState(DeviceEmulator.STATES.CONNECTING);
+    deviceEmulator.setState(deviceEmulator.STATES.CONNECTING);
 
     Logger.ws(`Connecting to: ${s.wsUrl}`);
     Logger.auth(`Device-Id: ${s.deviceId}, Client-Id: ${s.clientId}`);
@@ -1298,7 +2542,7 @@ const ProtocolClient = (() => {
 
     } catch (err) {
       Logger.error('Failed to create WebSocket', err.message);
-      DeviceEmulator.setState(DeviceEmulator.STATES.ERROR, err.message);
+      deviceEmulator.setState(deviceEmulator.STATES.ERROR, err.message);
       if (callbacks.onError) callbacks.onError(err.message);
       return false;
     }
@@ -1309,7 +2553,7 @@ const ProtocolClient = (() => {
     Logger.ws('WebSocket connected. Sending hello...');
 
     // Send the hello message exactly as the ESP32 firmware does
-    const s = SettingsManager.getAll();
+    const s = getSettings();
     const hello = {
       type: 'hello',
       version: s.protocolVersion || 1,
@@ -1353,8 +2597,7 @@ const ProtocolClient = (() => {
 
   /** Handle binary (audio) messages from server */
   function handleBinaryMessage(buffer) {
-    const s = SettingsManager.getAll();
-    const version = s.protocolVersion || 1;
+    const version = getSetting('protocolVersion') || 1;
     let opusPayload = buffer;
 
     if (version === 2 && buffer.byteLength >= 16) {
@@ -1377,7 +2620,12 @@ const ProtocolClient = (() => {
       callbacks.onAudio(opusPayload);
     }
 
-    if (SettingsManager.get('ttsPlayback')) {
+    // AudioEngine's speaker output is a single shared hardware resource
+    // (see AudioEngine module notes) — only the assistant currently on
+    // screen is allowed to play TTS audio through it. A background
+    // assistant's audio is still fully tracked (state, messages) — it
+    // just doesn't make sound until the user switches to it.
+    if (isActive() && getSetting('ttsPlayback')) {
       AudioEngine.enqueueTTSChunk(opusPayload);
     }
   }
@@ -1454,7 +2702,7 @@ const ProtocolClient = (() => {
     Logger.ws(`Server hello received. Session: ${sessionId}`);
     Logger.auth(`Server audio params: ${JSON.stringify(msg.audio_params || {})}`);
 
-    DeviceEmulator.setState(DeviceEmulator.STATES.IDLE);
+    deviceEmulator.setState(deviceEmulator.STATES.IDLE);
 
     if (callbacks.onConnected) callbacks.onConnected(sessionId, msg);
     if (callbacks.onHello) callbacks.onHello(msg);
@@ -1478,12 +2726,12 @@ const ProtocolClient = (() => {
     Logger.chat(`TTS ${state}: ${msg.text || ''}`);
 
     if (state === 'start') {
-      DeviceEmulator.setState(DeviceEmulator.STATES.SPEAKING);
+      deviceEmulator.setState(deviceEmulator.STATES.SPEAKING);
       if (callbacks.onTTSStart) callbacks.onTTSStart(msg.session_id);
     } else if (state === 'sentence_start') {
       if (callbacks.onTTSSentence) callbacks.onTTSSentence(msg.text, msg.session_id);
     } else if (state === 'stop') {
-      DeviceEmulator.setState(DeviceEmulator.STATES.IDLE);
+      deviceEmulator.setState(deviceEmulator.STATES.IDLE);
       if (callbacks.onTTSStop) callbacks.onTTSStop(msg.session_id);
     }
   }
@@ -1514,11 +2762,11 @@ const ProtocolClient = (() => {
     if (msg.payload && msg.payload.method === 'initialize') {
       const params = msg.payload.params;
       if (params && params.capabilities) {
-        const vision = params.capabilities.vision;
-        if (vision && vision.url) {
-          Logger.mcp('Vision capability received', { url: vision.url, hasToken: !!vision.token });
-          // Store in the shared VisionCapability singleton
-          VisionCapability.setUrl(vision.url, vision.token || '');
+        const visionCap = params.capabilities.vision;
+        if (visionCap && visionCap.url) {
+          Logger.mcp('Vision capability received', { url: visionCap.url, hasToken: !!visionCap.token });
+          // Store on THIS assistant's own VisionCapability instance.
+          vision.setUrl(visionCap.url, visionCap.token || '');
         }
       }
       // Respond to initialize — mirrors ESP32 firmware ParseCapabilities/ReplyResult
@@ -1548,7 +2796,7 @@ const ProtocolClient = (() => {
       // Xiaozhi server knows it can call us with vision tool-call requests,
       // exactly as it would a real ESP32 with a camera attached.
       // ─────────────────────────────────────────────────────────────────────
-      const cameraTools = VisionCapability.isAvailable() ? [
+      const cameraTools = vision.isAvailable() ? [
         {
           name: 'self.camera.take_photo',
           description:
@@ -1674,10 +2922,10 @@ const ProtocolClient = (() => {
               method: 'POST',
               headers: {
                 'Content-Type':   `multipart/form-data; boundary=${boundary}`,
-                'X-Vision-Url':   VisionCapability.getUrl(),
-                'X-Vision-Token': VisionCapability.getToken(),
-                'X-Device-Id':    SettingsManager.get('deviceId'),
-                'X-Client-Id':    SettingsManager.get('clientId'),
+                'X-Vision-Url':   vision.getUrl(),
+                'X-Vision-Token': vision.getToken(),
+                'X-Device-Id':    getSetting('deviceId'),
+                'X-Client-Id':    getSetting('clientId'),
               },
               body: body.buffer,
             });
@@ -1741,10 +2989,22 @@ const ProtocolClient = (() => {
             // chat immediately so the user sees it before server TTS arrives.
             // We do NOT call finalizeAIResponse() here — the server will send
             // proper tts/sentence_start events once the LLM uses the tool result.
-            UIController.hideTypingIndicator();
-            beginAIResponse(null);
-            appendAIResponseSentence(visionText);
-            finalizeAIResponse();
+            //
+            // PHASE 2 FIX: this used to call the bare identifiers
+            // beginAIResponse()/appendAIResponseSentence()/finalizeAIResponse(),
+            // which only exist inside ChatEngine's closure — NOT ProtocolClient's
+            // — so this threw "beginAIResponse is not defined" and silently broke
+            // vision-via-MCP any time it fired. Now routed through `chat` (this
+            // assistant's own ChatEngine instance). ChatEngine's own functions
+            // internally gate all DOM/UIController calls on isActive(), so a
+            // background assistant's vision message is still recorded in its
+            // message history without touching the screen.
+            if (chat) {
+              if (isActive()) UIController.hideTypingIndicator();
+              chat.beginAIResponse(null);
+              chat.appendAIResponseSentence(visionText);
+              chat.finalizeAIResponse();
+            }
 
           } catch (err) {
             Logger.error('take_photo tool execution failed', err.message);
@@ -1802,7 +3062,7 @@ const ProtocolClient = (() => {
     }
 
     helloReceived = false;
-    DeviceEmulator.setState(DeviceEmulator.STATES.IDLE);
+    deviceEmulator.setState(deviceEmulator.STATES.IDLE);
 
     // Detect authentication failure: server closes with 1008 (policy violation) or
     // 4xxx codes. If this happens, the device likely needs to re-provision.
@@ -1862,8 +3122,7 @@ const ProtocolClient = (() => {
   /** Send binary audio data */
   function sendAudio(buffer) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    const s = SettingsManager.getAll();
-    const version = s.protocolVersion || 1;
+    const version = getSetting('protocolVersion') || 1;
 
     let data;
     if (version === 2) {
@@ -1909,7 +3168,7 @@ const ProtocolClient = (() => {
       mode: mode,
     };
     Logger.proto('→ listen start', msg);
-    DeviceEmulator.setState(DeviceEmulator.STATES.LISTENING);
+    deviceEmulator.setState(deviceEmulator.STATES.LISTENING);
     return sendText(msg);
   }
 
@@ -1945,7 +3204,7 @@ const ProtocolClient = (() => {
       text: text,
     };
     Logger.proto('→ listen detect (text bypass)', msg);
-    DeviceEmulator.setState(DeviceEmulator.STATES.LISTENING);
+    deviceEmulator.setState(deviceEmulator.STATES.LISTENING);
     return sendText(msg);
   }
 
@@ -1957,7 +3216,7 @@ const ProtocolClient = (() => {
       reason: reason,
     };
     Logger.proto('→ abort', msg);
-    DeviceEmulator.setState(DeviceEmulator.STATES.IDLE);
+    deviceEmulator.setState(deviceEmulator.STATES.IDLE);
     AudioEngine.clearTTSQueue();
     return sendText(msg);
   }
@@ -1972,7 +3231,13 @@ const ProtocolClient = (() => {
 
   function getSessionId() { return sessionId; }
 
+  // PHASE 2 FIX: close the create(assistantId, deps) factory function body
+  // (previous session left this unclosed, causing "Unexpected )" — the
+  // trailing })() below is the IIFE wrapper for the ProtocolClient module
+  // itself, one level up, and must stay). Also expose setChatEngine so
+  // SessionManager can complete the circular chat<->protocol wiring.
   return {
+    setChatEngine,
     connect,
     disconnect,
     sendText,
@@ -1984,21 +3249,70 @@ const ProtocolClient = (() => {
     isConnected,
     isConnecting,
     getSessionId,
+    isActive,
     on,
     setAutoReconnect: (v) => { autoReconnect = v; },
   };
+  } // end create()
+
+  return { create };
 })();
 
 // ================================================================
 // MODULE: ChatEngine
 // Manages chat state, message history, and text interaction
+// ----------------------------------------------------------------
+// PHASE 2 CHANGE: Rewritten as a factory — ChatEngine.create(assistantId,
+// deps) returns an independent chat engine bound to ONE assistant, with
+// its own in-memory `messages` array (seeded from and persisted back to
+// that assistant's `conversationHistory` field via AssistantManager, so
+// chat history survives page refresh, per assistant).
+//
+// Every DOM-touching function (renderMessage, showTypingIndicator, etc.)
+// is guarded by isActive() — it only paints the screen when THIS
+// assistant is the one currently visible/active. This is what gives us
+// "switching assistants never disconnects, and message history never
+// mixes": a background assistant's ChatEngine instance keeps receiving
+// and storing STT/LLM/TTS-derived messages exactly as before, it just
+// doesn't touch the DOM until the user switches back to it — at which
+// point SessionManager.renderActiveSession() replays its full message
+// list into the chat pane.
+//
+// `deps.protocol` / `deps.vision` are THIS assistant's own ProtocolClient
+// / VisionCapability instances (see SessionManager) — never the globally
+// "active" ones, so sendTextMessage()/sendImageMessage() always talk to
+// the correct independent WebSocket connection even if the user has since
+// switched to viewing a different assistant.
 // ================================================================
 const ChatEngine = (() => {
+
+  function create(assistantId, deps) {
+  const { protocol, vision } = deps;
   const messages = [];
   let pendingUserMessage = null;  // User's typed message, awaiting AI response
   let pendingAIMessage = null;    // AI message being built incrementally
   let lastSender = null;
   let conversationCount = 0;
+
+  /** True only when this assistant is the one currently shown on screen. */
+  function isActive() {
+    return assistantId === AssistantManager.getActiveId();
+  }
+
+  // ── Seed message history from persisted storage (survives refresh) ──
+  (function loadPersistedHistory() {
+    const a = AssistantManager.getById(assistantId);
+    if (!a || !Array.isArray(a.conversationHistory)) return;
+    a.conversationHistory.forEach(m => {
+      messages.push({ ...m, timestamp: new Date(m.timestamp) });
+      lastSender = m.sender;
+    });
+  })();
+
+  /** Persist a finalized message onto the assistant record (trims to last 200). */
+  function persistMessage(msg) {
+    AssistantManager.appendConversationMessage(assistantId, msg);
+  }
 
   /**
    * Send a text message to the AI using the CORRECT Xiaozhi protocol.
@@ -2020,7 +3334,7 @@ const ChatEngine = (() => {
    *   { "session_id":"...", "type":"listen", "state":"detect", "text":"Hi XiaoZhi" }
    */
   async function sendTextMessage(text) {
-    if (!ProtocolClient.isConnected()) {
+    if (!protocol.isConnected()) {
       Logger.warn('Cannot send message: not connected');
       showToast('Not connected to server', 'error');
       return false;
@@ -2038,7 +3352,7 @@ const ChatEngine = (() => {
     Logger.chat(`→ Sending text via listen{detect}: "${trimmedText}"`);
 
     // Show typing indicator
-    UIController.showTypingIndicator('Sending to AI...');
+    if (isActive()) UIController.showTypingIndicator('Sending to AI...');
 
     // BUG #2 FIX: Long typed messages were rejected by the server with:
     // "Detect is only for wake words, do not send long texts."
@@ -2057,7 +3371,7 @@ const ChatEngine = (() => {
 
     if (trimmedText.length <= MAX_DETECT_LEN) {
       // Short message — send directly, same as before
-      ProtocolClient.sendListenDetect(trimmedText);
+      protocol.sendListenDetect(trimmedText);
     } else {
       // Long message — split into ≤ 80-char chunks at sentence boundaries,
       // then send all chunks. The last chunk triggers the AI response.
@@ -2066,7 +3380,7 @@ const ChatEngine = (() => {
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         Logger.chat(`→ Chunk ${i + 1}/${chunks.length}: "${chunk}"`);
-        ProtocolClient.sendListenDetect(chunk);
+        protocol.sendListenDetect(chunk);
         // Small delay between chunks so server can queue them correctly
         if (i < chunks.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 80));
@@ -2133,12 +3447,12 @@ const ChatEngine = (() => {
    * 4. When done: stopVoiceInput() sends listen{stop}
    */
   async function startVoiceInput(mode = 'auto') {
-    if (!ProtocolClient.isConnected()) {
+    if (!protocol.isConnected()) {
       showToast('Not connected to server', 'error');
       return false;
     }
 
-    if (!SettingsManager.get('audioEnabled')) {
+    if (!AssistantManager.getFlatField(assistantId, 'audioEnabled')) {
       showToast('Audio disabled in settings', 'warning');
       return false;
     }
@@ -2164,7 +3478,7 @@ const ChatEngine = (() => {
     const started = await AudioEngine.startCapture((opusBuffer) => {
       // opusBuffer is an ArrayBuffer containing a raw Opus packet
       Logger.audio(`→ Sending Opus frame ${opusBuffer.byteLength}b`);
-      ProtocolClient.sendAudio(opusBuffer);
+      protocol.sendAudio(opusBuffer);
     });
 
     if (!started) {
@@ -2173,7 +3487,7 @@ const ChatEngine = (() => {
     }
 
     // 2. Capture is live — NOW tell server to start accepting audio
-    ProtocolClient.sendListenStart(mode);
+    protocol.sendListenStart(mode);
 
     // Show audio meter
     document.getElementById('audioMeterSection').style.display = 'block';
@@ -2185,7 +3499,7 @@ const ChatEngine = (() => {
   function stopVoiceInput() {
     AudioEngine.stopCapture();
     document.getElementById('audioMeterSection').style.display = 'none';
-    ProtocolClient.sendListenStop();
+    protocol.sendListenStop();
     Logger.chat('Voice input stopped');
   }
 
@@ -2204,11 +3518,16 @@ const ChatEngine = (() => {
     };
 
     messages.push(msg);
-    UIController.renderMessage(msg, lastSender);
+    // PHASE 2: only paint the DOM when this assistant is the one on screen.
+    // A background assistant's message is still recorded (messages array +
+    // persisted history below) so switching back to it replays the full,
+    // uninterrupted conversation.
+    if (isActive()) {
+      UIController.renderMessage(msg, lastSender);
+      updateConversationPreview(text, now);
+    }
     lastSender = sender;
-
-    // Update conversation preview
-    updateConversationPreview(text, now);
+    persistMessage(msg);
 
     return msg;
   }
@@ -2228,12 +3547,32 @@ const ChatEngine = (() => {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  /** Clear in-memory + persisted history and (if active) the on-screen chat pane. */
   function clearMessages() {
     messages.length = 0;
     pendingUserMessage = null;
     pendingAIMessage = null;
     lastSender = null;
+    AssistantManager.clearConversationHistory(assistantId);
+    if (isActive()) UIController.clearMessages();
+  }
+
+  /**
+   * PHASE 2: Replay this assistant's full message history into the chat
+   * pane. Called by SessionManager.switchTo() right after making this
+   * assistant active — this is what makes switching assistants feel like
+   * switching Discord/Slack channels: the whole conversation reappears
+   * instantly, scroll position included (UIController scrolls to bottom).
+   */
+  function renderHistory() {
     UIController.clearMessages();
+    messages.forEach((msg, idx) => {
+      UIController.renderMessage(msg, idx > 0 ? messages[idx - 1].sender : null);
+    });
+    if (messages.length > 0) {
+      const last = messages[messages.length - 1];
+      updateConversationPreview(last.text, last.timestamp);
+    }
   }
 
   // Build AI message incrementally from TTS sentence events
@@ -2261,6 +3600,11 @@ const ChatEngine = (() => {
     aiMessageText = '';
     // BUG #2 FIX: beginStreamingMessage no longer appends to DOM.
     // The element stays in memory until updateStreamingMessage appends it.
+    // PHASE 2: created unconditionally (cheap, detached DOM node) even for a
+    // background assistant so aiMessageEl/aiMessageText bookkeeping below
+    // stays consistent; updateStreamingMessage/finalizeStreamingMessage are
+    // themselves gated on isActive() so a background stream never becomes
+    // visible or touches the live #messagesContainer.
     aiMessageEl = UIController.beginStreamingMessage('ai', emotion);
   }
 
@@ -2281,25 +3625,30 @@ const ChatEngine = (() => {
       beginAIResponse(null);
     }
     aiMessageText += (aiMessageText ? ' ' : '') + sentence;
-    if (aiMessageEl) {
+    if (aiMessageEl && isActive()) {
       UIController.updateStreamingMessage(aiMessageEl, aiMessageText);
     }
-    Logger.chat(`AI sentence: "${sentence}"`);
+    Logger.chat(`[${assistantId.slice(0,8)}] AI sentence: "${sentence}"`);
   }
 
   function finalizeAIResponse() {
     if (aiMessageText && aiMessageEl) {
-      UIController.finalizeStreamingMessage(aiMessageEl, aiMessageText);
-      // Store in message history
-      messages.push({
+      if (isActive()) {
+        UIController.finalizeStreamingMessage(aiMessageEl, aiMessageText);
+        updateConversationPreview(aiMessageText, new Date());
+      }
+      // Store in message history (always — even for a background assistant —
+      // so persisted conversationHistory and renderHistory() replay stay complete).
+      const finalMsg = {
         id: 'ai_' + Date.now(),
         sender: 'ai',
         text: aiMessageText,
         timestamp: new Date(),
         status: 'delivered',
-      });
+      };
+      messages.push(finalMsg);
+      persistMessage(finalMsg);
       lastSender = 'ai';
-      updateConversationPreview(aiMessageText, new Date());
     } else if (aiMessageEl && !aiMessageText) {
       // TTS ended but no sentence text was received — element was never appended
       // (lazy approach), so nothing to remove from DOM.  Just discard it.
@@ -2373,7 +3722,7 @@ const ChatEngine = (() => {
    * @param {string} [dataUrl] - Data URL for thumbnail display in chat bubble
    */
   async function sendImageMessage(imageFile, promptText, displayName, dataUrl) {
-    if (!ProtocolClient.isConnected()) {
+    if (!protocol.isConnected()) {
       Logger.warn('Cannot send image: not connected');
       showToast('Not connected to server', 'error');
       return false;
@@ -2388,9 +3737,9 @@ const ChatEngine = (() => {
     Logger.chat(`Filename: ${filename}`);
     Logger.chat(`Image size: ${Math.round(imageFile.size / 1024)} KB (${imageFile.size} bytes)`);
     Logger.chat(`Image type: ${imageFile.type}`);
-    Logger.chat(`Vision capability available: ${VisionCapability.isAvailable()}`);
-    Logger.chat(`Vision URL: ${VisionCapability.getUrl() || '(not set)'}`);
-    Logger.chat(`Vision token: ${VisionCapability.getToken() ? ('...' + VisionCapability.getToken().slice(-8)) : '(none)'}`);
+    Logger.chat(`Vision capability available: ${vision.isAvailable()}`);
+    Logger.chat(`Vision URL: ${vision.getUrl() || '(not set)'}`);
+    Logger.chat(`Vision token: ${vision.getToken() ? ('...' + vision.getToken().slice(-8)) : '(none)'}`);
 
     // Show user message with thumbnail immediately
     const userMsgText = question;
@@ -2398,12 +3747,12 @@ const ChatEngine = (() => {
     addMessage('user', userMsgText, { imageThumb: dataUrl, imageName: filename });
     conversationCount++;
 
-    UIController.showTypingIndicator('Sending to AI...');
+    if (isActive()) UIController.showTypingIndicator('Sending to AI...');
 
-    if (!VisionCapability.isAvailable()) {
+    if (!vision.isAvailable()) {
       Logger.warn('Vision URL not available — server has not advertised vision capability yet');
       Logger.warn('Make sure you are connected and the server sent an MCP initialize with vision capabilities');
-      UIController.hideTypingIndicator();
+      if (isActive()) UIController.hideTypingIndicator();
       showToast('Vision not available. Connect to server first.', 'error');
       return false;
     }
@@ -2460,7 +3809,7 @@ const ChatEngine = (() => {
     // Send the question text via the standard text channel.
     // The LLM will recognize it has vision capability (from tools/list) and
     // issue a tools/call for self.camera.take_photo.
-    ProtocolClient.sendListenDetect(question.slice(0, 80));
+    protocol.sendListenDetect(question.slice(0, 80));
 
     return true;
   }
@@ -2499,6 +3848,7 @@ const ChatEngine = (() => {
     stopVoiceInput,
     addMessage,
     clearMessages,
+    renderHistory,
     beginAIResponse,
     resetAIResponse,
     ensureAIResponseStarted,
@@ -2506,6 +3856,479 @@ const ChatEngine = (() => {
     finalizeAIResponse,
     consumePendingUserMessage,
     getMessages: () => [...messages],
+  };
+  } // end create()
+
+  return { create };
+})();
+
+// ================================================================
+// MODULE: SessionManager                                  [PHASE 2]
+// ----------------------------------------------------------------
+// The missing orchestrator. Every other module below this point
+// (DeviceEmulator, ProvisioningManager, VisionCapability, ProtocolClient,
+// ChatEngine) was already converted to a `create(assistantId, deps)`
+// factory by the time this session picked up the work — but nothing
+// was actually calling `.create()` or wiring the instances together.
+// AppController/UIController still called them as bare global
+// singletons (`ProtocolClient.on(...)`, `DeviceEmulator.setState(...)`),
+// which throws at runtime now that those modules only export `{ create }`.
+//
+// SessionManager fixes this: it owns one FULL session bundle per
+// assistant —
+//   { deviceEmulator, provisioning, vision, protocol, chat }
+// — created lazily and kept alive for the assistant's entire lifetime
+// (until the assistant is deleted), regardless of whether that
+// assistant is the one currently shown on screen. This is what makes
+// "switch away, connection stays alive" possible: switching only
+// changes which session's DOM updates are allowed through; it never
+// tears down or recreates a session.
+//
+// Ownership rules enforced here:
+//   - AssistantManager.setConnectionStatus(id, status) is ALWAYS called
+//     for every session, active or not, so the sidebar status dot for
+//     EVERY assistant is always live and correct.
+//   - UIController.setConnectionState()/updateSessionId()/etc (the
+//     functions that touch the on-screen chat panel/header) are ONLY
+//     called when the event's assistant === the currently active one.
+//   - AudioEngine playback (a shared hardware resource — see AudioEngine
+//     module notes) is already gated inside ProtocolClient/ChatEngine
+//     via their own isActive() checks, so SessionManager doesn't need
+//     to gate that itself.
+// ================================================================
+const SessionManager = (() => {
+  /** assistantId -> { deviceEmulator, provisioning, vision, protocol, chat } */
+  const sessions = new Map();
+
+  /** Human-readable connection-status labels, mapped from DeviceEmulator
+   *  states — mirrors what AppController.handleDeviceStateChange() used
+   *  to compute per-singleton. Kept local since only SessionManager now
+   *  decides an assistant's persisted connection.status. */
+  function deviceStateToConnectionStatus(deviceState, protocolConnected) {
+    const S = DeviceEmulator.STATES;
+    switch (deviceState) {
+      case S.CONNECTING: return 'connecting';
+      case S.LISTENING:   return 'listening';
+      case S.SPEAKING:    return 'speaking';
+      case S.ERROR:       return 'disconnected';
+      case S.IDLE:        return protocolConnected ? 'connected' : 'disconnected';
+      default:            return 'disconnected';
+    }
+  }
+
+  /** True only when `id` is the assistant currently shown on screen. */
+  function isActiveId(id) { return id === AssistantManager.getActiveId(); }
+
+  /**
+   * Build (or return the existing) full session bundle for one assistant.
+   * Safe to call repeatedly — a second call for the same id is a no-op
+   * that just returns the already-built bundle.
+   */
+  function getOrCreateSession(assistantId) {
+    if (sessions.has(assistantId)) return sessions.get(assistantId);
+
+    const deviceEmulator = DeviceEmulator.create(assistantId);
+    const provisioning   = ProvisioningManager.create(assistantId);
+    const vision         = VisionCapability.create(assistantId);
+    const protocol       = ProtocolClient.create(assistantId, { deviceEmulator, vision });
+    const chat           = ChatEngine.create(assistantId, { protocol, vision });
+    // Complete the circular wiring: ProtocolClient needs to call back
+    // into ChatEngine (consumePendingUserMessage / addMessage / etc.)
+    // but ChatEngine also needs `protocol` — so ChatEngine is built
+    // second and handed to ProtocolClient afterwards.
+    protocol.setChatEngine(chat);
+
+    const session = { assistantId, deviceEmulator, provisioning, vision, protocol, chat };
+    sessions.set(assistantId, session);
+
+    wireDeviceState(session);
+    wireProtocolCallbacks(session);
+
+    return session;
+  }
+
+  /** DeviceEmulator state changes -> persisted status + (if active) UI */
+  function wireDeviceState(session) {
+    const { assistantId, deviceEmulator, protocol } = session;
+    deviceEmulator.onStateChange((newState, prevState, reason) => {
+      const status = deviceStateToConnectionStatus(newState, protocol.isConnected());
+      AssistantManager.setConnectionStatus(assistantId, status);
+      if (isActiveId(assistantId)) {
+        UIController.setConnectionState(status);
+      }
+    });
+  }
+
+  /** ProtocolClient events -> persisted status/session-id + (if active) UI/chat */
+  function wireProtocolCallbacks(session) {
+    const { assistantId, deviceEmulator, protocol, chat } = session;
+
+    protocol.on('connected', (sessionId, helloMsg) => {
+      Logger.ws(`[${assistantId.slice(0, 8)}] Connected! Session ID: ${sessionId}`);
+      AssistantManager.setConnectionStatus(assistantId, 'connected');
+      if (isActiveId(assistantId)) {
+        UIController.setConnectionState('connected');
+        UIController.updateSessionId(sessionId);
+        UIController.addSystemMessage(
+          `Connected to Xiaozhi server. Session: ${sessionId || '(no session id)'}`,
+          'fa-plug-circle-check'
+        );
+        showToast('Connected to Xiaozhi server!', 'success', 'Connected');
+      }
+    });
+
+    protocol.on('disconnected', (code, reason) => {
+      Logger.ws(`[${assistantId.slice(0, 8)}] Disconnected: ${code} ${reason}`);
+      AssistantManager.setConnectionStatus(assistantId, 'disconnected');
+      AudioEngine.clearTTSQueue();
+      if (isActiveId(assistantId)) {
+        UIController.setConnectionState('disconnected');
+        UIController.updateSessionId('');
+        UIController.hideTypingIndicator();
+        if (!reason || reason === 'User disconnect') {
+          UIController.addSystemMessage('Disconnected from server.', 'fa-plug-circle-xmark');
+        } else {
+          UIController.addSystemMessage(`Disconnected: ${reason || 'Connection lost'}`, 'fa-exclamation-circle');
+          showToast(`Disconnected: ${reason || 'Connection lost'}`, 'error', 'Disconnected');
+        }
+      }
+    });
+
+    protocol.on('error', (message) => {
+      Logger.error(`[${assistantId.slice(0, 8)}] Protocol error`, message);
+      AssistantManager.setConnectionStatus(assistantId, 'disconnected');
+      if (isActiveId(assistantId)) {
+        UIController.setConnectionState('disconnected');
+        UIController.hideTypingIndicator();
+        showToast(message, 'error', 'Connection Error');
+        UIController.addSystemMessage(`Error: ${message}`, 'fa-circle-exclamation');
+      }
+    });
+
+    protocol.on('stt', (text, sessionId) => {
+      Logger.chat(`[${assistantId.slice(0, 8)}] STT received: "${text}"`);
+      if (isActiveId(assistantId)) UIController.hideSTTPreview();
+
+      if (text && text.trim()) {
+        if (chat.consumePendingUserMessage(text.trim())) {
+          Logger.chat('STT matches pending typed message — skipping duplicate render');
+        } else {
+          chat.addMessage('user', text.trim());
+        }
+      }
+      if (isActiveId(assistantId)) UIController.showTypingIndicator('AI is thinking...');
+    });
+
+    protocol.on('llm', (emotion, text, sessionId) => {
+      if (isActiveId(assistantId)) UIController.hideTypingIndicator();
+      chat.resetAIResponse();
+    });
+
+    protocol.on('ttsStart', (sessionId) => {
+      Logger.chat(`[${assistantId.slice(0, 8)}] TTS started`);
+      if (isActiveId(assistantId)) {
+        UIController.hideTypingIndicator();
+        UIController.setConnectionState('speaking');
+      }
+      chat.ensureAIResponseStarted();
+    });
+
+    protocol.on('ttsSentence', (text, sessionId) => {
+      if (text) {
+        Logger.chat(`[${assistantId.slice(0, 8)}] TTS sentence: "${text}"`);
+        chat.appendAIResponseSentence(text);
+      }
+    });
+
+    protocol.on('ttsStop', (sessionId) => {
+      Logger.chat(`[${assistantId.slice(0, 8)}] TTS stopped`);
+      if (isActiveId(assistantId)) {
+        UIController.hideTypingIndicator();
+        UIController.setConnectionState('connected');
+      }
+      chat.finalizeAIResponse();
+
+      // Auto-listen mode: restart listening after AI speaks. Only makes
+      // sense for the assistant whose mic is actually capturing — that
+      // can only ever be the active assistant (AudioEngine mic capture
+      // is a single shared hardware resource, same as TTS playback).
+      if (isActiveId(assistantId) &&
+          AssistantManager.getFlatField(assistantId, 'listeningMode') === 'auto' &&
+          AudioEngine.isCapturing()) {
+        protocol.sendListenStart('auto');
+      }
+    });
+
+    protocol.on('audio', (buffer) => {
+      // Already handled by binary message dispatcher + AudioEngine inside
+      // ProtocolClient itself (gated by ProtocolClient's own isActive()).
+    });
+
+    protocol.on('system', (command, msg) => {
+      Logger.warn(`[${assistantId.slice(0, 8)}] System command received: ${command}`);
+      if (isActiveId(assistantId)) {
+        UIController.addSystemMessage(`System: ${command}`, 'fa-gear');
+        if (command === 'reboot') {
+          showToast('Server requested reboot', 'warning', 'System');
+          setTimeout(() => {
+            UIController.addSystemMessage('Virtual reboot complete.', 'fa-rotate-right');
+          }, 1000);
+        }
+      }
+    });
+
+    protocol.on('alert', (status, message, emotion) => {
+      Logger.warn(`[${assistantId.slice(0, 8)}] Alert: [${status}] ${message}`);
+      if (isActiveId(assistantId)) {
+        showToast(`${message}`, 'warning', status);
+        UIController.addSystemMessage(`⚠️ ${status}: ${message}`, 'fa-triangle-exclamation');
+      }
+    });
+
+    protocol.on('mcp', (payload, sessionId) => {
+      Logger.mcp(`[${assistantId.slice(0, 8)}] MCP message`, payload);
+    });
+  }
+
+  /**
+   * Switch the active assistant: updates AssistantManager's activeId
+   * (which fires onChange -> sidebar/header re-render, see UIController),
+   * ensures that assistant's session bundle exists, replays its chat
+   * history into the now-visible chat panel, and syncs the connection
+   * UI to reflect THAT session's actual live state — all WITHOUT
+   * touching any other session's connection.
+   */
+  function switchTo(assistantId) {
+    const switched = AssistantManager.setActive(assistantId);
+    if (!switched) return false;
+
+    const session = getOrCreateSession(assistantId);
+
+    // Replay this assistant's isolated chat history into the chat panel.
+    session.chat.renderHistory();
+
+    // Sync connection UI to this session's real current state (it may be
+    // mid-connect, connected, listening, speaking, or disconnected —
+    // completely independent of whatever the previously active assistant
+    // was doing).
+    const status = deviceStateToConnectionStatus(
+      session.deviceEmulator.getState(),
+      session.protocol.isConnected()
+    );
+    UIController.setConnectionState(status);
+    UIController.updateSessionId(session.protocol.getSessionId());
+
+    // PHASE 4: refresh avatar displays for the newly active assistant
+    try { AvatarSystem.refreshAllAvatarDisplays(); } catch(e) { /* non-fatal */ }
+
+    // OLIVIA FEATURE: restore THIS assistant's own saved volume onto the
+    // shared TTS gain node + repaint the slider/icon in the header.
+    try { VolumeSystem.refreshActiveVolume(); } catch(e) { /* non-fatal */ }
+
+    return true;
+  }
+
+  /** User clicks Connect for a specific assistant (defaults to active). */
+  async function connectAssistant(assistantId) {
+    const id = assistantId || AssistantManager.getActiveId();
+    const session = getOrCreateSession(id);
+    const { deviceEmulator, provisioning, protocol } = session;
+
+    if (protocol.isConnected() || protocol.isConnecting()) {
+      if (isActiveId(id)) showToast('Already connected or connecting', 'warning');
+      return;
+    }
+
+    const wsUrl = AssistantManager.getFlatField(id, 'wsUrl');
+    if (!wsUrl) {
+      if (isActiveId(id)) showToast('Please configure the WebSocket URL in Settings', 'error');
+      return;
+    }
+
+    Logger.ws(`[${id.slice(0, 8)}] User initiated connection...`);
+    deviceEmulator.setState(deviceEmulator.STATES.CONNECTING);
+
+    try {
+      // Step 1: Provision device if not yet paired (ESP32 activation flow).
+      if (!AssistantManager.isPairedById(id)) {
+        Logger.auth(`[${id.slice(0, 8)}] Device unpaired — starting OTA provisioning...`);
+        if (isActiveId(id)) {
+          UIController.addSystemMessage('Registering virtual device with Xiaozhi server...', 'fa-link');
+        }
+
+        const result = await provisioning.provision();
+
+        if (result.needsUserAction) {
+          if (isActiveId(id)) {
+            UIController.showPairingModal(result.code, result.message);
+            UIController.addSystemMessage(
+              `Activation code: ${result.code} — enter at xiaozhi.me`,
+              'fa-key'
+            );
+          }
+
+          await provisioning.waitForActivation();
+
+          if (isActiveId(id)) {
+            UIController.hidePairingModal();
+            UIController.addSystemMessage('Device paired successfully!', 'fa-circle-check');
+            showToast('Device paired!', 'success', 'Activation Complete');
+          }
+        }
+      } else {
+        // Device was previously paired. Refresh OTA to get latest token/URL.
+        Logger.auth(`[${id.slice(0, 8)}] Device previously paired — refreshing OTA config before connecting...`);
+        try {
+          const refreshResult = await provisioning.provision(true); // silent=true
+          if (refreshResult.needsUserAction) {
+            Logger.warn(`[${id.slice(0, 8)}] Previously paired device now requires re-activation`);
+            AssistantManager.clearPairingById(id);
+            if (isActiveId(id)) {
+              UIController.showPairingModal(refreshResult.code, refreshResult.message);
+              UIController.addSystemMessage(
+                `Re-activation required: ${refreshResult.code} — enter at xiaozhi.me`,
+                'fa-key'
+              );
+            }
+            await provisioning.waitForActivation();
+            if (isActiveId(id)) {
+              UIController.hidePairingModal();
+              UIController.addSystemMessage('Device re-paired successfully!', 'fa-circle-check');
+            }
+          } else {
+            Logger.auth(`[${id.slice(0, 8)}] OTA refresh complete — device still registered`);
+          }
+        } catch (otaErr) {
+          Logger.warn(`[${id.slice(0, 8)}] OTA refresh failed, proceeding with cached settings`, otaErr.message);
+        }
+      }
+
+      // Step 2: Connect WebSocket with token from OTA.
+      const token = AssistantManager.getFlatField(id, 'token');
+      Logger.auth(`[${id.slice(0, 8)}] Connecting with token: ${token ? '***' + token.slice(-4) : '(none)'}`);
+      const ok = await protocol.connect();
+      if (!ok) {
+        deviceEmulator.setState(deviceEmulator.STATES.ERROR, 'connect failed');
+        AssistantManager.setConnectionStatus(id, 'disconnected');
+        if (isActiveId(id)) {
+          UIController.setConnectionState('disconnected');
+          showToast('Failed to connect. Check server settings.', 'error', 'Connection Failed');
+        }
+      }
+    } catch (err) {
+      Logger.error(`[${id.slice(0, 8)}] Connect/provision failed`, err.message);
+      provisioning.cancel();
+      deviceEmulator.setState(deviceEmulator.STATES.ERROR, 'provisioning failed');
+      AssistantManager.setConnectionStatus(id, 'disconnected');
+      if (isActiveId(id)) {
+        UIController.hidePairingModal();
+        UIController.setConnectionState('disconnected');
+        showToast(err.message || 'Provisioning failed', 'error', 'Activation Failed');
+        UIController.addSystemMessage(`Activation error: ${err.message}`, 'fa-circle-exclamation');
+      }
+    }
+  }
+
+  /** User clicks Disconnect for a specific assistant (defaults to active). */
+  function disconnectAssistant(assistantId) {
+    const id = assistantId || AssistantManager.getActiveId();
+    const session = sessions.get(id);
+    if (!session) return;
+
+    session.protocol.sendAbort('user_interruption');
+    session.protocol.disconnect();
+    session.deviceEmulator.setState(session.deviceEmulator.STATES.IDLE, 'user disconnect');
+    AssistantManager.setConnectionStatus(id, 'disconnected');
+
+    if (isActiveId(id)) {
+      AudioEngine.stopCapture();
+      AudioEngine.clearTTSQueue();
+      UIController.hideTypingIndicator();
+      UIController.updateMicButtonState(false);
+      UIController.setConnectionState('disconnected');
+    }
+    Logger.ws(`[${id.slice(0, 8)}] User disconnected`);
+  }
+
+  /** Create a brand-new assistant, build its session, and switch to it. */
+  function createAssistant(name) {
+    const created = AssistantManager.createAssistant(name);
+    getOrCreateSession(created.id);
+    switchTo(created.id);
+    return created;
+  }
+
+  /**
+   * Delete an assistant: disconnect its session (if connected), tear the
+   * bundle out of the Map, then delegate the actual removal (including
+   * the "never delete the last assistant" guard and activeId re-pointing)
+   * to AssistantManager.removeAssistant(). On success, switch the UI to
+   * whichever assistant AssistantManager auto-selected as the new active
+   * one so the chat panel/header refresh immediately.
+   */
+  function deleteAssistant(id) {
+    const session = sessions.get(id);
+    if (session) {
+      try {
+        session.protocol.disconnect();
+      } catch (e) { /* already disconnected */ }
+      sessions.delete(id);
+    }
+
+    // PHASE 4: remove avatar from storage when deleting an assistant
+    try { AvatarStorage.remove(id); } catch(e) { /* non-fatal */ }
+
+    // OLIVIA FEATURE: remove this assistant's saved volume too, so
+    // localStorage doesn't accumulate orphaned entries for deleted assistants.
+    try { VolumeStorage.remove(id); } catch(e) { /* non-fatal */ }
+
+    const removed = AssistantManager.removeAssistant(id);
+    if (!removed) return false;
+
+    // AssistantManager already re-pointed activeId if we deleted the
+    // active assistant. Refresh the chat/connection UI to match.
+    switchTo(AssistantManager.getActiveId());
+    return true;
+  }
+
+  /** Rename an assistant (name is UI-label only, no session impact). */
+  function renameAssistant(id, name) {
+    return AssistantManager.renameAssistant(id, name);
+  }
+
+  /**
+   * Called once at boot: build a session for every persisted assistant
+   * (so background-connected state, once implemented, can be restored)
+   * and ensure the active one's chat history is rendered.
+   */
+  function initAll() {
+    AssistantManager.getAllAssistants().forEach(a => getOrCreateSession(a.id));
+    const activeId = AssistantManager.getActiveId();
+    if (activeId) {
+      const session = sessions.get(activeId);
+      session.chat.renderHistory();
+      const status = deviceStateToConnectionStatus(
+        session.deviceEmulator.getState(),
+        session.protocol.isConnected()
+      );
+      UIController.setConnectionState(status);
+    }
+  }
+
+  function getSession(id) { return sessions.get(id || AssistantManager.getActiveId()); }
+  function getActiveSession() { return sessions.get(AssistantManager.getActiveId()); }
+
+  return {
+    initAll,
+    getOrCreateSession,
+    getSession,
+    getActiveSession,
+    switchTo,
+    connectAssistant,
+    disconnectAssistant,
+    createAssistant,
+    deleteAssistant,
+    renameAssistant,
   };
 })();
 
@@ -2521,6 +4344,17 @@ const UIController = (() => {
     return els[id];
   }
 
+  // PHASE 2: which assistant's fields the Settings panel currently shows.
+  // Defaults to the active assistant but can be re-targeted to ANY
+  // assistant via the per-item gear icon in the sidebar list, so users
+  // can rename/reconfigure/delete a background assistant without first
+  // switching to it. All settings read/write functions below resolve
+  // this id via getSettingsTargetId() rather than assuming "active".
+  let settingsTargetId = null;
+  function getSettingsTargetId() {
+    return settingsTargetId || AssistantManager.getActiveId();
+  }
+
   /** Initialize UI bindings */
   function init() {
     // Tab switching
@@ -2528,12 +4362,46 @@ const UIController = (() => {
       btn.addEventListener('click', () => switchTab(btn.dataset.tab));
     });
 
-    // Settings panel
+    // Settings panel — gear in the sidebar profile card always targets
+    // the currently ACTIVE assistant (see openSettings()). Per-item gear
+    // icons in the AI Assistants list target THAT specific assistant
+    // (see openSettingsFor(), wired inside renderAssistantList()).
     el('settingsToggleBtn').addEventListener('click', openSettings);
     el('closeSettingsBtn').addEventListener('click', closeSettings);
     el('saveSettingsBtn').addEventListener('click', saveSettings);
     el('resetSettingsBtn').addEventListener('click', resetSettings);
     el('resetPairingBtn').addEventListener('click', resetPairing);
+
+    // PHASE 2: Assistant-level actions inside the Settings panel — all
+    // target getSettingsTargetId(), NOT necessarily the active assistant.
+    if (el('settingsReconnectBtn')) {
+      el('settingsReconnectBtn').addEventListener('click', () => {
+        SessionManager.connectAssistant(getSettingsTargetId());
+      });
+    }
+    if (el('settingsDisconnectBtn')) {
+      el('settingsDisconnectBtn').addEventListener('click', () => {
+        SessionManager.disconnectAssistant(getSettingsTargetId());
+      });
+    }
+    if (el('deleteAssistantBtn')) {
+      el('deleteAssistantBtn').addEventListener('click', handleDeleteAssistantClick);
+    }
+    if (el('assistantNameInput')) {
+      // Renaming saves immediately on blur (not gated behind the main
+      // "Save Settings" button) so it feels the same as renaming a
+      // channel/conversation in Discord/Slack-style apps.
+      el('assistantNameInput').addEventListener('blur', () => {
+        const id = getSettingsTargetId();
+        const newName = el('assistantNameInput').value.trim();
+        if (newName && SessionManager.renameAssistant(id, newName)) {
+          Logger.info(`Assistant ${id.slice(0, 8)} renamed to "${newName}"`);
+        } else {
+          // Reject empty name — restore the current value.
+          el('assistantNameInput').value = AssistantManager.getById(id)?.name || '';
+        }
+      });
+    }
 
     // Pairing modal
     el('copyPairingCodeBtn').addEventListener('click', copyPairingCode);
@@ -2543,9 +4411,10 @@ const UIController = (() => {
     el('connectBtn').addEventListener('click', () => AppController.connect());
     el('disconnectBtn').addEventListener('click', () => AppController.disconnect());
 
-    // Clear chat
+    // Clear chat — targets the active assistant's session.
     el('clearChatBtn').addEventListener('click', () => {
-      ChatEngine.clearMessages();
+      const session = SessionManager.getActiveSession();
+      if (session) session.chat.clearMessages();
       showToast('Chat cleared', 'info');
     });
 
@@ -2601,8 +4470,50 @@ const UIController = (() => {
       navigator.clipboard.writeText(text).then(() => showToast('Copied to clipboard', 'success'));
     });
 
+    // ── PHASE 2: AI Assistants sidebar — real "Add Assistant" ────────
+    // Creates a brand-new, fully independent assistant (own device
+    // identity, own pairing/connection, own chat history) and switches
+    // to it immediately. Every other assistant's live connection is
+    // completely untouched — see SessionManager.createAssistant().
+    const addAssistantBtn = el('addAssistantBtn');
+    if (addAssistantBtn) {
+      addAssistantBtn.addEventListener('click', () => {
+        const name = prompt('Name your new assistant:', 'New Assistant');
+        if (name === null) return; // user cancelled
+        const created = SessionManager.createAssistant(name.trim() || 'New Assistant');
+        showToast(`"${created.name}" created`, 'success', 'Assistant Added');
+      });
+    }
+
+    // Initial render of the assistant list + header from AssistantManager.
+    renderAssistantList();
+    renderActiveAssistantHeader();
+
+    // Keep the sidebar/header in sync with any AssistantManager change
+    // (switching active assistant, connection-status updates, etc.)
+    AssistantManager.onChange(() => {
+      renderAssistantList();
+      renderActiveAssistantHeader();
+    });
+
     // Load settings into form
     loadSettingsIntoForm();
+
+    // PHASE 4: Initialize the avatar upload system (non-blocking, catches all errors)
+    try {
+      AvatarSystem.init();
+    } catch (e) {
+      Logger.warn('[AvatarSystem] init failed non-fatally', e && e.message);
+    }
+
+    // OLIVIA FEATURE: Initialize per-assistant speech volume system
+    // (Speaker button + slider popup + live gain wiring). Non-blocking,
+    // catches all errors — a bug here must never prevent boot.
+    try {
+      VolumeSystem.init();
+    } catch (e) {
+      Logger.warn('[VolumeSystem] init failed non-fatally', e && e.message);
+    }
   }
 
   /** BUG #4 FIX: Close the mobile sidebar (no-op on desktop). */
@@ -2620,14 +4531,18 @@ const UIController = (() => {
   let micClickTimeout = null;
   let micToggled = false;
 
+  // PHASE 2 NOTE: mic capture (AudioEngine) is a single shared hardware
+  // resource, so voice input always targets the CURRENTLY ACTIVE
+  // assistant's session — there is no concept of "background" voice input.
   function handleMicMouseDown(e) {
-    if (!ProtocolClient.isConnected()) return;
+    const session = SessionManager.getActiveSession();
+    if (!session || !session.protocol.isConnected()) return;
     micClickTimeout = setTimeout(() => {
       micHolding = true;
       Logger.audio('PTT (push-to-talk) start');
       // BUG #4 FIX: Close mobile sidebar when voice input starts
       closeMobileSidebar();
-      ChatEngine.startVoiceInput('manual');
+      session.chat.startVoiceInput('manual');
       updateMicButtonState(true);
     }, 300);
   }
@@ -2636,14 +4551,16 @@ const UIController = (() => {
     if (micClickTimeout) clearTimeout(micClickTimeout);
     if (micHolding) {
       micHolding = false;
-      ChatEngine.stopVoiceInput();
+      const session = SessionManager.getActiveSession();
+      if (session) session.chat.stopVoiceInput();
       updateMicButtonState(false);
       Logger.audio('PTT stop');
     }
   }
 
   function handleMicClick(e) {
-    if (!ProtocolClient.isConnected()) {
+    const session = SessionManager.getActiveSession();
+    if (!session || !session.protocol.isConnected()) {
       showToast('Connect to server first', 'warning');
       return;
     }
@@ -2653,12 +4570,12 @@ const UIController = (() => {
         micToggled = true;
         // BUG #4 FIX: Close mobile sidebar when voice input starts
         closeMobileSidebar();
-        ChatEngine.startVoiceInput('auto');
+        session.chat.startVoiceInput('auto');
         updateMicButtonState(true);
         showToast('Listening... (click again to stop)', 'info');
       } else {
         micToggled = false;
-        ChatEngine.stopVoiceInput();
+        session.chat.stopVoiceInput();
         updateMicButtonState(false);
       }
     }
@@ -2706,6 +4623,25 @@ const UIController = (() => {
 
     if (!attachment && !text) return;
 
+    // OLIVIA FEATURE: intercept local natural-language volume commands
+    // BEFORE anything is sent to Xiaozhi. Only plain text messages (no
+    // image attachment) are checked — an image caption like "turn your
+    // volume up" alongside a photo is still ambiguous chat content, so
+    // it is intentionally left to normal vision/chat handling.
+    // VolumeSystem.tryHandleLocalCommand() returns true only when it
+    // fully recognized + applied the command (updated volume, painted
+    // the slider, and shown a local confirmation) — in that case the
+    // message must NOT reach ChatEngine.sendTextMessage()/Xiaozhi at all.
+    if (!attachment && text && VolumeSystem.tryHandleLocalCommand(text)) {
+      input.value = '';
+      input.style.height = 'auto';
+      const charCountEl2 = el('charCount');
+      if (charCountEl2) charCountEl2.textContent = '';
+      closeMobileSidebar();
+      ImageInput.closePopup();
+      return;
+    }
+
     input.value = '';
     input.style.height = 'auto';
     const charCountEl = el('charCount');
@@ -2717,14 +4653,17 @@ const UIController = (() => {
     // Close plus popup if open
     ImageInput.closePopup();
 
+    const session = SessionManager.getActiveSession();
+    if (!session) return;
+
     if (attachment) {
       // Image message: upload via vision API, then send text prompt
       const promptText = text || 'Please describe this image.';
       ImageInput.clearAttachment();  // Remove the preview bar
-      ChatEngine.sendImageMessage(attachment.blob, promptText, attachment.name, attachment.dataUrl);
+      session.chat.sendImageMessage(attachment.blob, promptText, attachment.name, attachment.dataUrl);
     } else {
       // Text-only message — unchanged behavior
-      ChatEngine.sendTextMessage(text);
+      session.chat.sendTextMessage(text);
     }
   }
 
@@ -2758,26 +4697,44 @@ const UIController = (() => {
   function updateIdentityDisplay() {
     const display = el('identityDisplay');
     if (!display) return;
-    const info = DeviceEmulator.getIdentityInfo();
+    const activeSession = SessionManager.getActiveSession();
+    const info = activeSession ? activeSession.deviceEmulator.getIdentityInfo() : {};
     display.innerHTML = Object.entries(info)
       .map(([k, v]) => `<div><strong>${k}:</strong> ${v}</div>`)
       .join('');
   }
 
+  /** Open Settings scoped to the currently ACTIVE assistant (sidebar
+   *  profile gear). */
   function openSettings() {
+    settingsTargetId = AssistantManager.getActiveId();
+    loadSettingsIntoForm();
+    el('settingsPanel').classList.add('open');
+  }
+
+  /** Open Settings scoped to a SPECIFIC assistant (per-item gear icon
+   *  in the AI Assistants sidebar list) — works for background
+   *  assistants too, without switching to them first. */
+  function openSettingsFor(assistantId) {
+    settingsTargetId = assistantId;
     loadSettingsIntoForm();
     el('settingsPanel').classList.add('open');
   }
 
   function closeSettings() {
     el('settingsPanel').classList.remove('open');
+    // Revert to "always follow the active assistant" once the panel closes.
+    settingsTargetId = null;
   }
 
   function loadSettingsIntoForm() {
-    const s = SettingsManager.getAll();
+    const id = getSettingsTargetId();
+    const s  = AssistantManager.getFlatSnapshot(id);
+    if (el('assistantNameInput')) el('assistantNameInput').value = s.assistantName || '';
     el('wsUrlInput').value           = s.wsUrl || '';
     if (el('otaUrlInput')) el('otaUrlInput').value = s.otaUrl || '';
-    el('deviceNameInput').value       = s.deviceName || '';
+    // PHASE 4: deviceNameInput is now hidden — still set it for protocol use
+    if (el('deviceNameInput')) el('deviceNameInput').value = 'O.L.I.V.I.A.';
     el('deviceIdInput').value         = s.deviceId || '';
     el('clientIdInput').value         = s.clientId || '';
     el('protocolVersionInput').value  = String(s.protocolVersion || 1);
@@ -2786,12 +4743,36 @@ const UIController = (() => {
     el('audioEnabled').checked        = s.audioEnabled !== false;
     el('ttsPlayback').checked         = s.ttsPlayback !== false;
     updatePairingStatusDisplay();
+    updateSettingsConnectionStatusDisplay();
+
+    // PHASE 4: load avatar for the assistant being edited
+    try { AvatarSystem.loadSettingsAvatar(id); } catch(e) { /* non-fatal */ }
+
+    // Never allow deleting the last remaining assistant — mirrors the
+    // hard backstop in AssistantManager.removeAssistant().
+    if (el('deleteAssistantBtn')) {
+      el('deleteAssistantBtn').disabled = AssistantManager.getAllAssistants().length <= 1;
+    }
+  }
+
+  /** Connection-status line inside the Settings panel — reflects
+   *  whichever assistant the panel is currently scoped to (which may
+   *  be a background assistant, not necessarily the one on screen). */
+  function updateSettingsConnectionStatusDisplay() {
+    const display = el('assistantConnectionStatusDisplay');
+    if (!display) return;
+    const id = getSettingsTargetId();
+    const a  = AssistantManager.getById(id);
+    const status = a ? a.connection.status : 'disconnected';
+    const info = ASSISTANT_STATUS_LABELS[status] || ASSISTANT_STATUS_LABELS.disconnected;
+    display.textContent = info.label;
+    display.className = 'pairing-status-display ' + (status === 'connected' || status === 'listening' || status === 'speaking' ? 'paired' : 'unpaired');
   }
 
   function updatePairingStatusDisplay() {
     const display = el('pairingStatusDisplay');
     if (!display) return;
-    if (SettingsManager.isPaired()) {
+    if (AssistantManager.isPairedById(getSettingsTargetId())) {
       display.textContent = 'Paired ✓';
       display.className = 'pairing-status-display paired';
     } else {
@@ -2856,7 +4837,8 @@ const UIController = (() => {
   }
 
   function cancelPairing() {
-    ProvisioningManager.cancel();
+    const session = SessionManager.getActiveSession();
+    if (session) session.provisioning.cancel();
     hidePairingModal();
     setConnectionState('disconnected');
     showToast('Pairing cancelled', 'info');
@@ -2864,41 +4846,74 @@ const UIController = (() => {
 
   function resetPairing() {
     if (!confirm('Reset pairing? You will need to activate again at xiaozhi.me.')) return;
-    SettingsManager.clearPairing();
+    AssistantManager.clearPairingById(getSettingsTargetId());
     updatePairingStatusDisplay();
     showToast('Pairing reset', 'info');
     Logger.auth('Pairing cleared by user');
   }
 
+  /** Delete the assistant the Settings panel currently targets — with
+   *  confirmation and the "never delete last one" guard surfaced as a
+   *  toast (the hard backstop itself lives in AssistantManager). */
+  function handleDeleteAssistantClick() {
+    const id = getSettingsTargetId();
+    const a = AssistantManager.getById(id);
+    if (!a) return;
+
+    if (AssistantManager.getAllAssistants().length <= 1) {
+      showToast('Cannot delete the last remaining assistant', 'error');
+      return;
+    }
+
+    if (!confirm(`Delete "${a.name}"? This disconnects it and permanently removes its chat history, pairing, and settings.`)) {
+      return;
+    }
+
+    const deleted = SessionManager.deleteAssistant(id);
+    if (deleted) {
+      closeSettings();
+      showToast(`"${a.name}" deleted`, 'info');
+    } else {
+      showToast('Could not delete assistant', 'error');
+    }
+  }
+
   function saveSettings() {
+    const id = getSettingsTargetId();
     const wsUrl = el('wsUrlInput').value.trim();
     if (!wsUrl) {
       showToast('WebSocket URL is required', 'error');
       return;
     }
 
-    SettingsManager.set('wsUrl',           wsUrl);
+    if (el('assistantNameInput')) {
+      const newName = el('assistantNameInput').value.trim();
+      if (newName) AssistantManager.renameAssistant(id, newName);
+    }
+
+    AssistantManager.setFlatField(id, 'wsUrl',           wsUrl);
     if (el('otaUrlInput')) {
       const otaUrl = el('otaUrlInput').value.trim();
-      if (otaUrl) SettingsManager.set('otaUrl', otaUrl);
+      if (otaUrl) AssistantManager.setFlatField(id, 'otaUrl', otaUrl);
     }
-    SettingsManager.set('deviceName',      el('deviceNameInput').value.trim() || 'Virtual ESP32');
-    SettingsManager.set('protocolVersion', parseInt(el('protocolVersionInput').value) || 1);
-    SettingsManager.set('frameDuration',   parseInt(el('frameDurationInput').value) || 60);
-    SettingsManager.set('listeningMode',   el('listeningModeInput').value);
-    SettingsManager.set('audioEnabled',    el('audioEnabled').checked);
-    SettingsManager.set('ttsPlayback',     el('ttsPlayback').checked);
+    // PHASE 4: Device Name is always O.L.I.V.I.A. — not user-editable
+    AssistantManager.setFlatField(id, 'deviceName', 'O.L.I.V.I.A.');
+    AssistantManager.setFlatField(id, 'protocolVersion', parseInt(el('protocolVersionInput').value) || 1);
+    AssistantManager.setFlatField(id, 'frameDuration',   parseInt(el('frameDurationInput').value) || 60);
+    AssistantManager.setFlatField(id, 'listeningMode',   el('listeningModeInput').value);
+    AssistantManager.setFlatField(id, 'audioEnabled',    el('audioEnabled').checked);
+    AssistantManager.setFlatField(id, 'ttsPlayback',     el('ttsPlayback').checked);
 
     // Update device ID / client ID only if user entered a value
     // Normalize deviceId to lowercase to match firmware format (required by server)
     const newDeviceId = el('deviceIdInput').value.trim();
-    if (newDeviceId) SettingsManager.set('deviceId', newDeviceId.toLowerCase());
+    if (newDeviceId) AssistantManager.setFlatField(id, 'deviceId', newDeviceId.toLowerCase());
 
     const newClientId = el('clientIdInput').value.trim();
-    if (newClientId) SettingsManager.set('clientId', newClientId);
+    if (newClientId) AssistantManager.setFlatField(id, 'clientId', newClientId);
 
-    // Update UI
-    el('deviceNameDisplay').textContent = SettingsManager.get('deviceName');
+    // PHASE 4: Sidebar device name display is always "O.L.I.V.I.A."
+    if (el('deviceNameDisplay')) el('deviceNameDisplay').textContent = 'O.L.I.V.I.A.';
 
     closeSettings();
     showToast('Settings saved', 'success');
@@ -2907,7 +4922,7 @@ const UIController = (() => {
 
   function resetSettings() {
     if (!confirm('Reset all settings to defaults? This will generate new device IDs.')) return;
-    SettingsManager.reset();
+    AssistantManager.resetById(getSettingsTargetId());
     loadSettingsIntoForm();
     showToast('Settings reset to defaults', 'info');
     Logger.info('Settings reset');
@@ -2915,6 +4930,16 @@ const UIController = (() => {
 
   /** Update connection status indicators */
   function setConnectionState(state, message = '') {
+    // PHASE 2 CHANGE: persisting connection status onto the assistant
+    // record now happens in SessionManager (which knows which assistant
+    // an event belongs to, active or not, and always calls
+    // AssistantManager.setConnectionStatus(id, status) so the sidebar
+    // reflects every assistant's live status independently). This
+    // function is now ONLY invoked by SessionManager when the event's
+    // assistant IS the one currently on screen, so it stays pure DOM/UI
+    // update — it no longer silently overwrites a background
+    // assistant's status with the active tab's status like the old
+    // AssistantManager.setActiveConnectionStatus() call used to.
     const statusDot     = el('statusDot');
     const statusText    = el('statusText');
     const connectionLabel = el('connectionLabel');
@@ -2944,7 +4969,7 @@ const UIController = (() => {
         stateChip.classList.add('connecting');
         stateChipText.textContent = 'CONNECTING';
         stateChipIcon.className = 'fas fa-circle-notch fa-spin';
-        chatSubtitle.textContent = 'Connecting to server...';
+        chatSubtitle.textContent = 'Powered by Olivia \u2014 Connecting...';
         connectBtn.style.display = 'none';
         disconnectBtn.style.display = 'flex';
         inputHint.textContent = 'Connecting...';
@@ -2959,7 +4984,7 @@ const UIController = (() => {
         stateChip.classList.add('connected');
         stateChipText.textContent = 'IDLE';
         stateChipIcon.className = 'fas fa-circle';
-        chatSubtitle.textContent = 'Virtual ESP32 Device — Connected';
+        chatSubtitle.textContent = 'Powered by Olivia \u2014 Connected';
         connectBtn.style.display = 'none';
         disconnectBtn.style.display = 'flex';
         deviceAvatar.classList.add('connected');
@@ -2973,7 +4998,7 @@ const UIController = (() => {
         stateChip.classList.add('listening');
         stateChipText.textContent = 'LISTENING';
         stateChipIcon.className = 'fas fa-microphone';
-        chatSubtitle.textContent = 'Listening to your voice...';
+        chatSubtitle.textContent = 'Powered by Olivia \u2014 Listening';
         deviceAvatar.classList.add('listening');
         break;
 
@@ -2983,7 +5008,7 @@ const UIController = (() => {
         stateChip.classList.add('speaking');
         stateChipText.textContent = 'SPEAKING';
         stateChipIcon.className = 'fas fa-volume-high';
-        chatSubtitle.textContent = 'AI is speaking...';
+        chatSubtitle.textContent = 'Powered by Olivia \u2014 Speaking';
         deviceAvatar.classList.add('speaking');
         break;
 
@@ -2997,7 +5022,7 @@ const UIController = (() => {
         stateChip.classList.add('idle');
         stateChipText.textContent = 'IDLE';
         stateChipIcon.className = 'fas fa-circle';
-        chatSubtitle.textContent = 'Virtual ESP32 Device';
+        chatSubtitle.textContent = 'Powered by Olivia \u2014 Disconnected';
         connectBtn.style.display = 'flex';
         disconnectBtn.style.display = 'none';
         sessionInfo.style.display = 'none';
@@ -3042,9 +5067,12 @@ const UIController = (() => {
       msgEl.classList.add('grouped-message');
     }
 
+    // PHASE 4: Use assistant avatar image for AI messages
+    const activeAssistantId = AssistantManager.getActiveId();
+    const aiAvatarSrc = AvatarSystem.getAvatarDataUrl(activeAssistantId) || '/static/olivia-avatar-default.svg';
     const avatar = isOutgoing ? '' : `
-      <div class="message-avatar">
-        <i class="fas fa-robot"></i>
+      <div class="message-avatar has-avatar">
+        <img class="assistant-avatar-img" src="${escapeHtml(aiAvatarSrc)}" alt="AI" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" />
       </div>
     `;
 
@@ -3092,9 +5120,12 @@ const UIController = (() => {
     msgEl.className = `message ${sender === 'user' ? 'outgoing' : 'incoming'} streaming`;
     msgEl.id = 'streaming_msg_' + Date.now();
 
+    // PHASE 4: Use assistant avatar image for streaming AI messages
+    const activeAssistantId = AssistantManager.getActiveId();
+    const aiAvatarSrc = AvatarSystem.getAvatarDataUrl(activeAssistantId) || '/static/olivia-avatar-default.svg';
     msgEl.innerHTML = `
-      <div class="message-avatar">
-        <i class="fas fa-robot"></i>
+      <div class="message-avatar has-avatar">
+        <img class="assistant-avatar-img" src="${escapeHtml(aiAvatarSrc)}" alt="AI" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" />
       </div>
       <div class="message-content">
         <div class="message-bubble"></div>
@@ -3137,6 +5168,15 @@ const UIController = (() => {
     const statusEl  = el('typingStatus');
     if (indicator) indicator.style.display = 'flex';
     if (statusEl)  statusEl.textContent = status;
+    // PHASE 4: refresh typing indicator avatar
+    try {
+      const typingImg = el('typingAvatarImg');
+      if (typingImg) {
+        const activeId = AssistantManager.getActiveId();
+        const dataUrl  = AvatarSystem.getAvatarDataUrl(activeId);
+        typingImg.src = dataUrl || AvatarSystem.DEFAULT_AVATAR;
+      }
+    } catch(e) { /* non-fatal */ }
     scrollToBottom(el('messagesContainer'));
   }
 
@@ -3181,7 +5221,7 @@ const UIController = (() => {
     container.innerHTML = `
       <div class="system-message" id="welcomeMsg">
         <i class="fas fa-microchip"></i>
-        <span>Virtual ESP32 device initialized. Click Connect to register and pair via xiaozhi.me.</span>
+        <span>O.L.I.V.I.A. initialized. Click Connect to register and pair via xiaozhi.me.</span>
       </div>
     `;
   }
@@ -3221,6 +5261,132 @@ const UIController = (() => {
       .replace(/'/g, '&#39;');
   }
 
+  // ================================================================
+  // PHASE 1 — Multi-Assistant Sidebar & Header Rendering
+  // ----------------------------------------------------------------
+  // Renders the "AI Assistants" list (replacing "Recent Conversations")
+  // and the chat header's active-assistant name, purely from
+  // AssistantManager's stored state. Selecting an assistant ONLY
+  // switches which assistant is active in the UI/state layer — it
+  // never reconnects, disconnects, or triggers pairing. Those flows
+  // are out of scope for this phase.
+  // ================================================================
+
+  /** Human-readable label + status-dot CSS class for a connection status */
+  const ASSISTANT_STATUS_LABELS = {
+    connected:    { label: 'Connected',    dot: 'online' },
+    connecting:   { label: 'Connecting…',  dot: 'connecting' },
+    listening:    { label: 'Listening',    dot: 'listening' },
+    speaking:     { label: 'Speaking',     dot: 'speaking' },
+    error:        { label: 'Error',        dot: 'error' },
+    disconnected: { label: 'Not connected', dot: 'offline' },
+  };
+
+  /** Render the "AI Assistants" sidebar list from AssistantManager state */
+  function renderAssistantList() {
+    const container = el('assistantListItems');
+    if (!container) return;
+
+    const assistants = AssistantManager.getAllAssistants();
+    const activeId = AssistantManager.getActiveId();
+
+    container.innerHTML = assistants.map(a => {
+      const statusInfo = ASSISTANT_STATUS_LABELS[a.connection.status] || ASSISTANT_STATUS_LABELS.disconnected;
+      const isActive = a.id === activeId;
+      // PHASE 4: Use assistant avatar image if available, fall back to default
+      const avatarSrc = AvatarSystem.getAvatarDataUrl(a.id) || '/static/olivia-avatar-default.svg';
+      return `
+        <div class="conv-item assistant-item${isActive ? ' active' : ''}" data-assistant-id="${escapeHtml(a.id)}" role="button" tabindex="0">
+          <div class="conv-avatar has-avatar assistant-avatar-clickable" data-avatar-for="${escapeHtml(a.id)}" title="Change avatar for ${escapeHtml(a.name)}">
+            <img class="assistant-avatar-img" src="${escapeHtml(avatarSrc)}" alt="${escapeHtml(a.name)} avatar" />
+          </div>
+          <div class="conv-meta">
+            <div class="conv-name">${escapeHtml(a.name)}</div>
+            <div class="conv-preview assistant-status-line">
+              <span class="status-dot ${statusInfo.dot}"></span>
+              ${escapeHtml(statusInfo.label)}
+            </div>
+          </div>
+          <button class="assistant-gear-btn" type="button" title="Settings for ${escapeHtml(a.name)}" aria-label="Settings for ${escapeHtml(a.name)}">
+            <i class="fas fa-gear"></i>
+          </button>
+        </div>
+      `;
+    }).join('');
+
+    // Wire up selection — switches which assistant's chat/connection UI
+    // is shown WITHOUT touching any assistant's live connection.
+    // PHASE 2 CHANGE: was AssistantManager.setActive(id) directly, which
+    // only flips activeId (no chat replay, no connection UI sync). Now
+    // routed through SessionManager.switchTo(), which does both AND
+    // guarantees the target assistant's session bundle exists.
+    container.querySelectorAll('.assistant-item').forEach(item => {
+      const handleSelect = () => {
+        const id = item.dataset.assistantId;
+        if (id === AssistantManager.getActiveId()) return;
+        SessionManager.switchTo(id);
+        // switchTo() -> AssistantManager.setActive() triggers onChange,
+        // which re-renders both the list and the header (see init()),
+        // and switchTo() itself replays chat history + syncs connection UI.
+      };
+      item.addEventListener('click', handleSelect);
+      item.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleSelect(); }
+      });
+
+      // Gear icon — opens Settings scoped to THIS assistant (not
+      // necessarily the active one), so users can configure a
+      // background assistant without switching to it first.
+      const gearBtn = item.querySelector('.assistant-gear-btn');
+      if (gearBtn) {
+        gearBtn.addEventListener('click', (e) => {
+          e.stopPropagation(); // don't also trigger handleSelect()
+          openSettingsFor(item.dataset.assistantId);
+        });
+      }
+
+      // PHASE 4: Avatar click in sidebar opens upload dialog for that assistant.
+      const avatarEl = item.querySelector('.conv-avatar.assistant-avatar-clickable');
+      if (avatarEl) {
+        avatarEl.addEventListener('click', (e) => {
+          e.stopPropagation(); // don't also trigger handleSelect()
+          const targetId = avatarEl.dataset.avatarFor;
+          if (targetId) AvatarSystem.openUploadDialog(targetId);
+        });
+      }
+    });
+  }
+
+  /**
+   * Sync the chat header title to the active assistant's Assistant Name.
+   * NOTE: this is deliberately distinct from #deviceNameDisplay in the
+   * sidebar profile card, which shows the active assistant's ESP32
+   * "Device Name" (already kept in sync per-assistant automatically via
+   * the SettingsManager shim over AssistantManager — see
+   * AppController.init() and saveSettings()). Assistant Name and Device
+   * Name are two separate fields on the Assistant model.
+   */
+  function renderActiveAssistantHeader() {
+    const active = AssistantManager.getActiveAssistant();
+    if (!active) return;
+
+    const headerName = el('activeAssistantName');
+    if (headerName) headerName.textContent = active.name;
+
+    // PHASE 4: Sidebar always shows "O.L.I.V.I.A." — the website identity.
+    // Device Name concept is hidden from UI entirely.
+    const sidebarDeviceName = el('deviceNameDisplay');
+    if (sidebarDeviceName) sidebarDeviceName.textContent = 'O.L.I.V.I.A.';
+
+    // PHASE 4: Update chat header avatar and sidebar avatar for active assistant.
+    AvatarSystem.refreshAllAvatarDisplays();
+
+    // OLIVIA FEATURE: keep the volume slider/icon in sync with whichever
+    // assistant is active (covers onChange firing from rename/status
+    // updates, not just an explicit switchTo()). Idempotent + cheap.
+    try { VolumeSystem.refreshActiveVolume(); } catch (e) { /* non-fatal */ }
+  }
+
   return {
     init,
     setConnectionState,
@@ -3242,6 +5408,10 @@ const UIController = (() => {
     hidePairingModal,
     updatePairingStatus,
     updatePairingStatusDisplay,
+    renderAssistantList,
+    renderActiveAssistantHeader,
+    // PHASE 4: expose the current settings target id for AvatarSystem
+    getSettingsTargetIdPublic: () => getSettingsTargetId(),
   };
 })();
 
@@ -3626,35 +5796,93 @@ const ImageInput = (() => {
 })();
 
 // ================================================================
+// ================================================================
+// MODULE: ThemeManager
+// Manages light/dark theme preference independently of system setting.
+// Persists to localStorage so choice survives page reload.
+// Applies via data-theme attribute on <html> element, which overrides
+// the @media (prefers-color-scheme) rule in style.css.
+// ================================================================
+const ThemeManager = (() => {
+  const STORAGE_KEY = 'olivia_theme_preference';
+  const DARK  = 'dark';
+  const LIGHT = 'light';
+
+  /** Returns the currently effective theme: 'dark' or 'light'. */
+  function getCurrent() {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored === DARK || stored === LIGHT) return stored;
+    // Fall back to system preference
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? DARK : LIGHT;
+  }
+
+  /** Apply the given theme to the document. */
+  function apply(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    // Update the toggle button icon title
+    const btn = document.getElementById('themeToggleBtn');
+    if (btn) {
+      btn.title = theme === DARK ? 'Switch to light theme' : 'Switch to dark theme';
+    }
+  }
+
+  /** Toggle between dark and light, persist the choice. */
+  function toggle() {
+    const next = getCurrent() === DARK ? LIGHT : DARK;
+    localStorage.setItem(STORAGE_KEY, next);
+    apply(next);
+  }
+
+  /** Initialize: apply saved/system preference and wire toggle button. */
+  function init() {
+    apply(getCurrent());
+    const btn = document.getElementById('themeToggleBtn');
+    if (btn) btn.addEventListener('click', toggle);
+  }
+
+  return { init, toggle, getCurrent };
+})();
+
 // MODULE: AppController
 // Coordinates all modules. Entry point for user actions.
 // ================================================================
 const AppController = (() => {
 
-  /** Initialize the application */
+  /**
+   * Initialize the application.
+   * ------------------------------------------------------------------
+   * PHASE 2 CHANGE: AppController no longer owns any protocol/device
+   * wiring or connect/disconnect logic — all of that moved into
+   * SessionManager, which builds one full, independent session bundle
+   * PER ASSISTANT ({deviceEmulator, provisioning, vision, protocol,
+   * chat}) instead of the old single set of global singletons.
+   * AppController.init() now just boots AssistantManager + UIController,
+   * then hands off to SessionManager.initAll() to build every persisted
+   * assistant's session and render the active one.
+   */
   async function init() {
     Logger.boot('Initializing virtual device...');
 
-    // Load settings
-    SettingsManager.load();
+    // Apply saved theme preference before rendering anything
+    ThemeManager.init();
 
-    // Update device name in UI
+    // Load all persisted assistants (was: SettingsManager.load(), which
+    // is itself now just a thin shim over AssistantManager.load()).
+    AssistantManager.load();
+
+    // PHASE 4: Sidebar always shows "O.L.I.V.I.A." — not the device name field
     const deviceNameDisplay = document.getElementById('deviceNameDisplay');
     if (deviceNameDisplay) {
-      deviceNameDisplay.textContent = SettingsManager.get('deviceName');
+      deviceNameDisplay.textContent = 'O.L.I.V.I.A.';
     }
 
-    // Initialize UI
+    // Initialize UI (renders sidebar/header, wires all button handlers)
     UIController.init();
 
-    // Wire up device state changes
-    DeviceEmulator.onStateChange(handleDeviceStateChange);
-
-    // Wire up protocol events
-    setupProtocolCallbacks();
-
-    // Set initial state
-    DeviceEmulator.setState(DeviceEmulator.STATES.IDLE, 'boot complete');
+    // Build a full session bundle for every persisted assistant, and
+    // render the active assistant's chat history + connection state.
+    SessionManager.initAll();
 
     // Check microphone availability
     const micPerm = await AudioEngine.checkMicPermission();
@@ -3677,282 +5905,27 @@ const AppController = (() => {
     setTimeout(() => {
       UIController.hideLoadingOverlay();
       Logger.boot('Virtual device ready');
-      Logger.boot(`Device-Id: ${SettingsManager.get('deviceId')}`);
-      Logger.boot(`Client-Id: ${SettingsManager.get('clientId')}`);
-      Logger.boot(`WS URL: ${SettingsManager.get('wsUrl')}`);
+      Logger.boot(`Active assistant Device-Id: ${AssistantManager.getActiveFlatField('deviceId')}`);
+      Logger.boot(`Active assistant Client-Id: ${AssistantManager.getActiveFlatField('clientId')}`);
+      Logger.boot(`Active assistant WS URL: ${AssistantManager.getActiveFlatField('wsUrl')}`);
       Logger.boot('Text mode: listen{detect} protocol (correct server bypass)');
       Logger.boot('Voice mode: real Opus encoding @ 16kHz mono 60ms frames');
     }, 800);
   }
 
-  /** Setup all protocol event callbacks */
-  function setupProtocolCallbacks() {
-
-    ProtocolClient.on('connected', (sessionId, helloMsg) => {
-      Logger.ws(`Connected! Session ID: ${sessionId}`);
-      UIController.setConnectionState('connected');
-      UIController.updateSessionId(sessionId);
-      UIController.addSystemMessage(
-        `Connected to Xiaozhi server. Session: ${sessionId || '(no session id)'}`,
-        'fa-plug-circle-check'
-      );
-      showToast('Connected to Xiaozhi server!', 'success', 'Connected');
-    });
-
-    ProtocolClient.on('disconnected', (code, reason) => {
-      Logger.ws(`Disconnected: ${code} ${reason}`);
-      UIController.setConnectionState('disconnected');
-      UIController.updateSessionId('');
-      UIController.hideTypingIndicator();
-      AudioEngine.clearTTSQueue();
-
-      if (!reason || reason === 'User disconnect') {
-        UIController.addSystemMessage('Disconnected from server.', 'fa-plug-circle-xmark');
-      } else {
-        UIController.addSystemMessage(`Disconnected: ${reason || 'Connection lost'}`, 'fa-exclamation-circle');
-        showToast(`Disconnected: ${reason || 'Connection lost'}`, 'error', 'Disconnected');
-      }
-    });
-
-    ProtocolClient.on('error', (message) => {
-      Logger.error('Protocol error', message);
-      UIController.setConnectionState('disconnected');
-      UIController.hideTypingIndicator();
-      showToast(message, 'error', 'Connection Error');
-      UIController.addSystemMessage(`Error: ${message}`, 'fa-circle-exclamation');
-    });
-
-    ProtocolClient.on('stt', (text, sessionId) => {
-      // STT = speech-to-text result of what the user said via voice.
-      Logger.chat(`STT received: "${text}"`);
-      console.log('[STT callback fired]', text);
-      UIController.hideSTTPreview();
-
-      // BUG #1 FIX (duplicate typed messages):
-      // For VOICE input, the STT event is the first (and only) place we render the
-      // user's message, so we always add it here.
-      // For TYPED text, sendTextMessage() already called addMessage() and set
-      // pendingUserMessage to the same string.  The server echoes back an stt event
-      // with that same text.  We must NOT add it a second time.
-      // Solution: skip rendering if the text matches the pending typed message.
-      if (text && text.trim()) {
-        if (ChatEngine.consumePendingUserMessage(text.trim())) {
-          // Message was already rendered by sendTextMessage(); skip duplicate.
-          Logger.chat('STT matches pending typed message — skipping duplicate render');
-        } else {
-          // Voice-transcribed message: render it now.
-          ChatEngine.addMessage('user', text.trim());
-        }
-      }
-
-      // Show 'AI is thinking...' indicator while we wait for the LLM/TTS response.
-      UIController.showTypingIndicator('AI is thinking...');
-    });
-
-    ProtocolClient.on('llm', (emotion, text, sessionId) => {
-      // Hide "Sending to AI..." / "AI is thinking..." when LLM starts
-      UIController.hideTypingIndicator();
-
-      // BUG #2 FIX: Do NOT call showEmotionBadge — emotion badge removed per spec.
-      // BUG #2 FIX: Do NOT call beginAIResponse here — that would create an empty
-      // bubble in the DOM before any text arrives (the "blank bubble").
-      // The streaming element is created lazily on the first ttsSentence instead.
-      // We still reset ChatEngine's internal state so it is ready for sentences.
-      ChatEngine.resetAIResponse();
-    });
-
-    ProtocolClient.on('ttsStart', (sessionId) => {
-      Logger.chat('TTS started');
-      console.log('[TTS start callback fired]', sessionId);
-      // Hide typing indicator when TTS begins (covers cases where no stt/llm event fired)
-      UIController.hideTypingIndicator();
-      UIController.setConnectionState('speaking');
-
-      // If beginAIResponse() was never called (LLM event skipped),
-      // start the streaming bubble now so ttsSentence events have somewhere to render.
-      ChatEngine.ensureAIResponseStarted();
-    });
-
-    ProtocolClient.on('ttsSentence', (text, sessionId) => {
-      if (text) {
-        Logger.chat(`TTS sentence: "${text}"`);
-        console.log('[TTS sentence callback fired]', text);
-        ChatEngine.appendAIResponseSentence(text);
-      }
-    });
-
-    ProtocolClient.on('ttsStop', (sessionId) => {
-      Logger.chat('TTS stopped');
-      console.log('[TTS stop callback fired]', sessionId);
-      // Ensure typing indicator is always gone after TTS ends
-      UIController.hideTypingIndicator();
-      UIController.setConnectionState('connected');
-      ChatEngine.finalizeAIResponse();
-
-      // Auto-listen mode: restart listening after AI speaks
-      if (SettingsManager.get('listeningMode') === 'auto' &&
-          AudioEngine.isCapturing()) {
-        ProtocolClient.sendListenStart('auto');
-      }
-    });
-
-    ProtocolClient.on('audio', (buffer) => {
-      // Already handled by binary message dispatcher + AudioEngine
-    });
-
-    ProtocolClient.on('system', (command, msg) => {
-      Logger.warn(`System command received: ${command}`);
-      UIController.addSystemMessage(`System: ${command}`, 'fa-gear');
-
-      if (command === 'reboot') {
-        showToast('Server requested reboot', 'warning', 'System');
-        setTimeout(() => {
-          UIController.addSystemMessage('Virtual reboot complete.', 'fa-rotate-right');
-        }, 1000);
-      }
-    });
-
-    ProtocolClient.on('alert', (status, message, emotion) => {
-      Logger.warn(`Alert: [${status}] ${message}`);
-      showToast(`${message}`, 'warning', status);
-      UIController.addSystemMessage(`⚠️ ${status}: ${message}`, 'fa-triangle-exclamation');
-    });
-
-    ProtocolClient.on('mcp', (payload, sessionId) => {
-      Logger.mcp('MCP message', payload);
-    });
-  }
-
-  /** Handle device state machine transitions */
-  function handleDeviceStateChange(newState, prevState, reason) {
-    const S = DeviceEmulator.STATES;
-
-    switch (newState) {
-      case S.CONNECTING:
-        UIController.setConnectionState('connecting');
-        break;
-      case S.IDLE:
-        if (prevState === S.CONNECTING) {
-          // Do nothing, onConnected callback handles this
-        } else if (prevState !== S.UNKNOWN && prevState !== S.STARTING) {
-          UIController.setConnectionState(
-            ProtocolClient.isConnected() ? 'connected' : 'disconnected'
-          );
-        }
-        break;
-      case S.LISTENING:
-        UIController.setConnectionState('listening');
-        break;
-      case S.SPEAKING:
-        UIController.setConnectionState('speaking');
-        break;
-      case S.ERROR:
-        UIController.setConnectionState('disconnected');
-        break;
-    }
-  }
-
-  /** User clicks Connect button */
+  /** User clicks Connect button — always targets the active assistant. */
   async function connect() {
-    if (ProtocolClient.isConnected() || ProtocolClient.isConnecting()) {
-      showToast('Already connected or connecting', 'warning');
-      return;
-    }
-
-    const wsUrl = SettingsManager.get('wsUrl');
-    if (!wsUrl) {
-      showToast('Please configure the WebSocket URL in Settings', 'error');
-      return;
-    }
-
-    Logger.ws('User initiated connection...');
-    UIController.setConnectionState('connecting');
-
-    try {
-      // Step 1: Provision device if not yet paired (ESP32 activation flow).
-      // Mirrors ESP32 firmware: CheckNewVersion() → if activation needed, show code,
-      // poll Activate() until ESP_OK → loop back to CheckVersion() to confirm.
-      if (!SettingsManager.isPaired()) {
-        Logger.auth('Device unpaired — starting OTA provisioning...');
-        UIController.addSystemMessage('Registering virtual device with Xiaozhi server...', 'fa-link');
-
-        const result = await ProvisioningManager.provision();
-
-        if (result.needsUserAction) {
-          UIController.showPairingModal(result.code, result.message);
-          UIController.addSystemMessage(
-            `Activation code: ${result.code} — enter at xiaozhi.me`,
-            'fa-key'
-          );
-
-          // waitForActivation() blocks until HTTP 200 from /activate AND the
-          // subsequent CheckVersion() confirms the device is registered (no activation
-          // code returned). This mirrors the firmware's two-phase confirmation.
-          await ProvisioningManager.waitForActivation();
-          UIController.hidePairingModal();
-          UIController.addSystemMessage('Device paired successfully!', 'fa-circle-check');
-          showToast('Device paired!', 'success', 'Activation Complete');
-        }
-      } else {
-        // Device was previously paired. Run a fresh OTA check to get the latest
-        // token and WebSocket URL (in case server changed them).
-        // This also re-validates the pairing — if OTA returns activation code again,
-        // the token may have expired and the device needs to re-pair.
-        Logger.auth('Device previously paired — refreshing OTA config before connecting...');
-        try {
-          const refreshResult = await ProvisioningManager.provision(true);  // silent=true
-          if (refreshResult.needsUserAction) {
-            // Unexpected: paired device now needs activation again (device reset on server?)
-            Logger.warn('Previously paired device now requires re-activation');
-            SettingsManager.clearPairing();
-            UIController.showPairingModal(refreshResult.code, refreshResult.message);
-            UIController.addSystemMessage(
-              `Re-activation required: ${refreshResult.code} — enter at xiaozhi.me`,
-              'fa-key'
-            );
-            await ProvisioningManager.waitForActivation();
-            UIController.hidePairingModal();
-            UIController.addSystemMessage('Device re-paired successfully!', 'fa-circle-check');
-          } else {
-            Logger.auth('OTA refresh complete — device still registered');
-          }
-        } catch (otaErr) {
-          Logger.warn('OTA refresh failed, proceeding with cached settings', otaErr.message);
-        }
-      }
-
-      // Step 2: Connect WebSocket with token from OTA.
-      // The token ('test-token' or real JWT) is stored in SettingsManager by checkVersion().
-      Logger.auth(`Connecting with token: ${SettingsManager.get('token') ? '***' + SettingsManager.get('token').slice(-4) : '(none)'}`);
-      const ok = await ProtocolClient.connect();
-      if (!ok) {
-        UIController.setConnectionState('disconnected');
-        showToast('Failed to connect. Check server settings.', 'error', 'Connection Failed');
-      }
-    } catch (err) {
-      Logger.error('Connect/provision failed', err.message);
-      ProvisioningManager.cancel();
-      UIController.hidePairingModal();
-      UIController.setConnectionState('disconnected');
-      showToast(err.message || 'Provisioning failed', 'error', 'Activation Failed');
-      UIController.addSystemMessage(`Activation error: ${err.message}`, 'fa-circle-exclamation');
-    }
+    await SessionManager.connectAssistant(AssistantManager.getActiveId());
   }
 
-  /** User clicks Disconnect button */
+  /** User clicks Disconnect button — always targets the active assistant. */
   function disconnect() {
-    ProtocolClient.sendAbort('user_interruption');
-    ProtocolClient.disconnect();
-    AudioEngine.stopCapture();
-    AudioEngine.clearTTSQueue();
-    UIController.hideTypingIndicator();
-    UIController.updateMicButtonState(false);
-    Logger.ws('User disconnected');
-    UIController.setConnectionState('disconnected');
+    SessionManager.disconnectAssistant(AssistantManager.getActiveId());
   }
 
   return { init, connect, disconnect };
 })();
+
 
 // ================================================================
 // APPLICATION ENTRY POINT
@@ -3967,31 +5940,46 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // Handle page unload - clean disconnect
+// PHASE 2 CHANGE: disconnect EVERY assistant's live session on unload,
+// not just "the" singleton connection — each assistant's ProtocolClient
+// instance is an independent WebSocket that needs its own clean close.
 window.addEventListener('beforeunload', () => {
-  if (ProtocolClient.isConnected()) {
-    ProtocolClient.disconnect();
-  }
+  AssistantManager.getAllAssistants().forEach(a => {
+    const session = SessionManager.getSession(a.id);
+    if (session && session.protocol.isConnected()) {
+      session.protocol.disconnect();
+    }
+  });
 });
 
-// Expose to browser console for debugging
+// Expose to browser console for debugging.
+// PHASE 2 CHANGE: ProtocolClient/ProvisioningManager/DeviceEmulator/
+// VisionCapability/ChatEngine are now factories with no single instance —
+// `protocol`/`chat`/`device`/`provisioning` below always resolve to the
+// CURRENTLY ACTIVE assistant's session bundle at call-time (via getters),
+// so `XiaozhiDebug.protocol.isConnected()` still works exactly as before
+// for whichever assistant is on screen when you call it.
 window.XiaozhiDebug = {
-  protocol:     ProtocolClient,
-  settings:     SettingsManager,
-  provisioning: ProvisioningManager,
-  device:       DeviceEmulator,
-  audio:        AudioEngine,
-  chat:         ChatEngine,
-  ui:           UIController,
-  app:          AppController,
-  logger:       Logger,
+  sessionManager: SessionManager,
+  assistants:     AssistantManager,
+  settings:       SettingsManager,
+  audio:          AudioEngine,
+  ui:             UIController,
+  app:            AppController,
+  theme:          ThemeManager,
+  logger:         Logger,
+  get protocol()     { return SessionManager.getActiveSession()?.protocol; },
+  get provisioning() { return SessionManager.getActiveSession()?.provisioning; },
+  get device()       { return SessionManager.getActiveSession()?.deviceEmulator; },
+  get chat()         { return SessionManager.getActiveSession()?.chat; },
   quickTest: async (message) => {
     await AppController.connect();
     if (message) {
-      setTimeout(() => ChatEngine.sendTextMessage(message), 2000);
+      setTimeout(() => SessionManager.getActiveSession()?.chat.sendTextMessage(message), 2000);
     }
   },
-  // Direct protocol test — bypasses ChatEngine UI
-  sendDetect: (text) => ProtocolClient.sendListenDetect(text),
+  // Direct protocol test — bypasses ChatEngine UI. Targets active assistant.
+  sendDetect: (text) => SessionManager.getActiveSession()?.protocol.sendListenDetect(text),
   // Check opus status
   opusStatus: () => AudioEngine.loadOpus().then(m => ({ loaded: true, version: m.version })).catch(e => ({ loaded: false, error: e.message })),
 };

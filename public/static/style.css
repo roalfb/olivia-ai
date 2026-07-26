@@ -53,9 +53,51 @@
   --transition:       0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* ─── Dark Mode ────────────────────────────────────────────────── */
+/* ─── Theme Toggle Support ─────────────────────────────────────── */
+/* Manual theme override via data-theme attribute on <html>.
+   Light theme variables are already defined in :root above.
+   When data-theme="dark" is set (by JS), these override the root vars.
+   When data-theme is absent, system preference (@media) takes effect. */
+
+[data-theme="dark"] {
+  --bg-primary:         #18191a;
+  --bg-secondary:       #242526;
+  --bg-sidebar:         #242526;
+  --bg-chat:            #18191a;
+  --bg-input:           #3a3b3c;
+  --text-primary:       #e4e6eb;
+  --text-secondary:     #b0b3b8;
+  --text-muted:         #8a8d91;
+  --border:             #3a3b3c;
+  --bubble-in:          #3a3b3c;
+  --bubble-in-text:     #e4e6eb;
+  --bubble-system:      #3a3b3c;
+  /* Active assistant item in dark mode: deep navy background with light text */
+  --active-item-bg:     #1a3a5c;
+  --active-item-text:   #ffffff;
+}
+
+[data-theme="light"] {
+  /* Explicit light override (mirrors :root defaults) */
+  --bg-primary:         #f0f2f5;
+  --bg-secondary:       #ffffff;
+  --bg-sidebar:         #ffffff;
+  --bg-chat:            #f0f2f5;
+  --bg-input:           #f0f2f5;
+  --text-primary:       #1c1e21;
+  --text-secondary:     #65676b;
+  --text-muted:         #8a8d91;
+  --border:             #e4e6eb;
+  --bubble-in:          #e4e6eb;
+  --bubble-in-text:     #1c1e21;
+  --bubble-system:      #e4e6eb;
+  --active-item-bg:     var(--primary-light);
+  --active-item-text:   #1c1e21;
+}
+
+/* ─── Dark Mode (system preference — used when data-theme is absent) ── */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg-primary:     #18191a;
     --bg-secondary:   #242526;
     --bg-sidebar:     #242526;
@@ -68,7 +110,16 @@
     --bubble-in:      #3a3b3c;
     --bubble-in-text: #e4e6eb;
     --bubble-system:  #3a3b3c;
+    /* Active assistant item in dark mode */
+    --active-item-bg:   #1a3a5c;
+    --active-item-text: #ffffff;
   }
+}
+
+/* ─── Light mode active item defaults ───────────────────────────── */
+:root {
+  --active-item-bg:   var(--primary-light);
+  --active-item-text: #1c1e21;
 }
 
 /* ─── Reset & Base ─────────────────────────────────────────────── */
@@ -242,6 +293,39 @@ body {
   transform: rotate(45deg);
 }
 
+/* Theme Toggle Button — sits next to the gear icon in sidebar header */
+.theme-toggle-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+.theme-toggle-btn:hover {
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+/* Show sun icon in dark mode, moon icon in light mode */
+.theme-toggle-btn .icon-sun  { display: none; }
+.theme-toggle-btn .icon-moon { display: inline; }
+[data-theme="dark"] .theme-toggle-btn .icon-sun  { display: inline; }
+[data-theme="dark"] .theme-toggle-btn .icon-moon { display: none; }
+[data-theme="light"] .theme-toggle-btn .icon-sun  { display: none; }
+[data-theme="light"] .theme-toggle-btn .icon-moon { display: inline; }
+/* When system is dark and no override, also show sun */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .theme-toggle-btn .icon-sun  { display: inline; }
+  :root:not([data-theme="light"]) .theme-toggle-btn .icon-moon { display: none; }
+}
+
 /* Sidebar Tabs */
 .sidebar-tabs {
   display: flex;
@@ -337,8 +421,30 @@ body {
   transition: background var(--transition);
 }
 
-.conv-item:hover, .conv-item.active {
+.conv-item:hover {
   background: var(--primary-light);
+}
+
+/* Active assistant: use theme-aware vars so dark mode shows readable dark-navy bg + white text */
+.conv-item.active {
+  background: var(--active-item-bg);
+}
+
+/* Keep active background consistent even on hover — don't lose the navy bg */
+.conv-item.active:hover {
+  background: var(--active-item-bg);
+  filter: brightness(1.15);
+}
+
+/* Ensure the name text is readable on the active item background in dark mode */
+.conv-item.active .conv-name {
+  color: var(--active-item-text);
+}
+
+/* Also make preview text readable under active background */
+.conv-item.active .conv-preview,
+.conv-item.active .conv-time {
+  opacity: 0.85;
 }
 
 .conv-avatar {
@@ -366,6 +472,71 @@ body {
 }
 
 .conv-time { font-size: 11px; color: var(--text-muted); flex-shrink: 0; }
+
+/* AI Assistants list (PHASE 1: Multi-Assistant Foundation) */
+.assistant-item { user-select: none; }
+.assistant-status-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.assistant-status-line .status-dot {
+  position: static;
+  flex-shrink: 0;
+}
+
+/* PHASE 2: per-assistant gear icon — opens Settings scoped to that
+   specific assistant (active or in the background) without switching
+   to it first. Hidden until hover/focus to keep the list visually calm,
+   but always focusable for keyboard/touch accessibility. */
+.assistant-gear-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--transition), background var(--transition), color var(--transition);
+}
+.conv-item:hover .assistant-gear-btn,
+.assistant-gear-btn:focus-visible {
+  opacity: 1;
+}
+.assistant-gear-btn:hover {
+  background: var(--bg-input);
+  color: var(--primary);
+}
+
+.add-assistant-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px 8px;
+  border: 1.5px dashed var(--border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+
+.add-assistant-btn:hover {
+  background: var(--primary-light);
+  border-color: var(--primary);
+  color: var(--primary);
+}
 
 /* Audio Meter */
 .audio-meter-section {
@@ -532,6 +703,14 @@ body {
   border-top: 1px solid var(--border);
 }
 
+/* PHASE 2: Connect/Disconnect pair inside the per-assistant Settings
+   panel — sits side-by-side above the Delete Assistant danger button. */
+.settings-connection-actions {
+  display: flex;
+  gap: 8px;
+}
+.settings-connection-actions .btn-secondary { flex: 1; }
+
 /* ─── BUTTONS ──────────────────────────────────────────────────── */
 .btn-primary {
   background: var(--primary);
@@ -583,6 +762,25 @@ body {
   transition: all var(--transition);
 }
 .btn-small:hover { background: var(--border); color: var(--text-primary); }
+
+/* PHASE 2: Danger button (Delete Assistant) — mirrors .btn-secondary
+   layout but uses the --danger accent so destructive actions stand out. */
+.btn-danger {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  padding: 10px 16px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all var(--transition);
+}
+.btn-danger:hover { background: var(--danger); color: white; }
 
 /* ─── CHAT AREA ─────────────────────────────────────────────────── */
 .chat-area {
@@ -704,6 +902,87 @@ body {
 }
 .action-btn:hover { background: var(--bg-input); color: var(--primary); }
 .action-btn.danger:hover { color: var(--danger); background: rgba(255,68,68,0.1); }
+
+/* ════════════════════════════════════════════════════════════
+   OLIVIA FEATURE — Per-assistant speech volume
+   Speaker button (chat header) + floating slider popup.
+   Local playback control only — never touches Xiaozhi.
+   ════════════════════════════════════════════════════════════ */
+.speaker-btn-wrapper {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.speaker-btn-wrapper .action-btn.volume-active {
+  color: var(--primary);
+}
+
+.volume-popup {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.10);
+  min-width: 190px;
+  padding: 14px 16px 10px;
+  z-index: 200;
+  animation: popupIn 0.15s ease-out;
+}
+
+.volume-popup-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.volume-popup-icon-min,
+.volume-popup-icon-max {
+  font-size: 13px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.volume-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  outline: none;
+  cursor: pointer;
+}
+
+.volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--primary);
+  cursor: pointer;
+  transition: transform 0.1s ease;
+}
+.volume-slider::-webkit-slider-thumb:hover { transform: scale(1.15); }
+
+.volume-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: none;
+  cursor: pointer;
+}
+
+.volume-popup-label {
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-top: 6px;
+}
 
 /* Messages Container */
 .messages-container {
@@ -1596,6 +1875,12 @@ body {
   .chat-header-actions {
     gap: 4px;
   }
+
+  /* ── Volume popup: keep on-screen on narrow viewports ──── */
+  .volume-popup {
+    right: -8px;
+    min-width: 170px;
+  }
 }
 
 /* ── Very small phones (≤ 375px) ─────────────────────────────── */
@@ -2130,5 +2415,175 @@ body {
     max-width: 180px;
     max-height: 180px;
   }
+}
+
+
+/* ================================================================
+   PHASE 4 — Assistant Avatar System
+   ================================================================ */
+
+/* ── Assistant avatar image container (sidebar + chat header) ── */
+.assistant-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  display: block;
+}
+
+/* ── Clickable avatar styling ── */
+.assistant-avatar-clickable {
+  cursor: pointer;
+  position: relative;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.assistant-avatar-clickable:hover {
+  transform: scale(1.06);
+  box-shadow: 0 0 0 3px var(--primary);
+}
+
+.assistant-avatar-clickable::after {
+  content: '\f030'; /* fa-camera */
+  font-family: 'Font Awesome 6 Free';
+  font-weight: 900;
+  position: absolute;
+  bottom: -3px;
+  right: -3px;
+  width: 18px;
+  height: 18px;
+  background: var(--primary);
+  border-radius: 50%;
+  border: 2px solid var(--bg-secondary);
+  font-size: 8px;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 14px;
+  text-align: center;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.assistant-avatar-clickable:hover::after {
+  opacity: 1;
+}
+
+/* ── conv-avatar with image (sidebar assistant list) ── */
+.conv-avatar.has-avatar {
+  background: none;
+  padding: 0;
+  overflow: hidden;
+}
+
+.conv-avatar.has-avatar .assistant-avatar-img {
+  border-radius: 50%;
+}
+
+/* ── chat-avatar overrides for real images ── */
+.chat-avatar.assistant-avatar-clickable {
+  overflow: hidden;
+  background: linear-gradient(135deg, #0084ff, #00c6ff);
+  padding: 0;
+}
+
+/* ── Settings panel avatar preview ── */
+.settings-avatar-section {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.settings-avatar-preview {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 3px solid var(--border);
+  flex-shrink: 0;
+  background: linear-gradient(135deg, #0084ff, #00c6ff);
+}
+
+.settings-avatar-preview .assistant-avatar-img {
+  border-radius: 0;
+}
+
+.settings-avatar-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.btn-small-danger {
+  background: transparent;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+.btn-small-danger:hover {
+  background: rgba(255, 68, 68, 0.1);
+}
+
+/* ── Avatar upload overlay modal ── */
+.avatar-upload-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.avatar-upload-modal {
+  background: var(--bg-secondary);
+  border-radius: 20px;
+  padding: 28px;
+  max-width: 360px;
+  width: 90%;
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+}
+
+.avatar-upload-modal h3 {
+  margin: 0 0 16px;
+  font-size: 18px;
+  color: var(--text-primary);
+}
+
+.avatar-upload-preview-wrap {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  overflow: hidden;
+  margin: 0 auto 20px;
+  border: 4px solid var(--primary);
+  background: linear-gradient(135deg, #0084ff, #00c6ff);
+}
+
+.avatar-upload-preview-wrap img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.avatar-upload-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+/* ── message avatar with image ── */
+.message-avatar.has-avatar {
+  background: none;
+  padding: 0;
+  overflow: hidden;
 }
 

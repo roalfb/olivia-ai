@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bodyGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1e40af;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#3b82f6;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="headGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1d4ed8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#60a5fa;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <!-- Background circle -->
+  <circle cx="128" cy="128" r="120" fill="url(#bodyGrad)" opacity="0.15"/>
+  <!-- Head -->
+  <rect x="76" y="52" width="104" height="96" rx="20" ry="20" fill="url(#headGrad)" stroke="#60a5fa" stroke-width="2"/>
+  <!-- Antenna -->
+  <line x1="128" y1="52" x2="128" y2="30" stroke="#60a5fa" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="128" cy="25" r="7" fill="#3b82f6" filter="url(#glow)"/>
+  <!-- Eyes -->
+  <rect x="95" y="75" width="22" height="16" rx="8" fill="#e0f2fe" filter="url(#glow)"/>
+  <rect x="139" y="75" width="22" height="16" rx="8" fill="#e0f2fe" filter="url(#glow)"/>
+  <circle cx="106" cy="83" r="5" fill="#0284c7"/>
+  <circle cx="150" cy="83" r="5" fill="#0284c7"/>
+  <circle cx="108" cy="81" r="2" fill="white" opacity="0.8"/>
+  <circle cx="152" cy="81" r="2" fill="white" opacity="0.8"/>
+  <!-- Mouth -->
+  <path d="M 100 112 Q 128 130 156 112" stroke="#e0f2fe" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Ear panels -->
+  <rect x="62" y="78" width="14" height="28" rx="7" fill="#1e40af" stroke="#60a5fa" stroke-width="1.5"/>
+  <rect x="180" y="78" width="14" height="28" rx="7" fill="#1e40af" stroke="#60a5fa" stroke-width="1.5"/>
+  <!-- Neck -->
+  <rect x="115" y="148" width="26" height="16" rx="4" fill="#1e40af"/>
+  <!-- Body -->
+  <rect x="64" y="164" width="128" height="70" rx="16" fill="url(#headGrad)" stroke="#60a5fa" stroke-width="2"/>
+  <!-- Chest panel -->
+  <rect x="84" y="178" width="88" height="44" rx="8" fill="#1e3a8a" opacity="0.7"/>
+  <!-- Circuit dots on chest -->
+  <circle cx="104" cy="192" r="4" fill="#38bdf8" filter="url(#glow)"/>
+  <circle cx="128" cy="192" r="4" fill="#38bdf8" filter="url(#glow)"/>
+  <circle cx="152" cy="192" r="4" fill="#38bdf8" filter="url(#glow)"/>
+  <line x1="108" y1="192" x2="124" y2="192" stroke="#38bdf8" stroke-width="1.5"/>
+  <line x1="132" y1="192" x2="148" y2="192" stroke="#38bdf8" stroke-width="1.5"/>
+  <!-- Lower circuit -->
+  <line x1="100" y1="208" x2="156" y2="208" stroke="#60a5fa" stroke-width="1.5" opacity="0.6"/>
+  <circle cx="116" cy="208" r="3" fill="#60a5fa" opacity="0.8"/>
+  <circle cx="140" cy="208" r="3" fill="#60a5fa" opacity="0.8"/>
+</svg>

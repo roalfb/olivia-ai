@@ -370,35 +370,23 @@ app.post('/api/vision/explain', async (c) => {
   const deviceId     = c.req.header('X-Device-Id')?.trim()    ?? ''
   const clientId     = c.req.header('X-Client-Id')?.trim()    ?? ''
 
-  console.log('[VISION] Proxy request received')
-  console.log('[VISION] Raw vision URL:', rawVisionUrl)
-  console.log('[VISION] Has token:', !!token)
-  console.log('[VISION] Device-Id:', deviceId)
-  console.log('[VISION] Client-Id:', clientId)
-
   if (!rawVisionUrl) {
-    console.log('[VISION] Error: X-Vision-Url header missing')
     return c.json({ error: 'X-Vision-Url header is required' }, 400)
   }
 
   // Validate the host (accept both http:// and https://)
   if (!isAllowedVisionUrl(rawVisionUrl)) {
-    console.log('[VISION] Error: host not allowed for URL:', rawVisionUrl)
     return c.json({ error: `Vision URL host is not allowed (got: ${rawVisionUrl})` }, 400)
   }
 
   // Normalise to https:// — the server sends http:// in MCP capabilities
   // but the actual API endpoint requires TLS.
   const visionUrl = normaliseVisionUrl(rawVisionUrl)
-  console.log('[VISION] Normalised URL:', visionUrl)
 
   // Forward the entire multipart body unchanged.
   // The Content-Type (including boundary) is preserved from the original request.
   const contentType = c.req.header('Content-Type') ?? ''
   const body = await c.req.arrayBuffer()
-
-  console.log('[VISION] Content-Type:', contentType)
-  console.log('[VISION] Body size:', body.byteLength, 'bytes')
 
   const headers: Record<string, string> = {
     'Content-Type': contentType,
@@ -407,9 +395,6 @@ app.post('/api/vision/explain', async (c) => {
   if (token)    headers['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`
   if (deviceId) headers['Device-Id']     = deviceId
   if (clientId) headers['Client-Id']     = clientId
-
-  console.log('[VISION] Forwarding headers:', JSON.stringify(headers))
-  console.log('[VISION] Sending POST to:', visionUrl)
 
   let upstream: Response
   try {
@@ -420,13 +405,10 @@ app.post('/api/vision/explain', async (c) => {
     })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
-    console.log('[VISION] Fetch error:', msg)
     return c.json({ error: `Vision fetch failed: ${msg}` }, 502)
   }
 
   const text = await upstream.text()
-  console.log('[VISION] Upstream status:', upstream.status)
-  console.log('[VISION] Upstream response (first 500 chars):', text.slice(0, 500))
 
   // Return the raw response with the same status
   return c.text(text, upstream.status as 200, {
@@ -439,13 +421,7 @@ app.post('/api/vision/explain', async (c) => {
 app.use('/static/*', serveStatic({ root: './public' }))
 
 // Serve favicon inline
-app.get('/favicon.svg', (c) => {
-  return c.body(
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#0084ff"/><text x="32" y="46" font-size="36" text-anchor="middle" fill="white">⚙</text></svg>`,
-    200,
-    { 'Content-Type': 'image/svg+xml' }
-  )
-})
+
 
 // ── Main application HTML ────────────────────────────────────────────────────
 app.get('/', (c) => {
@@ -455,7 +431,7 @@ app.get('/', (c) => {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
   <title>OLIVIA — Open Language Intelligence & Voice Interactive Assistant</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
 
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -484,12 +460,16 @@ app.get('/', (c) => {
         <i class="fas fa-microchip"></i>
       </div>
       <div class="device-info">
-        <h3 class="device-name" id="deviceNameDisplay">OLIVIA</h3>
+        <h3 class="device-name" id="deviceNameDisplay">O.L.I.V.I.A.</h3>
         <div class="device-status" id="deviceStatusBadge">
           <span class="status-dot offline" id="statusDot"></span>
           <span id="statusText">Offline</span>
         </div>
       </div>
+      <button class="theme-toggle-btn" id="themeToggleBtn" title="Toggle light/dark theme">
+        <i class="fas fa-sun icon-sun"></i>
+        <i class="fas fa-moon icon-moon"></i>
+      </button>
       <button class="sidebar-settings-btn" id="settingsToggleBtn" title="Settings">
         <i class="fas fa-cog"></i>
       </button>
@@ -523,17 +503,17 @@ app.get('/', (c) => {
       </div>
     </div>
 
-    <!-- Conversation List -->
-    <div class="conversation-list" id="conversationList">
-      <div class="conv-list-header">Recent Conversations</div>
-      <div class="conv-item active">
-        <div class="conv-avatar"><i class="fas fa-robot"></i></div>
-        <div class="conv-meta">
-          <div class="conv-name">Xiaozhi AI</div>
-          <div class="conv-preview" id="convPreview">Start a conversation...</div>
-        </div>
-        <div class="conv-time" id="convTime">Now</div>
-      </div>
+    <!-- AI Assistants List (PHASE 1: Multi-Assistant Foundation) -->
+    <div class="conversation-list" id="assistantList">
+      <div class="conv-list-header">AI Assistants</div>
+      <!-- Assistant items are rendered dynamically by
+           UIController.renderAssistantList() from AssistantManager's
+           stored assistants. See public/static/app.js. -->
+      <div id="assistantListItems"></div>
+      <button class="add-assistant-btn" id="addAssistantBtn" title="Add a new assistant">
+        <i class="fas fa-plus"></i>
+        <span>Add Assistant</span>
+      </button>
     </div>
 
     <!-- Audio Level Meter -->
@@ -547,12 +527,63 @@ app.get('/', (c) => {
   </aside>
 
   <!-- ── SETTINGS PANEL (slides in) ──────────────────────── -->
+  <!-- PHASE 2: this panel is now shared across ALL assistants — it is
+       opened either via the sidebar profile gear (active assistant) or
+       via a per-assistant gear icon in the AI Assistants list (any
+       assistant, active or not). UIController tracks which assistant id
+       the panel currently targets and reads/writes THAT assistant's
+       fields, never assuming "the active one". See app.js openSettingsFor(). -->
   <div class="settings-panel" id="settingsPanel">
     <div class="settings-header">
-      <h2><i class="fas fa-cog"></i> Device Settings</h2>
+      <h2><i class="fas fa-cog"></i> Assistant Settings</h2>
       <button class="close-settings-btn" id="closeSettingsBtn"><i class="fas fa-times"></i></button>
     </div>
     <div class="settings-body">
+
+      <div class="settings-section">
+        <h3>Assistant</h3>
+        <div class="form-group">
+          <label for="assistantNameInput">Assistant Name</label>
+          <input type="text" id="assistantNameInput" placeholder="My Assistant" />
+          <small>Shown in the AI Assistants sidebar list and chat header</small>
+        </div>
+        <!-- PHASE 4: Avatar management inside settings -->
+        <div class="form-group">
+          <label>Profile Picture</label>
+          <div class="settings-avatar-section">
+            <div class="settings-avatar-preview" id="settingsAvatarPreview">
+              <img class="assistant-avatar-img" id="settingsAvatarImg" src="/static/olivia-avatar-default.svg" alt="Assistant Avatar" />
+            </div>
+            <div class="settings-avatar-actions">
+              <button class="btn-secondary" type="button" id="settingsUploadAvatarBtn">
+                <i class="fas fa-upload"></i> Upload New Image
+              </button>
+              <button class="btn-secondary btn-small-danger" type="button" id="settingsRemoveAvatarBtn">
+                <i class="fas fa-trash"></i> Remove
+              </button>
+            </div>
+          </div>
+          <small>PNG, JPG, JPEG, WEBP &mdash; auto-resized to 256&times;256</small>
+        </div>
+        <div class="form-group">
+          <label>Connection Status</label>
+          <div class="pairing-status-display" id="assistantConnectionStatusDisplay">Disconnected</div>
+        </div>
+        <div class="form-group settings-connection-actions">
+          <button class="btn-secondary" type="button" id="settingsReconnectBtn">
+            <i class="fas fa-plug"></i> Connect / Reconnect
+          </button>
+          <button class="btn-secondary" type="button" id="settingsDisconnectBtn">
+            <i class="fas fa-plug-circle-xmark"></i> Disconnect
+          </button>
+        </div>
+        <div class="form-group">
+          <button class="btn-danger btn-block" type="button" id="deleteAssistantBtn">
+            <i class="fas fa-trash"></i> Delete Assistant
+          </button>
+          <small>Cannot delete the last remaining assistant</small>
+        </div>
+      </div>
 
       <div class="settings-section">
         <h3>Connection</h3>
@@ -582,10 +613,10 @@ app.get('/', (c) => {
 
       <div class="settings-section">
         <h3>Virtual Device Identity</h3>
-        <div class="form-group">
-          <label for="deviceNameInput">Device Name</label>
-          <input type="text" id="deviceNameInput" placeholder="OLIVIA" value="OLIVIA" />
-        </div>
+        <!-- PHASE 4: Device Name field removed from UI per spec.
+             The device name is always "O.L.I.V.I.A." from the user's perspective.
+             The internal field still exists in AssistantManager for protocol use. -->
+        <input type="hidden" id="deviceNameInput" value="O.L.I.V.I.A." />
         <div class="form-group">
           <label for="deviceIdInput">Device-Id (MAC Address)</label>
           <input type="text" id="deviceIdInput" placeholder="Auto-generated" />
@@ -663,13 +694,37 @@ app.get('/', (c) => {
         <i class="fas fa-bars"></i>
       </button>
       <div class="chat-header-info">
-        <div class="chat-avatar"><i class="fas fa-robot"></i></div>
+        <!-- PHASE 4: chat-avatar is clickable and shows the active assistant's avatar.
+             Clicking it opens the avatar upload dialog. -->
+        <div class="chat-avatar assistant-avatar-clickable" id="chatHeaderAvatar" title="Change assistant avatar">
+          <img class="assistant-avatar-img" id="chatHeaderAvatarImg" src="/static/olivia-avatar-default.svg" alt="Assistant Avatar" />
+        </div>
         <div class="chat-title-block">
-          <h2>OLIVIA</h2>
-          <div class="chat-subtitle" id="chatSubtitle">AI Chatbot</div>
+          <!-- PHASE 1: shows the active assistant's name instead of the
+               hardcoded "OLIVIA" app title. Updated by
+               UIController.renderActiveAssistantHeader(). -->
+          <h2 id="activeAssistantName">OLIVIA</h2>
+          <div class="chat-subtitle" id="chatSubtitle">Powered by Olivia &mdash; Disconnected</div>
         </div>
       </div>
       <div class="chat-header-actions">
+        <!-- OLIVIA FEATURE: Per-assistant local speech volume.
+             Speaker button opens a floating slider popup (see VolumeSystem
+             in app.js). Volume is saved per-assistant and ONLY controls
+             Olivia's local TTS playback gain — it never touches Xiaozhi. -->
+        <div class="speaker-btn-wrapper" id="speakerBtnWrapper">
+          <button class="action-btn" id="speakerBtn" title="Assistant speech volume">
+            <i class="fas fa-volume-high" id="speakerBtnIcon"></i>
+          </button>
+          <div class="volume-popup" id="volumePopup" style="display:none;">
+            <div class="volume-popup-row">
+              <i class="fas fa-volume-low volume-popup-icon-min"></i>
+              <input type="range" id="volumeSlider" class="volume-slider" min="0" max="100" step="1" value="100" aria-label="Assistant speech volume" />
+              <i class="fas fa-volume-high volume-popup-icon-max"></i>
+            </div>
+            <div class="volume-popup-label" id="volumeSliderLabel">100%</div>
+          </div>
+        </div>
         <div class="device-state-chip" id="deviceStateChip">
           <i class="fas fa-circle" id="stateChipIcon"></i>
           <span id="stateChipText">IDLE</span>
@@ -699,7 +754,7 @@ app.get('/', (c) => {
 
     <!-- Typing Indicator (shown when AI is generating) -->
     <div class="typing-indicator" id="typingIndicator" style="display:none;">
-      <div class="typing-avatar"><i class="fas fa-robot"></i></div>
+      <!-- PHASE 4: typing avatar uses the active assistant's avatar -->\n      <div class="typing-avatar" id="typingAvatar"><img class="assistant-avatar-img" id="typingAvatarImg" src="/static/olivia-avatar-default.svg" alt="AI" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" /></div>
       <div class="typing-bubble">
         <div class="typing-dots">
           <span></span><span></span><span></span>
@@ -814,6 +869,8 @@ app.get('/', (c) => {
 
     <!-- Hidden file input for gallery -->
     <input type="file" id="galleryFileInput" accept="image/jpeg,image/jpg,image/png,image/webp,image/gif,image/bmp,image/heic,image/*" style="display:none;" />
+    <!-- Hidden file input for avatar upload (PHASE 4) -->
+    <input type="file" id="avatarFileInput" accept="image/png,image/jpeg,image/jpg,image/webp" style="display:none;" />
 
   </main>
 
