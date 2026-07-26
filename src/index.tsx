@@ -470,9 +470,6 @@ app.get('/', (c) => {
         <i class="fas fa-sun icon-sun"></i>
         <i class="fas fa-moon icon-moon"></i>
       </button>
-      <button class="sidebar-settings-btn" id="settingsToggleBtn" title="Settings">
-        <i class="fas fa-cog"></i>
-      </button>
     </div>
 
     <!-- Navigation Tabs -->
@@ -886,36 +883,123 @@ app.get('/', (c) => {
     <div class="debug-log" id="debugLog"></div>
   </div>
 
-  <!-- ── INFO PANEL ────────────────────────────────────────── -->
+  <!-- ── INFO PANEL ("About Olivia") ──────────────────────── -->
+  <!-- PHASE 6: Refactored from a single-device "Device Identity" info
+       panel into a platform-level "About Olivia" page. Olivia is now a
+       multi-assistant platform — every assistant owns its own Device-Id /
+       Client-Id / pairing / connection, so no single set of those values
+       can correctly represent the whole app anymore. Those live-per-
+       assistant values still exist, but only inside each assistant's own
+       Settings panel (see settings-panel above) — never duplicated here.
+       This panel is purely descriptive/informational + a few safe,
+       aggregate, non-identifying stats (System Status section below). -->
   <div class="info-panel" id="infoPanel" style="display:none;">
     <div class="info-content">
       <h3><i class="fas fa-microchip"></i> O.L.I.V.I.A.</h3>
-      <p>OLIVIA (Open Language Intelligence & Voice Interactive Assistant) is a web application that emulates an ESP32 hardware device and connects to a Xiaozhi server through a local WebSocket proxy that injects required auth headers.</p>
+      <p>O.L.I.V.I.A. (Open Language Intelligence &amp; Voice Interactive Assistant) is a browser-based multi-assistant AI platform built on the Xiaozhi protocol.</p>
+      <p>Each assistant maintains its own independent identity, pairing, conversation history, connection, avatar, volume, and settings while sharing one unified interface.</p>
+      <p>Internally, Olivia emulates multiple virtual ESP32 devices, but this implementation detail is abstracted away to provide a seamless multi-assistant experience.</p>
+
+      <h4>Features</h4>
+      <div class="info-feature-grid">
+        <div class="info-feature-item"><i class="fas fa-check"></i> Multi-assistant architecture</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Independent assistant sessions</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Independent conversations</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Independent Xiaozhi pairing</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Independent connections</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Per-assistant avatars</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Per-assistant volume controls</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Light &amp; Dark theme support</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Persistent local storage</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Browser-based platform</div>
+        <div class="info-feature-item"><i class="fas fa-check"></i> Cloudflare Pages deployment</div>
+      </div>
+
+      <h4>Technology Stack</h4>
+      <div class="tech-stack-grid">
+        <div class="tech-stack-col">
+          <div class="tech-stack-col-title">Frontend</div>
+          <ul>
+            <li>TypeScript</li>
+            <li>Vanilla JavaScript</li>
+            <li>HTML5</li>
+            <li>CSS3</li>
+          </ul>
+        </div>
+        <div class="tech-stack-col">
+          <div class="tech-stack-col-title">Backend</div>
+          <ul>
+            <li>Hono</li>
+            <li>Cloudflare Pages</li>
+            <li>Cloudflare Workers</li>
+          </ul>
+        </div>
+        <div class="tech-stack-col">
+          <div class="tech-stack-col-title">Communication</div>
+          <ul>
+            <li>WebSocket</li>
+            <li>Opus Audio</li>
+            <li>Xiaozhi Protocol v1</li>
+          </ul>
+        </div>
+      </div>
 
       <h4>Protocol Summary</h4>
       <div class="protocol-table">
-        <div class="proto-row"><span>Transport</span><code>WebSocket (ws:// or wss://)</code></div>
-        <div class="proto-row"><span>Audio Codec</span><code>Opus @ 16kHz mono</code></div>
-        <div class="proto-row"><span>Provisioning</span><code>POST /xiaozhi/ota/ → 6-digit code</code></div>
-        <div class="proto-row"><span>Auth Header</span><code>Authorization: Bearer &lt;token&gt; (via /api/ws proxy)</code></div>
-        <div class="proto-row"><span>Device ID</span><code>Device-Id: &lt;mac-style&gt;</code></div>
-        <div class="proto-row"><span>Client ID</span><code>Client-Id: &lt;uuid&gt;</code></div>
-        <div class="proto-row"><span>Hello Timeout</span><code>10 seconds</code></div>
+        <div class="proto-row"><span>Transport</span><code>WebSocket (ws / wss)</code></div>
+        <div class="proto-row"><span>Audio Codec</span><code>Opus @ 16 kHz Mono</code></div>
+        <div class="proto-row"><span>Provisioning</span><code>6-digit Pairing Code</code></div>
+        <div class="proto-row"><span>Authentication</span><code>Bearer Token</code></div>
+        <div class="proto-row"><span>Protocol Version</span><code>1</code></div>
       </div>
 
-      <h4>Message Flow</h4>
-      <ol class="flow-list">
-        <li>Client → Server: <code>hello</code> (capabilities + audio params)</li>
-        <li>Server → Client: <code>hello</code> (session_id + server audio params)</li>
-        <li>Client → Server: <code>listen {state: "start"}</code> + binary Opus frames</li>
-        <li>Server → Client: <code>stt</code> (transcript)</li>
-        <li>Server → Client: <code>llm</code> (emotion)</li>
-        <li>Server → Client: <code>tts {state: "start"}</code> + binary Opus frames</li>
-        <li>Server → Client: <code>tts {state: "stop"}</code></li>
-      </ol>
+      <h4>Assistant Architecture</h4>
+      <p>Each assistant maintains its own independent:</p>
+      <ul class="info-bullet-list">
+        <li>Device ID</li>
+        <li>Client ID</li>
+        <li>Pairing Token</li>
+        <li>WebSocket Session</li>
+        <li>Conversation History</li>
+        <li>Avatar</li>
+        <li>Audio Volume</li>
+        <li>Settings</li>
+      </ul>
+      <p>Internally, every assistant behaves as its own virtual ESP32 device, while presenting one unified application to the user.</p>
 
-      <h4>Device Identity</h4>
-      <div class="identity-display" id="identityDisplay">Loading...</div>
+      <h4>System Status</h4>
+      <div class="protocol-table" id="systemStatusTable">
+        <div class="proto-row"><span>Application Version</span><code>Olivia 2.0</code></div>
+        <div class="proto-row"><span>Registered Assistants</span><code id="statAssistantCount">—</code></div>
+        <div class="proto-row"><span>Connected Assistants</span><code id="statConnectedCount">—</code></div>
+        <div class="proto-row"><span>Stored Conversations</span><code id="statConversationCount">—</code></div>
+        <div class="proto-row"><span>Theme</span><code id="statTheme">—</code></div>
+        <div class="proto-row"><span>Storage</span><code>Local Browser Storage</code></div>
+      </div>
+
+      <h4>Open Source</h4>
+      <div class="open-source-links">
+        <a class="open-source-link" href="https://github.com/roalfb/olivia-ai" target="_blank" rel="noopener">
+          <i class="fab fa-github"></i>
+          <span>Project Repository</span>
+        </a>
+        <a class="open-source-link" href="https://github.com/roalfb/olivia-ai/blob/main/README.md" target="_blank" rel="noopener">
+          <i class="fab fa-github"></i>
+          <span>Documentation</span>
+        </a>
+        <a class="open-source-link" href="https://github.com/roalfb/olivia-ai/issues" target="_blank" rel="noopener">
+          <i class="fab fa-github"></i>
+          <span>Issues</span>
+        </a>
+      </div>
+
+      <h4>Version</h4>
+      <div class="protocol-table">
+        <div class="proto-row"><span>Version</span><code>2.0</code></div>
+        <div class="proto-row"><span>Project</span><code>Open Language Intelligence &amp; Voice Interactive Assistant</code></div>
+        <div class="proto-row"><span>License</span><code>MIT</code></div>
+        <div class="proto-row"><span>Author</span><code>Roalf Burgonio</code></div>
+      </div>
     </div>
   </div>
 

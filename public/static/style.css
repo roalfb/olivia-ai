@@ -1492,15 +1492,107 @@ body {
   border-radius: 3px;
 }
 
-.identity-display {
+/* ─── ABOUT PAGE — Features grid ───────────────────────────────── */
+.info-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px 16px;
+}
+
+.info-feature-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  padding: 6px 0;
+}
+
+.info-feature-item i {
+  color: var(--secondary);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+/* ─── ABOUT PAGE — Technology stack columns ────────────────────── */
+.tech-stack-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.tech-stack-col {
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 12px;
-  font-family: 'SF Mono', 'Fira Code', monospace;
-  font-size: 12px;
+}
+
+.tech-stack-col-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.tech-stack-col ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 13px;
   color: var(--text-secondary);
-  line-height: 1.8;
+  line-height: 1.9;
+}
+
+/* ─── ABOUT PAGE — Assistant Architecture bullet list ──────────── */
+.info-bullet-list {
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.9;
+}
+
+/* ─── ABOUT PAGE — Open Source links ───────────────────────────── */
+.open-source-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.open-source-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: all var(--transition);
+}
+
+.open-source-link:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+  transform: translateX(2px);
+}
+
+.open-source-link i {
+  font-size: 16px;
+  color: var(--text-secondary);
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+  transition: color var(--transition);
+}
+
+.open-source-link:hover i {
+  color: var(--primary);
 }
 
 /* ─── LOADING OVERLAY ───────────────────────────────────────────── */
@@ -1772,6 +1864,12 @@ body {
   .debug-panel,
   .info-panel {
     left: 0;
+  }
+
+  /* ── About page grids: collapse to a single column on mobile ── */
+  .info-feature-grid,
+  .tech-stack-grid {
+    grid-template-columns: 1fr;
   }
 
   /* ── Chat area: full width, flex column with sticky input ──── */

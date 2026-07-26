@@ -4362,11 +4362,11 @@ const UIController = (() => {
       btn.addEventListener('click', () => switchTab(btn.dataset.tab));
     });
 
-    // Settings panel — gear in the sidebar profile card always targets
-    // the currently ACTIVE assistant (see openSettings()). Per-item gear
-    // icons in the AI Assistants list target THAT specific assistant
-    // (see openSettingsFor(), wired inside renderAssistantList()).
-    el('settingsToggleBtn').addEventListener('click', openSettings);
+    // Settings panel — the sidebar profile card's own gear icon was
+    // removed (PHASE 6: redundant with each assistant's per-item gear
+    // icon in the AI Assistants list below, which already covers the
+    // active assistant too). Settings now only opens via that per-item
+    // gear icon (see openSettingsFor(), wired inside renderAssistantList()).
     el('closeSettingsBtn').addEventListener('click', closeSettings);
     el('saveSettingsBtn').addEventListener('click', saveSettings);
     el('resetSettingsBtn').addEventListener('click', resetSettings);
@@ -4690,26 +4690,52 @@ const UIController = (() => {
       }, 50);
     } else if (tab === 'info') {
       infoPanel.style.display = 'block';
-      updateIdentityDisplay();
+      updateSystemStatusDisplay();
     }
   }
 
-  function updateIdentityDisplay() {
-    const display = el('identityDisplay');
-    if (!display) return;
-    const activeSession = SessionManager.getActiveSession();
-    const info = activeSession ? activeSession.deviceEmulator.getIdentityInfo() : {};
-    display.innerHTML = Object.entries(info)
-      .map(([k, v]) => `<div><strong>${k}:</strong> ${v}</div>`)
-      .join('');
-  }
+  /**
+   * PHASE 6: Populates the "About Olivia" Info panel's System Status
+   * section with live, platform-level (non-identifying) aggregate stats.
+   * Replaces the old single-device `updateIdentityDisplay()`, which used
+   * to surface one assistant's raw Device-Id/Client-Id/WS URL/etc. — now
+   * obsolete since every assistant has its own identity (see that
+   * assistant's own Settings panel instead). Reads only already-public
+   * app state (AssistantManager, SessionManager, ThemeManager); does not
+   * touch connection, pairing, or protocol logic.
+   */
+  function updateSystemStatusDisplay() {
+    try {
+      const assistants = AssistantManager.getAllAssistants();
 
-  /** Open Settings scoped to the currently ACTIVE assistant (sidebar
-   *  profile gear). */
-  function openSettings() {
-    settingsTargetId = AssistantManager.getActiveId();
-    loadSettingsIntoForm();
-    el('settingsPanel').classList.add('open');
+      const assistantCountEl = el('statAssistantCount');
+      if (assistantCountEl) assistantCountEl.textContent = String(assistants.length);
+
+      let connectedCount = 0;
+      let conversationCount = 0;
+      assistants.forEach(a => {
+        const session = SessionManager.getSession(a.id);
+        if (session && session.protocol && session.protocol.isConnected()) {
+          connectedCount++;
+        }
+        if (Array.isArray(a.conversationHistory)) {
+          conversationCount += a.conversationHistory.length;
+        }
+      });
+
+      const connectedCountEl = el('statConnectedCount');
+      if (connectedCountEl) connectedCountEl.textContent = String(connectedCount);
+
+      const conversationCountEl = el('statConversationCount');
+      if (conversationCountEl) conversationCountEl.textContent = String(conversationCount);
+
+      const themeEl = el('statTheme');
+      if (themeEl && typeof ThemeManager !== 'undefined') {
+        themeEl.textContent = ThemeManager.getCurrent() === 'dark' ? 'Dark' : 'Light';
+      }
+    } catch (e) {
+      Logger.warn('updateSystemStatusDisplay failed', e);
+    }
   }
 
   /** Open Settings scoped to a SPECIFIC assistant (per-item gear icon
