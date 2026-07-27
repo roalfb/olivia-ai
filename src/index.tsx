@@ -430,8 +430,18 @@ app.get('/', (c) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
-  <title>OLIVIA — Open Language Intelligence & Voice Interactive Assistant</title>
-  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <title>Olivia — Open Language Intelligence & Voice Interactive Assistant</title>
+
+  <!-- Olivia Brand Identity: favicon, PWA manifest, touch icons -->
+  <link rel="icon" type="image/svg+xml" href="/static/logo/favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/logo/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/static/logo/apple-touch-icon.png" />
+  <link rel="manifest" href="/static/manifest.json" />
+  <meta name="theme-color" content="#0084ff" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Olivia" />
 
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -457,10 +467,10 @@ app.get('/', (c) => {
     <!-- Profile / Device Section -->
     <div class="sidebar-header">
       <div class="device-avatar" id="deviceAvatar">
-        <i class="fas fa-microchip"></i>
+        <span class="olivia-monogram" role="img" aria-label="Olivia"></span>
       </div>
       <div class="device-info">
-        <h3 class="device-name" id="deviceNameDisplay">O.L.I.V.I.A.</h3>
+        <span class="olivia-wordmark device-name" id="deviceNameDisplay" role="img" aria-label="Olivia"></span>
         <div class="device-status" id="deviceStatusBadge">
           <span class="status-dot offline" id="statusDot"></span>
           <span id="statusText">Offline</span>
@@ -611,9 +621,9 @@ app.get('/', (c) => {
       <div class="settings-section">
         <h3>Virtual Device Identity</h3>
         <!-- PHASE 4: Device Name field removed from UI per spec.
-             The device name is always "O.L.I.V.I.A." from the user's perspective.
+             The device name is always "Olivia" from the user's perspective.
              The internal field still exists in AssistantManager for protocol use. -->
-        <input type="hidden" id="deviceNameInput" value="O.L.I.V.I.A." />
+        <input type="hidden" id="deviceNameInput" value="Olivia" />
         <div class="form-group">
           <label for="deviceIdInput">Device-Id (MAC Address)</label>
           <input type="text" id="deviceIdInput" placeholder="Auto-generated" />
@@ -743,8 +753,8 @@ app.get('/', (c) => {
 
       <!-- System welcome message -->
       <div class="system-message" id="welcomeMsg">
-        <i class="fas fa-microchip"></i>
-        <span>OLIVIA initialized. Click Connect to register and pair via xiaozhi.me.</span>
+        <span class="olivia-monogram olivia-monogram-inline" role="img" aria-label="Olivia"></span>
+        <span>Olivia initialized. Click Connect to register and pair via xiaozhi.me.</span>
       </div>
 
     </div>
@@ -895,8 +905,10 @@ app.get('/', (c) => {
        aggregate, non-identifying stats (System Status section below). -->
   <div class="info-panel" id="infoPanel" style="display:none;">
     <div class="info-content">
-      <h3><i class="fas fa-microchip"></i> O.L.I.V.I.A.</h3>
-      <p>O.L.I.V.I.A. (Open Language Intelligence &amp; Voice Interactive Assistant) is a browser-based multi-assistant AI platform built on the Xiaozhi protocol.</p>
+      <div class="about-brand-header">
+        <span class="olivia-wordmark about-wordmark" role="img" aria-label="Olivia"></span>
+      </div>
+      <p>Olivia (Open Language Intelligence &amp; Voice Interactive Assistant) is a browser-based multi-assistant AI platform built on the Xiaozhi protocol.</p>
       <p>Each assistant maintains its own independent identity, pairing, conversation history, connection, avatar, volume, and settings while sharing one unified interface.</p>
       <p>Internally, Olivia emulates multiple virtual ESP32 devices, but this implementation detail is abstracted away to provide a seamless multi-assistant experience.</p>
 
@@ -1032,8 +1044,9 @@ app.get('/', (c) => {
 <!-- Loading overlay -->
 <div class="loading-overlay" id="loadingOverlay">
   <div class="loading-card">
+    <span class="olivia-monogram loading-monogram" role="img" aria-label="Olivia"></span>
     <div class="loading-spinner"></div>
-    <div class="loading-text" id="loadingText">Initializing OLIVIA...</div>
+    <div class="loading-text" id="loadingText">Initializing Olivia...</div>
   </div>
 </div>
 

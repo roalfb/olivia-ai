@@ -184,6 +184,51 @@ body {
   background: var(--bg-sidebar);
 }
 
+/* ─── OLIVIA BRAND IDENTITY ──────────────────────────────────────
+   Official Olivia Monogram ("ai" ligature) and Wordmark logos.
+   Rendered via CSS mask so they inherit currentColor and adapt
+   automatically between light/dark themes without duplicating SVGs. */
+.olivia-monogram {
+  display: inline-block;
+  width: 28px;
+  height: 28px;
+  background-color: currentColor;
+  -webkit-mask: url('/static/logo/monogram.svg') no-repeat center / contain;
+  mask: url('/static/logo/monogram.svg') no-repeat center / contain;
+  flex-shrink: 0;
+}
+
+.olivia-wordmark {
+  display: inline-block;
+  width: 96px;
+  height: 32px;
+  background-color: currentColor;
+  -webkit-mask: url('/static/logo/wordmark.svg') no-repeat left center / contain;
+  mask: url('/static/logo/wordmark.svg') no-repeat left center / contain;
+}
+
+.olivia-monogram-inline {
+  width: 16px;
+  height: 16px;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+.about-brand-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.about-brand-header .about-monogram { width: 36px; height: 36px; color: var(--text-primary); }
+.about-brand-header .about-wordmark { width: 140px; height: 44px; color: var(--text-primary); }
+
+.loading-monogram {
+  width: 40px;
+  height: 40px;
+  color: var(--primary);
+}
+
 .device-avatar {
   width: 44px;
   height: 44px;
@@ -237,12 +282,9 @@ body {
 }
 
 .device-name {
-  font-size: 15px;
-  font-weight: 600;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .device-status {

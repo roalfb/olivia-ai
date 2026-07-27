@@ -4760,7 +4760,7 @@ const UIController = (() => {
     el('wsUrlInput').value           = s.wsUrl || '';
     if (el('otaUrlInput')) el('otaUrlInput').value = s.otaUrl || '';
     // PHASE 4: deviceNameInput is now hidden — still set it for protocol use
-    if (el('deviceNameInput')) el('deviceNameInput').value = 'O.L.I.V.I.A.';
+    if (el('deviceNameInput')) el('deviceNameInput').value = 'Olivia';
     el('deviceIdInput').value         = s.deviceId || '';
     el('clientIdInput').value         = s.clientId || '';
     el('protocolVersionInput').value  = String(s.protocolVersion || 1);
@@ -4923,7 +4923,7 @@ const UIController = (() => {
       if (otaUrl) AssistantManager.setFlatField(id, 'otaUrl', otaUrl);
     }
     // PHASE 4: Device Name is always O.L.I.V.I.A. — not user-editable
-    AssistantManager.setFlatField(id, 'deviceName', 'O.L.I.V.I.A.');
+    AssistantManager.setFlatField(id, 'deviceName', 'Olivia');
     AssistantManager.setFlatField(id, 'protocolVersion', parseInt(el('protocolVersionInput').value) || 1);
     AssistantManager.setFlatField(id, 'frameDuration',   parseInt(el('frameDurationInput').value) || 60);
     AssistantManager.setFlatField(id, 'listeningMode',   el('listeningModeInput').value);
@@ -4938,8 +4938,8 @@ const UIController = (() => {
     const newClientId = el('clientIdInput').value.trim();
     if (newClientId) AssistantManager.setFlatField(id, 'clientId', newClientId);
 
-    // PHASE 4: Sidebar device name display is always "O.L.I.V.I.A."
-    if (el('deviceNameDisplay')) el('deviceNameDisplay').textContent = 'O.L.I.V.I.A.';
+    // PHASE 4: Sidebar device name display is always "Olivia"
+    // BRAND UPDATE: deviceNameDisplay is now the Olivia Wordmark logo (CSS mask) — no text injection needed.
 
     closeSettings();
     showToast('Settings saved', 'success');
@@ -5246,8 +5246,8 @@ const UIController = (() => {
     const container = el('messagesContainer');
     container.innerHTML = `
       <div class="system-message" id="welcomeMsg">
-        <i class="fas fa-microchip"></i>
-        <span>O.L.I.V.I.A. initialized. Click Connect to register and pair via xiaozhi.me.</span>
+        <span class="olivia-monogram olivia-monogram-inline" role="img" aria-label="Olivia"></span>
+        <span>Olivia initialized. Click Connect to register and pair via xiaozhi.me.</span>
       </div>
     `;
   }
@@ -5399,10 +5399,9 @@ const UIController = (() => {
     const headerName = el('activeAssistantName');
     if (headerName) headerName.textContent = active.name;
 
-    // PHASE 4: Sidebar always shows "O.L.I.V.I.A." — the website identity.
+    // PHASE 4: Sidebar always shows "Olivia" — the website identity.
     // Device Name concept is hidden from UI entirely.
-    const sidebarDeviceName = el('deviceNameDisplay');
-    if (sidebarDeviceName) sidebarDeviceName.textContent = 'O.L.I.V.I.A.';
+    // BRAND UPDATE: sidebar deviceNameDisplay is now the permanent Olivia Wordmark logo — no text injection.
 
     // PHASE 4: Update chat header avatar and sidebar avatar for active assistant.
     AvatarSystem.refreshAllAvatarDisplays();
@@ -5897,11 +5896,8 @@ const AppController = (() => {
     // is itself now just a thin shim over AssistantManager.load()).
     AssistantManager.load();
 
-    // PHASE 4: Sidebar always shows "O.L.I.V.I.A." — not the device name field
-    const deviceNameDisplay = document.getElementById('deviceNameDisplay');
-    if (deviceNameDisplay) {
-      deviceNameDisplay.textContent = 'O.L.I.V.I.A.';
-    }
+    // PHASE 4: Sidebar always shows "Olivia" — not the device name field
+    // BRAND UPDATE: deviceNameDisplay is now the permanent Olivia Wordmark logo — no text injection.
 
     // Initialize UI (renders sidebar/header, wires all button handlers)
     UIController.init();

@@ -5,7 +5,13 @@
 <br/>
 <br/>
 
-# O.L.I.V.I.A.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="public/static/logo/wordmark-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="public/static/logo/wordmark-light.png">
+    <img alt="Olivia" src="public/static/logo/wordmark-dark.svg" width="500">
+  </picture>
+</p>
 
 ### Multi-Assistant Virtual ESP32 Platform for Xiaozhi AI
 
@@ -28,7 +34,7 @@
 
 ---
 
-**Olivia** — full name **O.L.I.V.I.A.** (Open Language Interactive Assistant) — is a browser-based virtual ESP32 device that faithfully emulates an official Xiaozhi ESP32 hardware device while adding browser-native capabilities such as a live camera viewfinder, photo gallery uploads, and a full messenger-style chat UI. It connects directly to the Xiaozhi cloud using the same OTA provisioning, WebSocket handshake, binary Opus audio protocol, and MCP (Model Context Protocol) tool-call architecture used by real ESP32 firmware — without any physical hardware.
+**Olivia** — full name **O.L.I.V.I.A.** (Open Language Intelligence & Voice Interactive Assistant) — is a browser-based virtual ESP32 device that faithfully emulates an official Xiaozhi ESP32 hardware device while adding browser-native capabilities such as a live camera viewfinder, photo gallery uploads, and a full messenger-style chat UI. It connects directly to the Xiaozhi cloud using the same OTA provisioning, WebSocket handshake, binary Opus audio protocol, and MCP (Model Context Protocol) tool-call architecture used by real ESP32 firmware — without any physical hardware.
 
 What started as a single virtual device has grown into a full **multi-assistant AI platform**. Olivia is still presented to the outside world — and to the Xiaozhi cloud — as a device speaking the exact ESP32 protocol described above, but the application itself now hosts **any number of independent AI assistants** side by side, each with its own name, avatar, conversation history, pairing, connection, and settings. Under the hood, every assistant is its own self-contained virtual Xiaozhi device (its own `Device-Id`, `Client-Id`, WebSocket connection, and OTA pairing state), so the Xiaozhi backend always sees clean, isolated device sessions — but from the user's point of view there is only ever **one Olivia**, with multiple personalities living inside it, switchable like tabs in a chat app. You never manage "devices"; you manage **assistants**.
 
@@ -47,6 +53,7 @@ What started as a single virtual device has grown into a full **multi-assistant 
 - [OTA Provisioning and Pairing](#ota-provisioning-and-pairing)
 - [MCP — Model Context Protocol](#mcp--model-context-protocol)
 - [Theming (Light / Dark Mode)](#theming-light--dark-mode)
+- [Brand Identity](#brand-identity)
 - [Assistant Avatars](#assistant-avatars)
 - [Per-Assistant Speech Volume](#per-assistant-speech-volume)
 - [Usage Guide](#usage-guide)
@@ -59,6 +66,7 @@ What started as a single virtual device has grown into a full **multi-assistant 
 - [FAQ](#faq)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
+- [Documentation](#documentation)
 - [License](#license)
 
 ---
@@ -700,6 +708,44 @@ Olivia's dark mode was originally tied purely to the OS-level `prefers-color-sch
 `ThemeManager` reads any saved preference from `localStorage` (`olivia_theme_preference`) on boot, applies the matching `data-theme` attribute to `<html>`, and wires the ☀️/🌙 toggle button in the sidebar header. Clicking the button flips the theme and persists the new choice; the icon swap itself is pure CSS (`[data-theme]` selectors toggle `.icon-sun` / `.icon-moon` visibility, no re-render needed).
 
 As part of adding manual theming, the active-assistant sidebar item was also audited for dark-mode contrast: dedicated `--active-item-bg` / `--active-item-text` custom properties now guarantee readable text on the active item's highlight colour in both themes (previously, dark mode showed near-white text on a light-blue background, which was nearly invisible).
+
+---
+
+## Brand Identity
+
+Olivia's visual identity is the official **Olivia Monogram** (the merged
+"ai" ligature) and the **Olivia Wordmark** ("olivi**ai**"), both delivered
+as unmodified SVG assets and used consistently across the entire app —
+sidebar header, welcome message, About page, loading screen, browser
+favicon, and PWA/mobile install icon. The old generic computer-chip icon
+and `O.L.I.V.I.A.` text branding have been fully retired.
+
+```
+public/static/logo/
+├── wordmark.svg          Full "olivi(ai)" wordmark — fill="currentColor"
+├── monogram.svg          "ai" ligature icon — fill="currentColor"
+├── favicon.svg           Monogram + prefers-color-scheme aware styling
+├── favicon-32.png        32×32 PNG fallback
+├── apple-touch-icon.png  180×180 iOS home-screen icon
+├── icon-192.png          192×192 PWA icon
+├── icon-512.png          512×512 PWA icon
+└── maskable-512.png      512×512 PWA maskable icon (safe-zone padded)
+```
+
+Both logos render via a CSS `mask` + `background-color: currentColor`
+technique (`.olivia-monogram` / `.olivia-wordmark` in `style.css`), so a
+single SVG file automatically adapts between light and dark themes — no
+duplicate per-theme assets. The browser-tab favicon uses its own
+`prefers-color-scheme` media query (since page CSS variables aren't visible
+to browser chrome) so it follows the OS theme. The sidebar's device-avatar
+status colors/animations (offline/connecting/connected/listening/speaking)
+are entirely unchanged — only the icon rendered inside that container was
+swapped from a chip glyph to the Olivia Monogram.
+
+See [DEVELOPMENT_HISTORY.md](./DEVELOPMENT_HISTORY.md#brand-identity-integration)
+for the full integration writeup, including how the monogram was extracted
+from the wordmark's original path data without any redrawing or geometry
+changes.
 
 ---
 
@@ -1536,6 +1582,19 @@ When reporting a bug, please include:
 - Whether the issue is with text mode, voice mode, or vision
 - Whether the issue reproduces with a single assistant or only after creating multiple assistants
 - The WebSocket close code and reason from the debug log (if applicable)
+
+---
+
+## Documentation
+
+This README covers what Olivia is and how to use, install, and deploy it.
+For deeper technical documentation, see:
+
+| Document | Purpose |
+|---|---|
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | How Olivia works today — system design, module responsibilities, and data-flow diagrams, for a developer joining the project |
+| [CHANGELOG.md](./CHANGELOG.md) | User-visible changes, organized by release |
+| [DEVELOPMENT_HISTORY.md](./DEVELOPMENT_HISTORY.md) | The engineering history of how Olivia evolved into its current architecture, including decisions, problems encountered, and ideas considered for the future |
 
 ---
 
