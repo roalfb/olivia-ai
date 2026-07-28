@@ -12,23 +12,31 @@ list of released changes, see [CHANGELOG.md](./CHANGELOG.md). For
 setup/usage instructions, see [README.md](./README.md).
 
 > **Source note:** This document consolidates the individual
-> `HANDOFF_PHASE123.md`, `HANDOFF_PHASE45.md`,
-> `HANDOFF_About-Page-Refactor.md`, and `HANDOFF_Brand-Identity.md`
-> documents that were produced during Version 2 development. Those files
-> have been merged into this single chronological history and removed from
+> `HANDOFF_PHASE123.md`, `HANDOFF_PHASE45.md`, and
+> `HANDOFF_About-Page-Refactor.md` documents that were produced during
+> Version 2.0 and Version 2.1 development (the Brand Identity Integration
+> work below was not tracked in its own handoff file). Those files have
+> been merged into this single chronological history and removed from
 > the repository; their content lives on here.
 
 ## Table of Contents
 
 - [v1.0 — Foundation](#v10--foundation)
 - [v1.1 — Stabilization and First Deployment](#v11--stabilization-and-first-deployment)
-- [Version 2 Development](#version-2-development)
+- [Version 2.0 Development — Multi-Assistant Foundation](#version-20-development--multi-assistant-foundation)
   - [Phase 1–2 — Multi-Assistant Foundation](#phase-12--multi-assistant-foundation)
   - [Phase 3 — Finalization, Polish & Theme Toggle](#phase-3--finalization-polish--theme-toggle)
   - [Phase 4 — Assistant Identity & Avatars](#phase-4--assistant-identity--avatars)
   - [Phase 5 — Per-Assistant Speech Volume](#phase-5--per-assistant-speech-volume)
+- [Version 2.1 — Official Branding & Documentation](#version-21--official-branding--documentation)
   - [About Page Refactor](#about-page-refactor)
   - [Brand Identity Integration](#brand-identity-integration)
+  - [Documentation Restructuring](#documentation-restructuring)
+- [Version 2.2 — Settings & Backup](#version-22--settings--backup)
+  - [Why Backup & Restore Was Introduced](#why-backup--restore-was-introduced)
+  - [Migration from olivia-ai.pages.dev to www.oliviaai.dev](#migration-from-olivia-aipagesdev-to-wwwoliviaaidev)
+  - [Evolution of the Settings Interface](#evolution-of-the-settings-interface)
+  - [Milestones in Version 2.2](#milestones-in-version-22)
 - [Recurring Design Principles](#recurring-design-principles)
 - [Future Ideas That Remain Relevant](#future-ideas-that-remain-relevant)
 
@@ -84,10 +92,10 @@ was written.
 
 ---
 
-## Version 2 Development
+## Version 2.0 Development — Multi-Assistant Foundation
 
-Version 2's overarching goal was to transform Olivia from a single virtual
-device into a platform hosting **any number of independent AI
+Version 2.0's overarching goal was to transform Olivia from a single
+virtual device into a platform hosting **any number of independent AI
 assistants**, without changing a single byte of the underlying Xiaozhi
 protocol implementation. The work was carried out in phases, each with its
 own handoff document; this section merges them into one narrative.
@@ -301,6 +309,25 @@ held in memory only, not persisted — if the page reloads while muted,
 pre-mute value. This was a conscious choice to avoid growing the storage
 schema for a rare edge case.
 
+---
+
+## Version 2.1 — Official Branding & Documentation
+
+With Version 2.0 released and the multi-assistant platform stable, Olivia
+still carried the visual identity of its original single-device ESP32
+emulator days: a generic Font Awesome computer-chip icon and plain
+`O.L.I.V.I.A.` text wherever the app needed to identify itself, no PWA
+icon set, and its engineering history scattered across three separate
+`HANDOFF_*.md` files written during Version 2 development. Version 2.1's
+goal was to close that gap — transitioning Olivia from an ESP32 emulator
+identity into a professionally branded AI platform — before Version 2.2
+introduced Settings and Backup & Restore on top of that foundation. Two
+pieces of work made up the release: a refactor of the Info tab into a
+proper "About Olivia" page, and a full brand identity integration
+(monogram, wordmark, favicon, PWA icons, manifest). A third, non-code
+effort — restructuring the project's documentation — closed out the
+release.
+
 ### About Page Refactor
 
 **Objective:** The Info tab had started life as a single-device "Device
@@ -410,6 +437,171 @@ codebase. A live cross-browser visual/screenshot comparison was flagged
 as not performed in that session (no headless browser binary available)
 and recommended as a manual follow-up.
 
+### Documentation Restructuring
+
+**Objective:** Version 2's engineering history had been captured as three
+separate, standalone handoff documents — `HANDOFF_PHASE123.md`,
+`HANDOFF_PHASE45.md`, and `HANDOFF_About-Page-Refactor.md` — written
+incrementally as each phase shipped. Useful in the moment, but by the end
+of Version 2 development they were a disconnected, non-chronological set
+of files with no single entry point for a new contributor, and no
+document at all describing the app's current architecture or a
+user-facing changelog.
+
+**Implementation:**
+
+- The three `HANDOFF_*.md` files were consolidated into this single
+  document, `DEVELOPMENT_HISTORY.md`, reorganized into one continuous
+  chronological narrative (v1.0 → v1.1 → Version 2.0 phases → Version 2.1)
+  and removed from the repository — their content lives on here.
+- `CHANGELOG.md` was introduced as a concise, user-facing record of
+  what changed release over release, intentionally kept separate from
+  this document's engineering narrative.
+- `ARCHITECTURE.md` was introduced as a static reference for how Olivia
+  works **today** — module responsibilities, data flow, and the
+  multi-assistant session model — independent of how it got there.
+- `README.md` was substantially expanded: a "Brand Identity" section
+  documenting the new logo assets and their theming technique, a
+  reworked introduction reflecting the multi-assistant platform, and a
+  new documentation cross-reference section pointing to `CHANGELOG.md`,
+  `ARCHITECTURE.md`, and this file.
+- Every remaining reference to the retired `HANDOFF_*.md` filenames
+  elsewhere in the repository (README links, code comments) was updated
+  to point at the new consolidated documents.
+
+**Rationale:** With four purpose-built documents — a user-facing
+changelog, a narrative development history, a static architecture
+reference, and a setup/usage README — Olivia's documentation now mirrors
+the separation of concerns already established in its codebase: each
+document answers one question (*what changed* / *why does it look this
+way* / *how does it work now* / *how do I use or run it*) instead of one
+growing pile of phase-by-phase handoff notes.
+
+---
+
+## Version 2.2 — Settings & Backup
+
+### Why Backup & Restore Was Introduced
+
+Olivia stores all user data — assistants, conversations, avatars, volume
+settings, pairing tokens, and device identities — in browser `localStorage`.
+This is intentional: the app is fully client-side and requires no backend
+database. However, `localStorage` is bound to a single browser profile on a
+single device. Moving to a different browser, clearing browser storage, or
+migrating to a new machine means losing all Olivia data.
+
+Version 2.2 solves this with a complete Export / Import system. The export
+captures every `olivia_*` and `xiaozhi_*` key from `localStorage` into a
+versioned JSON envelope and triggers a browser download. The import reverses
+the process: reads the file locally, validates it, asks for confirmation, and
+restores all keys before reloading the app. Nothing is transmitted to a server.
+
+The decision to enumerate all `olivia_*` / `xiaozhi_*` keys dynamically
+(rather than maintaining an explicit inclusion list) was deliberate: it ensures
+that any key added in a future version is automatically included in exports
+without requiring a matching update to the backup code.
+
+The `backupVersion` integer in the envelope enables future migration paths.
+A future Olivia version that changes storage schema can inspect the
+`backupVersion` of an incoming backup and run the appropriate transformations
+before writing to `localStorage`, without breaking older backups.
+
+### Migration from olivia-ai.pages.dev to www.oliviaai.dev
+
+During the Version 2 cycle, Olivia moved from its initial Cloudflare Pages
+deployment at `olivia-ai.pages.dev` to a custom domain, `www.oliviaai.dev`.
+This migration was transparent to users at the protocol level — the Hono
+Worker, proxy routes, and all Xiaozhi endpoints are domain-agnostic.
+
+However, the migration highlighted a practical gap: users who had accumulated
+assistants, conversation histories, and avatars on the old domain had no way
+to carry that data to the new URL. Browser `localStorage` is scoped to the
+origin (scheme + hostname + port), so `olivia-ai.pages.dev` and
+`www.oliviaai.dev` each have completely separate storage.
+
+The Export / Import feature introduced in v2.2 directly solves this class of
+problem. A user can export their data from any Olivia URL and import it into
+any other — same user on a different browser, different device, or different
+domain. The versioned backup format ensures that a backup created on
+`olivia-ai.pages.dev` (Olivia 2.0) can be imported into `www.oliviaai.dev`
+(Olivia 2.2) without issues.
+
+### Evolution of the Settings Interface
+
+Olivia's settings have gone through three distinct phases:
+
+**v1.0 — Single global settings panel.** There was one device, so there was
+one settings panel. A gear icon in the sidebar header opened it. It contained
+all device configuration: WebSocket URL, OTA URL, Device-Id, Client-Id,
+protocol version, frame duration, listening mode, and audio toggles.
+
+**v2.0 — Per-assistant settings, header gear icon removed.** When Olivia
+became a multi-assistant platform, the old global gear icon was removed. Each
+assistant in the sidebar list gained its own gear icon (revealed on hover),
+opening a settings panel scoped exclusively to that assistant. The panel
+retained all connection and protocol fields, but now also included the
+assistant's name, avatar, and delete controls. A global gear icon in the
+sidebar header was deemed redundant at the time (the active assistant's gear
+icon in the list already served the same purpose) and was not included in v2.0.
+The hover-only reveal of the per-assistant gear icon was flagged in Phase 3
+as a mobile usability gap (touch devices have no hover state) but was not
+revisited until v2.2.
+
+**v2.2 — Global settings icon restored, with a clear separation.**
+As Olivia matures, a distinction emerged between two kinds of settings:
+*per-assistant configuration* (WebSocket URL, pairing, avatars, protocol) and
+*app-level user preferences* (backup, future language, accessibility). The
+v2.2 release restores the gear icon to the sidebar header, but wires it to a
+new *global* Settings panel that contains only app-level settings. The
+per-assistant gear icons in the assistant list remain unchanged and continue
+to open the per-assistant settings panel as before. The two panels are
+visually and functionally separate, ensuring users intuitively understand
+where to find what.
+
+The Info panel (accessible via the Info tab) was deliberately kept separate
+from the Settings panel — it is read-only and informational, while Settings
+is interactive. This separation was established in the About Page Refactor
+and reinforced in v2.2.
+
+### Touch-Friendly Per-Assistant Gear Icon
+
+The hover-only per-assistant gear icon, unresolved since Phase 3, was
+addressed in the same v2.2 cycle that restored the global Settings icon.
+Rather than introducing new JavaScript state, the fix is purely CSS-driven,
+using the `hover` media feature to distinguish real pointer devices from
+touch:
+
+- **Desktop (`@media (hover: hover)`)** — unchanged hover reveal on any
+  assistant row, plus the active assistant's gear now also stays visible
+  without requiring a hover, matching user expectation that "the assistant
+  I'm currently using" is always adjustable.
+- **Touch (`@media (hover: none)`)** — only the active/selected assistant's
+  gear icon is shown; every other assistant in the list keeps its gear
+  hidden. This avoids the alternative of showing every assistant's gear
+  icon at once on mobile, which would clutter the list and looks
+  inconsistent with the calm, minimal sidebar style established since v1.0.
+
+Keyboard focus (`:focus-visible`) continues to reveal the gear regardless
+of device, preserving existing accessibility behavior. No changes were made
+to `AssistantManager`, `renderAssistantList()`, or the click handlers that
+open the per-assistant settings panel — only the CSS visibility rules for
+`.assistant-gear-btn` changed.
+
+### Milestones in Version 2.2
+
+| Milestone | Description |
+|---|---|
+| Global Settings button | Gear icon restored to sidebar header, beside theme toggle |
+| Global Settings panel | Slide-in panel for app-level settings (separate from per-assistant panel) |
+| BackupSystem module | New IIFE module in `app.js` handling export, import, validation, and restore |
+| BackupStorage module | Thin `localStorage` wrapper for the Last Backup timestamp |
+| Versioned backup format | `backupVersion` integer + `oliviaVersion` string for future migrations |
+| Last Backup timestamp | Persisted after each export, displayed in human-readable form in Settings |
+| Import confirmation modal | Required confirmation dialog before any data is overwritten |
+| Info panel version bump | `Olivia 2.0` → `Olivia 2.2` in System Status |
+| Storage label correction | `Local Browser Storage` → `Browser Local Storage` |
+| Touch-friendly gear icon | `@media (hover: ...)` rules so the active assistant's gear is always reachable on touch devices, while desktop hover behavior is preserved |
+
 ---
 
 ## Recurring Design Principles
@@ -459,9 +651,6 @@ rationale for context:
 - **Inline "Add Assistant" input** — replacing the `prompt()` dialog with
   an inline sidebar text input was proposed as early as Phase 3 and
   remained unimplemented through Phase 5.
-- **Always-visible or tap-accessible gear icon on touch devices** — the
-  hover-only gear icon was flagged as a mobile usability gap in Phase 3
-  and never revisited.
 - **Cloudflare R2-backed avatar storage** — `AvatarStorage`'s minimal
   three-method interface (`save`/`load`/`remove`) was deliberately kept
   swappable so a future phase could move avatar images to R2 (via new

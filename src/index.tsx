@@ -480,6 +480,9 @@ app.get('/', (c) => {
         <i class="fas fa-sun icon-sun"></i>
         <i class="fas fa-moon icon-moon"></i>
       </button>
+      <button class="global-settings-btn" id="globalSettingsBtn" title="Settings">
+        <i class="fas fa-gear"></i>
+      </button>
     </div>
 
     <!-- Navigation Tabs -->
@@ -532,6 +535,66 @@ app.get('/', (c) => {
     </div>
 
   </aside>
+
+  <!-- ── GLOBAL SETTINGS PANEL (slides in from right) ──────── -->
+  <!-- v2.2: Global app-level settings for Backup & Restore and future
+       user preferences. Opened via the gear icon in the sidebar header.
+       This is SEPARATE from the per-assistant settings panel (settingsPanel)
+       which is scoped to a single assistant's configuration. -->
+  <div class="global-settings-panel" id="globalSettingsPanel">
+    <div class="settings-header">
+      <h2><i class="fas fa-gear"></i> Settings</h2>
+      <button class="close-settings-btn" id="closeGlobalSettingsBtn"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="settings-body">
+
+      <div class="settings-section">
+        <h3>Backup &amp; Restore</h3>
+
+        <div class="form-group">
+          <button class="btn-primary btn-block" type="button" id="exportDataBtn">
+            <i class="fas fa-file-export"></i> Export Olivia Data
+          </button>
+          <small>Downloads a complete backup of all your Olivia data as a JSON file.</small>
+        </div>
+
+        <div class="form-group">
+          <label>Last Backup</label>
+          <div class="backup-timestamp" id="lastBackupTimestamp">Never</div>
+        </div>
+
+        <div class="form-group">
+          <button class="btn-secondary btn-block" type="button" id="importDataBtn">
+            <i class="fas fa-file-import"></i> Import Olivia Data
+          </button>
+          <small>Restore from a previously exported Olivia backup file (.json).</small>
+          <input type="file" id="importFileInput" accept=".json,application/json" style="display:none;" />
+        </div>
+      </div>
+
+      <!-- Future settings sections go here:
+           Language, Accessibility, Reset Application, Experimental Features -->
+
+    </div>
+  </div>
+
+  <!-- ── IMPORT CONFIRMATION MODAL ──────────────────────── -->
+  <div class="import-confirm-overlay" id="importConfirmOverlay" style="display:none;">
+    <div class="import-confirm-card">
+      <div class="import-confirm-header">
+        <i class="fas fa-file-import"></i>
+        <h3>Import Backup</h3>
+      </div>
+      <p class="import-confirm-message">Importing this backup will replace your current Olivia data. This cannot be undone.</p>
+      <div class="import-confirm-meta" id="importConfirmMeta"></div>
+      <div class="import-confirm-actions">
+        <button class="btn-secondary" type="button" id="importCancelBtn">Cancel</button>
+        <button class="btn-primary" type="button" id="importConfirmBtn">
+          <i class="fas fa-check"></i> Import
+        </button>
+      </div>
+    </div>
+  </div>
 
   <!-- ── SETTINGS PANEL (slides in) ──────────────────────── -->
   <!-- PHASE 2: this panel is now shared across ALL assistants — it is
@@ -981,12 +1044,12 @@ app.get('/', (c) => {
 
       <h4>System Status</h4>
       <div class="protocol-table" id="systemStatusTable">
-        <div class="proto-row"><span>Application Version</span><code>Olivia 2.0</code></div>
+        <div class="proto-row"><span>Application Version</span><code>Olivia 2.2</code></div>
         <div class="proto-row"><span>Registered Assistants</span><code id="statAssistantCount">—</code></div>
         <div class="proto-row"><span>Connected Assistants</span><code id="statConnectedCount">—</code></div>
         <div class="proto-row"><span>Stored Conversations</span><code id="statConversationCount">—</code></div>
         <div class="proto-row"><span>Theme</span><code id="statTheme">—</code></div>
-        <div class="proto-row"><span>Storage</span><code>Local Browser Storage</code></div>
+        <div class="proto-row"><span>Storage</span><code>Browser Local Storage</code></div>
       </div>
 
       <h4>Open Source</h4>
@@ -1007,7 +1070,7 @@ app.get('/', (c) => {
 
       <h4>Version</h4>
       <div class="protocol-table">
-        <div class="proto-row"><span>Version</span><code>2.0</code></div>
+        <div class="proto-row"><span>Version</span><code>2.2</code></div>
         <div class="proto-row"><span>Project</span><code>Open Language Intelligence &amp; Voice Interactive Assistant</code></div>
         <div class="proto-row"><span>License</span><code>MIT</code></div>
         <div class="proto-row"><span>Author</span><code>Roalf Burgonio</code></div>

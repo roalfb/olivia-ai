@@ -371,6 +371,35 @@ the sidebar header. The icon swap between sun/moon is pure CSS
 (`[data-theme]` selectors toggle visibility) — no re-render is triggered by
 toggling. The theme preference is global to the app, not per-assistant.
 
+### Responsive Gear Icon (v2.2)
+
+Each assistant row in the sidebar (`.conv-item.assistant-item`) renders its
+own `.assistant-gear-btn`, which opens that assistant's scoped Settings
+panel. Visibility of this button is governed entirely by CSS `@media
+(hover: ...)` feature queries in `style.css` — no JavaScript branching is
+involved:
+
+```
+default             → opacity: 0 (hidden)
+:focus-visible       → opacity: 1 (keyboard access, any device)
+@media (hover: hover)
+  .conv-item:hover  OR  .conv-item.active   → opacity: 1
+@media (hover: none)
+  .conv-item.active (ONLY)                  → opacity: 1
+```
+
+`hover: hover` targets devices that can genuinely hover (mouse/trackpad),
+so desktop behavior is unchanged: the gear reveals on hover of any row,
+and — new in v2.2 — the active assistant's gear also stays visible without
+needing to hover it. `hover: none` targets devices with no true hover
+state (touch-only), where only the active/selected assistant's gear icon
+is ever shown; every other assistant's gear stays hidden regardless of
+touch/tap, keeping the list uncluttered while still making settings
+reachable on mobile. `AssistantManager`/rendering logic is untouched —
+`renderAssistantList()` already added the `.active` class to the selected
+assistant's row before v2.2; only the CSS rules consuming that class
+changed.
+
 ---
 
 ## Storage
@@ -385,10 +414,61 @@ traffic (WebSocket, OTA, vision) that a physical ESP32 would also send.
 | `olivia_theme_preference` | Manual theme override (`'light'` or `'dark'`); absent when following the system preference |
 | `olivia_avatar_v1_<assistantId>` | That assistant's custom avatar, as a 256×256 JPEG data URL |
 | `olivia_volume_v1_<assistantId>` | That assistant's saved local speech volume, `0`–`1` |
+| `olivia_last_backup_ts` | ISO 8601 timestamp of the most recent successful export; written by `BackupStorage.save()` |
 
 Deleting an assistant removes its avatar and volume keys automatically.
 `olivia_assistants_v1` and `olivia_theme_preference` are the only two keys
 that persist independently of any single assistant's lifecycle.
+
+### Backup & Restore (v2.2)
+
+`BackupSystem` implements client-side data portability:
+
+**Export (backup):**
+The `gatherAllData()` helper enumerates every `olivia_*` and `xiaozhi_*`
+key in `localStorage` at export time. This is intentionally future-proof:
+any new storage key added to a future Olivia version is automatically
+included in the backup without requiring an explicit list update.
+
+The backup is serialised to a versioned JSON envelope:
+
+```json
+{
+  "backupVersion": 1,
+  "oliviaVersion": "2.2",
+  "createdAt": "2026-07-28T21:42:00.000Z",
+  "data": {
+    "olivia_assistants_v1": "...",
+    "olivia_theme_preference": "dark",
+    "olivia_avatar_v1_<id>": "data:image/jpeg;base64,...",
+    "olivia_volume_v1_<id>": "0.8",
+    "olivia_last_backup_ts": "..."
+  }
+}
+```
+
+**Import (restore):**
+1. The file is read via `FileReader` — entirely in the browser; never uploaded.
+2. `validateBackup()` checks: valid JSON, `backupVersion` present and not
+   newer than the running version, `createdAt` present, `data` non-empty,
+   at least one Olivia key present. Invalid files are rejected without
+   touching any data.
+3. A confirmation modal is shown with the backup's metadata (creation date,
+   Olivia version, key count). The user must explicitly confirm.
+4. On confirmation, existing `olivia_*`/`xiaozhi_*` keys are removed, the
+   backup's `data` values are written back, and `window.location.reload()`
+   is called so the app boots fresh from the restored state.
+
+**Migration path for future versions:**
+`backupVersion` is an integer. When a future Olivia version introduces
+breaking storage schema changes, it should increment `BACKUP_VERSION` and
+add migration logic in `performRestore()` that transforms a lower-versioned
+backup before writing it to `localStorage`. Backups with a `backupVersion`
+higher than the running app version are rejected with an error.
+
+**Security:**
+Everything is client-side. No backup data is transmitted to any server.
+The Hono backend has no knowledge of the backup system.
 
 ---
 

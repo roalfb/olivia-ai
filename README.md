@@ -56,6 +56,7 @@ What started as a single virtual device has grown into a full **multi-assistant 
 - [Brand Identity](#brand-identity)
 - [Assistant Avatars](#assistant-avatars)
 - [Per-Assistant Speech Volume](#per-assistant-speech-volume)
+- [Backup & Restore](#backup--restore)
 - [Usage Guide](#usage-guide)
 - [Installation](#installation)
 - [Deployment](#deployment)
@@ -229,7 +230,7 @@ See [Per-Assistant Speech Volume](#per-assistant-speech-volume) below for the fu
 - **Message image thumbnails** — user messages that include a vision attachment show an inline thumbnail above the text
 - **Theme toggle button** — ☀️/🌙 icon in the sidebar header
 - **Speaker / volume popup** — per-assistant volume slider in the chat header
-- **Assistant sidebar** — scrollable list of all assistants with avatar, name, live connection-status dot, and a hover-revealed gear icon for scoped settings
+- **Assistant sidebar** — scrollable list of all assistants with avatar, name, live connection-status dot, and a gear icon for scoped settings (hover-revealed on desktop; always visible on the active assistant on touch devices)
 - **Clickable avatars** — click any avatar (sidebar, chat header, or settings panel) to upload a new profile picture for that assistant
 
 ---
@@ -244,7 +245,7 @@ The activation overlay appears the first time you connect a given assistant. It 
 
 ### Multi-Assistant Sidebar
 
-The left sidebar lists every assistant you've created, each with its own avatar, name, and a live status dot (grey = disconnected, green = connected). Click any entry to switch instantly — background assistants keep their connection alive. A gear icon appears on hover for opening that assistant's scoped settings, and a ☀️/🌙 button at the top of the sidebar toggles the light/dark theme app-wide.
+The left sidebar lists every assistant you've created, each with its own avatar, name, and a live status dot (grey = disconnected, green = connected). Click any entry to switch instantly — background assistants keep their connection alive. A gear icon opens that assistant's scoped settings — on desktop it appears on hover, while on touch devices the active assistant's gear icon stays visible so settings remain reachable without a hover state. A ☀️/🌙 button and a ⚙️ Settings button at the top of the sidebar toggle the theme and open the global Settings panel, respectively.
 
 ### Chat
 
@@ -368,7 +369,6 @@ These guarantees were verified with a dedicated automated test harness (12 core-
 
 - **Add Assistant** currently uses a simple `prompt()` dialog rather than an inline sidebar input
 - **No reconnect-on-reload** — this is intentional: a page reload does not attempt to silently resume every assistant's WebSocket connection; you reconnect assistants manually, the same way you would reconnect a single device
-- **Mobile gear icon** — the per-assistant settings gear is currently revealed on hover and may need a tap-and-hold or always-visible affordance on touch-only devices
 
 See [Roadmap](#roadmap) for planned improvements.
 
@@ -822,6 +822,63 @@ Wiring it up in a future phase would take a single additional `protocol.on('cust
 
 ---
 
+## Backup & Restore
+
+Olivia stores all data in browser `localStorage`. The Backup & Restore feature (introduced in v2.2) lets you export that data to a JSON file and restore it on any browser, device, or domain — including when migrating between Cloudflare deployment URLs.
+
+### Accessing Backup & Restore
+
+1. Click the **⚙️ gear icon** in the sidebar header (beside the ☀️/🌙 theme toggle)
+2. The **Settings panel** opens — Backup & Restore is the first section
+
+### Export
+
+Click **Export Olivia Data** to download a complete snapshot of all your Olivia data. The file is named `Olivia-Backup-YYYY-MM-DD.json` and contains every `olivia_*` key from your browser storage, wrapped in a versioned envelope:
+
+```json
+{
+  "backupVersion": 1,
+  "oliviaVersion": "2.2",
+  "createdAt": "2026-07-28T21:42:00.000Z",
+  "data": {
+    "olivia_assistants_v1": "...",
+    "olivia_theme_preference": "dark",
+    "olivia_avatar_v1_<id>": "...",
+    "olivia_volume_v1_<id>": "0.8"
+  }
+}
+```
+
+After a successful export, the **Last Backup** timestamp in Settings updates to the current date and time and persists across reloads.
+
+### Import
+
+Click **Import Olivia Data** to restore from a backup file:
+
+1. A file picker opens — select a `.json` Olivia backup file
+2. Olivia validates the file (JSON format, backup version, required fields)
+3. If valid, a confirmation dialog appears:
+   > *Importing this backup will replace your current Olivia data.*
+4. Click **Import** to confirm, or **Cancel** to abort without making any changes
+5. After a successful import, Olivia reloads automatically from the restored state
+
+Invalid files (wrong format, missing fields, backup version newer than the running app) are rejected without touching any existing data.
+
+### Security
+
+Everything is entirely client-side. Backup files are downloaded to your device — they are never uploaded to any server or transmitted anywhere. Olivia's Hono backend has no knowledge of the backup system.
+
+### Last Backup
+
+The Settings panel always shows when your last backup was created:
+
+- **Never** — no backup has been made yet
+- **Jul 28, 2026 • 9:42 PM** — the date and time of the most recent export
+
+This timestamp is stored locally in `olivia_last_backup_ts` and is included in each backup, so it is also restored along with all other data.
+
+---
+
 ## Usage Guide
 
 ### Adding an Assistant
@@ -1167,8 +1224,11 @@ All data lives in **browser `localStorage`** — there is no server-side databas
 | `olivia_theme_preference` | Manual theme override (`'light'` or `'dark'`); absent when following the system preference |
 | `olivia_avatar_v1_<assistantId>` | That assistant's custom avatar, stored as a 256×256 JPEG data URL |
 | `olivia_volume_v1_<assistantId>` | That assistant's saved local speech volume, `0`–`1` |
+| `olivia_last_backup_ts` | ISO 8601 timestamp of the most recent successful Export; written by `BackupStorage` (v2.2) |
 
 Deleting an assistant removes its avatar and volume keys automatically; only `olivia_assistants_v1` and `olivia_theme_preference` persist independently of any single assistant's lifecycle.
+
+All of these keys (and any future `olivia_*` keys) are captured together in a single export by the Backup & Restore feature — see [Backup & Restore](#backup--restore).
 
 ---
 
@@ -1403,7 +1463,7 @@ The `beforeunload` handler sends a clean WebSocket disconnect for every connecte
 
 **Does it work on mobile?**
 
-Yes. The layout is fully responsive. On screens ≤ 768 px, the sidebar becomes a slide-in overlay. The mic button supports both touch (push-to-talk) and tap (toggle). The camera modal works with mobile front and rear cameras. The per-assistant gear icon currently relies on hover and is easiest to reach with a mouse or trackpad — see [Known Limitations](#known-limitations).
+Yes. The layout is fully responsive. On screens ≤ 768 px, the sidebar becomes a slide-in overlay. The mic button supports both touch (push-to-talk) and tap (toggle). The camera modal works with mobile front and rear cameras. The per-assistant gear icon adapts to input type: on desktop it reveals on hover, while on touch devices the active assistant's gear icon is always visible so its settings stay reachable without needing a hover state.
 
 **What is `test-token`?**
 
@@ -1450,9 +1510,9 @@ Multi-Assistant
   [x] Per-assistant scoped settings panel (gear icon)
   [x] Persistent assistants, history, and settings across reload
   [ ] Inline "Add Assistant" input (replace prompt() dialog)
-  [ ] Always-visible gear icon on touch devices
+  [x] Touch-friendly gear icon (active assistant's gear always visible on touch devices)
   [ ] Auto-reconnect assistants that were connected before reload
-  [ ] Export/import assistant configuration (JSON backup)
+  [x] Export/import all Olivia data (JSON backup with versioned schema)
   [ ] Unread-message badge for background assistants
   [ ] Per-assistant audio output device routing
 

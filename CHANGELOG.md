@@ -10,9 +10,117 @@ the current architecture, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Table of Contents
 
+- [v2.2 — Settings, Backup & Restore](#v22--settings-backup--restore)
+- [v2.1 — Official Branding & Documentation](#v21--official-branding--documentation)
 - [v2.0 — Multi-Assistant Platform](#v20--multi-assistant-platform)
 - [v1.1 — Bug Fixes & Cloudflare Deployment](#v11--bug-fixes--cloudflare-deployment)
 - [v1.0 — Initial Release](#v10--initial-release)
+
+---
+
+## v2.2 — Settings, Backup & Restore
+
+Olivia 2.2 introduces a dedicated Settings interface, complete
+Backup & Restore functionality, and several UI refinements.
+
+### Added
+
+- **Settings icon** — a gear (⚙️) button now appears in the sidebar
+  header beside the existing Light/Dark mode toggle; clicking it opens
+  the new global Settings panel
+- **Global Settings panel** — a slide-in panel separate from the
+  per-assistant settings; contains app-level user preferences starting
+  with Backup & Restore; designed to accommodate future options (Language,
+  Accessibility, Reset Application, Experimental Features)
+- **Export Olivia Data** — exports every piece of persistent Olivia data
+  (assistants, conversations, avatars, volume settings, device identities,
+  pairing tokens, themes, OTA/WebSocket settings, and all other
+  `olivia_*`/`xiaozhi_*` localStorage keys) to a single, versioned JSON
+  file named `Olivia-Backup-YYYY-MM-DD.json`
+- **Versioned backup format** — backups include `backupVersion`,
+  `oliviaVersion`, and `createdAt` fields; designed so future Olivia
+  versions can migrate older backups without data loss
+- **Import Olivia Data** — accepts a previously exported JSON backup;
+  validates the file format and required fields before proceeding; shows
+  an explicit confirmation prompt before overwriting any data; reloads
+  Olivia automatically after a successful restore
+- **Last Backup timestamp** — each successful export records the time in
+  `localStorage`; the Settings panel displays it in a human-readable
+  format (`Jul 28, 2026 • 9:42 PM`) or "Never" if no backup exists
+
+### Changed
+
+- **Info panel — Application Version** updated from `Olivia 2.0`
+  to `Olivia 2.2`
+- **Info panel — Storage** label corrected to `Browser Local Storage`
+  (was `Local Browser Storage`) for consistency with standard terminology
+- **Touch-friendly assistant gear icon** — each assistant's settings gear
+  icon used to be revealed only on hover, which touch devices cannot
+  trigger. On desktop (`hover: hover`), hovering an assistant still reveals
+  its gear icon exactly as before, and the active assistant's gear icon
+  also stays visible without needing to hover it. On touch devices
+  (`hover: none`), only the currently active/selected assistant's gear
+  icon is shown; every other assistant's gear stays hidden, so settings
+  remain reachable on mobile without cluttering the list with every icon
+  at once
+
+### Responsibility separation
+
+- The **Info panel** (accessible via the Info tab) remains purely
+  informational — About, Features, Technology Stack, Architecture,
+  Protocol, System Status, Open Source, Documentation.
+- The **Settings panel** (gear icon) is interactive — Backup & Restore
+  and future user preferences. These two panels do not duplicate content.
+
+---
+
+## v2.1 — Official Branding & Documentation
+
+Olivia 2.1 is a branding and documentation release. No protocol, feature,
+or architectural behavior changed — every update in this release is
+visual identity or documentation, refining the multi-assistant platform
+introduced in v2.0 into a professionally branded product.
+
+### Added
+
+- **Official Olivia Monogram and Wordmark** — a new merged "ai" ligature
+  monogram and an "olivi**ai**" wordmark, both delivered as unmodified
+  SVG assets, replace the generic Font Awesome computer-chip icon and the
+  plain `O.L.I.V.I.A.` text branding across the sidebar header, chat
+  welcome message, About page, and loading screen
+- **Updated favicon and full PWA icon set** — a new brand-aware
+  `favicon.svg` (with its own `prefers-color-scheme`-aware styling,
+  since page CSS variables aren't visible to browser chrome),
+  `favicon-32.png`, `apple-touch-icon.png` (180×180), `icon-192.png`,
+  `icon-512.png`, and a safe-zone-padded `maskable-512.png` for PWA
+  installs — all placed under the new `public/static/logo/` directory
+- **Web App Manifest** (`manifest.json`) — name, icon set, `theme_color`,
+  and `display: standalone`, enabling Olivia to be installed to a device
+  home screen with the new brand icon
+- **Theme-aware logo rendering** — both `monogram.svg` and `wordmark.svg`
+  render via a CSS `mask` + `background-color: currentColor` technique,
+  so a single SVG file automatically adapts between light and dark
+  themes with no duplicate per-theme assets
+- **Restructured project documentation** — introduced `README.md`,
+  `CHANGELOG.md`, `ARCHITECTURE.md`, and `DEVELOPMENT_HISTORY.md` as the
+  project's permanent documentation set; added a "Brand Identity" section
+  to the README covering the new logo assets and their theming technique
+
+### Changed
+
+- **About page branding** — the About page header now displays the
+  Olivia Wordmark instead of the plain-text `O.L.I.V.I.A.` heading
+- **Sidebar branding** — the sidebar's device avatar now displays the
+  Olivia Monogram instead of the generic chip icon, and the device name
+  label now renders the Olivia Wordmark
+- Browser tab `<title>` normalized from `OLIVIA` to `Olivia`
+
+### Removed
+
+- **Retired the HANDOFF documents** — `HANDOFF_PHASE123.md`,
+  `HANDOFF_PHASE45.md`, and `HANDOFF_About-Page-Refactor.md` were merged
+  into the new `DEVELOPMENT_HISTORY.md` and removed from the repository;
+  their content lives on in that consolidated history
 
 ---
 

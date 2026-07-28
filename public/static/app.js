@@ -5821,6 +5821,351 @@ const ImageInput = (() => {
 })();
 
 // ================================================================
+// MODULE: BackupStorage                                   [v2.2]
+// ----------------------------------------------------------------
+// Persists the "Last Backup" timestamp to localStorage.
+// Keyed separately so it is never accidentally wiped by AssistantManager.
+// ================================================================
+const BackupStorage = (() => {
+  const KEY = 'olivia_last_backup_ts';
+
+  function save(isoString) {
+    try {
+      localStorage.setItem(KEY, isoString);
+    } catch (e) {
+      Logger.warn('[BackupStorage] save failed', e.message);
+    }
+  }
+
+  function load() {
+    try {
+      return localStorage.getItem(KEY) || null;
+    } catch (e) {
+      Logger.warn('[BackupStorage] load failed', e.message);
+      return null;
+    }
+  }
+
+  return { save, load };
+})();
+
+// ================================================================
+// MODULE: BackupSystem                                    [v2.2]
+// ----------------------------------------------------------------
+// Handles Export (all Olivia data → JSON file) and Import
+// (JSON file → restore all Olivia data + reload).
+//
+// Backup schema version: 1
+// Format: { backupVersion, oliviaVersion, createdAt, data: { ... } }
+//
+// Security: 100% client-side. No uploads. No servers. No transmission.
+// ================================================================
+const BackupSystem = (() => {
+  const OLIVIA_VERSION = '2.2';
+  const BACKUP_VERSION = 1;
+  const LAST_BACKUP_KEY = 'olivia_last_backup_ts';
+
+  // ── Helpers ──────────────────────────────────────────────
+
+  /**
+   * Format a Date for display: "Jul 28, 2026 • 9:42 PM"
+   */
+  function formatTimestamp(isoString) {
+    if (!isoString) return 'Never';
+    try {
+      const d = new Date(isoString);
+      if (isNaN(d.getTime())) return 'Never';
+      return d.toLocaleDateString('en-US', {
+        month: 'short', day: 'numeric', year: 'numeric'
+      }) + ' \u2022 ' + d.toLocaleTimeString('en-US', {
+        hour: 'numeric', minute: '2-digit', hour12: true
+      });
+    } catch (e) {
+      return 'Never';
+    }
+  }
+
+  /**
+   * Gather ALL Olivia localStorage keys and their values.
+   * This is future-proof: any new keys added to the app are
+   * automatically captured as long as they start with "olivia_".
+   */
+  function gatherAllData() {
+    const data = {};
+
+    // Enumerate every key in localStorage that belongs to Olivia
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key) continue;
+      if (key.startsWith('olivia_') || key.startsWith('xiaozhi_')) {
+        try {
+          data[key] = localStorage.getItem(key);
+        } catch (e) { /* skip */ }
+      }
+    }
+
+    return data;
+  }
+
+  /**
+   * Build the versioned backup object.
+   */
+  function buildBackup() {
+    return {
+      backupVersion: BACKUP_VERSION,
+      oliviaVersion: OLIVIA_VERSION,
+      createdAt: new Date().toISOString(),
+      data: gatherAllData()
+    };
+  }
+
+  /**
+   * Validate an imported backup object.
+   * Returns { valid: true } or { valid: false, reason: string }
+   */
+  function validateBackup(obj) {
+    if (!obj || typeof obj !== 'object') {
+      return { valid: false, reason: 'File does not contain valid JSON.' };
+    }
+    if (typeof obj.backupVersion !== 'number') {
+      return { valid: false, reason: 'Missing or invalid backupVersion field.' };
+    }
+    if (obj.backupVersion > BACKUP_VERSION) {
+      return { valid: false, reason: `Backup version ${obj.backupVersion} is newer than this Olivia (supports up to version ${BACKUP_VERSION}). Please update Olivia first.` };
+    }
+    if (typeof obj.createdAt !== 'string') {
+      return { valid: false, reason: 'Missing createdAt field.' };
+    }
+    if (!obj.data || typeof obj.data !== 'object') {
+      return { valid: false, reason: 'Missing or invalid data field.' };
+    }
+    // Must have at least one Olivia key to be useful
+    const keys = Object.keys(obj.data);
+    const oliviaKeys = keys.filter(k => k.startsWith('olivia_') || k.startsWith('xiaozhi_'));
+    if (oliviaKeys.length === 0) {
+      return { valid: false, reason: 'Backup contains no Olivia data.' };
+    }
+    return { valid: true };
+  }
+
+  // ── Public API ────────────────────────────────────────────
+
+  /**
+   * Export all Olivia data to a JSON file.
+   * Triggers a browser download.
+   */
+  function exportData() {
+    try {
+      const backup = buildBackup();
+      const json = JSON.stringify(backup, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+
+      // Generate filename: Olivia-Backup-YYYY-MM-DD.json
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const filename = `Olivia-Backup-${dateStr}.json`;
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      // Persist the Last Backup timestamp
+      const now = new Date().toISOString();
+      BackupStorage.save(now);
+
+      // Refresh the display in the settings panel
+      updateLastBackupDisplay();
+
+      Logger.info(`[BackupSystem] Export complete: ${filename}`);
+      showToast(`Backup saved as ${filename}`, 'success', 'Export Complete');
+    } catch (e) {
+      Logger.error('[BackupSystem] Export failed', e.message);
+      showToast('Export failed: ' + e.message, 'error');
+    }
+  }
+
+  /**
+   * Parse and validate a File object, then show the import confirmation modal.
+   */
+  function importFromFile(file) {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.json') && file.type !== 'application/json') {
+      showToast('Please select a valid Olivia backup JSON file.', 'error');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      let parsed;
+      try {
+        parsed = JSON.parse(e.target.result);
+      } catch (err) {
+        showToast('Invalid file: could not parse JSON.', 'error');
+        return;
+      }
+
+      const validation = validateBackup(parsed);
+      if (!validation.valid) {
+        showToast('Invalid backup: ' + validation.reason, 'error');
+        return;
+      }
+
+      // Show confirmation modal
+      showImportConfirmation(parsed);
+    };
+    reader.onerror = () => {
+      showToast('Could not read the file. Please try again.', 'error');
+    };
+    reader.readAsText(file);
+  }
+
+  /**
+   * Show the import confirmation modal with backup metadata.
+   */
+  function showImportConfirmation(backup) {
+    const overlay = document.getElementById('importConfirmOverlay');
+    const meta = document.getElementById('importConfirmMeta');
+    if (!overlay || !meta) return;
+
+    const keys = Object.keys(backup.data || {});
+    const oliviaKeys = keys.filter(k => k.startsWith('olivia_') || k.startsWith('xiaozhi_'));
+
+    meta.innerHTML = [
+      `<strong>Created:</strong> ${formatTimestamp(backup.createdAt)}`,
+      `<strong>Olivia Version:</strong> ${backup.oliviaVersion || 'Unknown'}`,
+      `<strong>Backup Version:</strong> ${backup.backupVersion}`,
+      `<strong>Data Keys:</strong> ${oliviaKeys.length} items`
+    ].join('<br>');
+
+    overlay.style.display = 'flex';
+
+    // Store backup on the overlay for the confirm handler
+    overlay._pendingBackup = backup;
+  }
+
+  /**
+   * Perform the actual restore — called after user confirms.
+   */
+  function performRestore(backup) {
+    try {
+      const data = backup.data || {};
+
+      // Remove all existing Olivia keys before restoring
+      const keysToRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && (key.startsWith('olivia_') || key.startsWith('xiaozhi_'))) {
+          keysToRemove.push(key);
+        }
+      }
+      keysToRemove.forEach(k => localStorage.removeItem(k));
+
+      // Restore from backup
+      Object.entries(data).forEach(([key, value]) => {
+        if (value !== null && value !== undefined) {
+          localStorage.setItem(key, value);
+        }
+      });
+
+      Logger.info('[BackupSystem] Restore complete — reloading...');
+      showToast('Backup restored successfully. Reloading Olivia...', 'success');
+
+      // Reload after short delay to show the toast
+      setTimeout(() => {
+        window.location.reload();
+      }, 1200);
+    } catch (e) {
+      Logger.error('[BackupSystem] Restore failed', e.message);
+      showToast('Restore failed: ' + e.message, 'error');
+    }
+  }
+
+  /**
+   * Update the "Last Backup" display inside the Settings panel.
+   */
+  function updateLastBackupDisplay() {
+    const el = document.getElementById('lastBackupTimestamp');
+    if (!el) return;
+    const ts = BackupStorage.load();
+    el.textContent = formatTimestamp(ts);
+  }
+
+  /**
+   * Initialize — wire buttons and set initial display.
+   */
+  function init() {
+    // Global Settings button (gear icon beside theme toggle)
+    const globalSettingsBtn = document.getElementById('globalSettingsBtn');
+    const globalSettingsPanel = document.getElementById('globalSettingsPanel');
+    const closeGlobalSettingsBtn = document.getElementById('closeGlobalSettingsBtn');
+
+    if (globalSettingsBtn && globalSettingsPanel) {
+      globalSettingsBtn.addEventListener('click', () => {
+        globalSettingsPanel.classList.toggle('open');
+        updateLastBackupDisplay();
+      });
+    }
+    if (closeGlobalSettingsBtn && globalSettingsPanel) {
+      closeGlobalSettingsBtn.addEventListener('click', () => {
+        globalSettingsPanel.classList.remove('open');
+      });
+    }
+
+    // Export button
+    const exportBtn = document.getElementById('exportDataBtn');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', exportData);
+    }
+
+    // Import button triggers file picker
+    const importBtn = document.getElementById('importDataBtn');
+    const importFileInput = document.getElementById('importFileInput');
+    if (importBtn && importFileInput) {
+      importBtn.addEventListener('click', () => {
+        importFileInput.value = '';
+        importFileInput.click();
+      });
+      importFileInput.addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (file) importFromFile(file);
+      });
+    }
+
+    // Import confirmation modal
+    const importConfirmBtn = document.getElementById('importConfirmBtn');
+    const importCancelBtn = document.getElementById('importCancelBtn');
+    const importConfirmOverlay = document.getElementById('importConfirmOverlay');
+
+    if (importConfirmBtn && importConfirmOverlay) {
+      importConfirmBtn.addEventListener('click', () => {
+        const backup = importConfirmOverlay._pendingBackup;
+        if (backup) {
+          importConfirmOverlay.style.display = 'none';
+          performRestore(backup);
+        }
+      });
+    }
+    if (importCancelBtn && importConfirmOverlay) {
+      importCancelBtn.addEventListener('click', () => {
+        importConfirmOverlay.style.display = 'none';
+        importConfirmOverlay._pendingBackup = null;
+      });
+    }
+
+    // Set initial Last Backup display
+    updateLastBackupDisplay();
+
+    Logger.boot('[BackupSystem] initialized');
+  }
+
+  return { init, exportData, updateLastBackupDisplay };
+})();
+
+// ================================================================
 // ================================================================
 // MODULE: ThemeManager
 // Manages light/dark theme preference independently of system setting.
@@ -5901,6 +6246,9 @@ const AppController = (() => {
 
     // Initialize UI (renders sidebar/header, wires all button handlers)
     UIController.init();
+
+    // v2.2: Initialize Backup & Restore system (global settings panel)
+    BackupSystem.init();
 
     // Build a full session bundle for every persisted assistant, and
     // render the active assistant's chat history + connection state.
@@ -5989,6 +6337,7 @@ window.XiaozhiDebug = {
   ui:             UIController,
   app:            AppController,
   theme:          ThemeManager,
+  backup:         BackupSystem,
   logger:         Logger,
   get protocol()     { return SessionManager.getActiveSession()?.protocol; },
   get provisioning() { return SessionManager.getActiveSession()?.provisioning; },

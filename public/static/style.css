@@ -527,10 +527,19 @@ body {
   flex-shrink: 0;
 }
 
-/* PHASE 2: per-assistant gear icon — opens Settings scoped to that
+/* PHASE 2 / v2.2: per-assistant gear icon — opens Settings scoped to that
    specific assistant (active or in the background) without switching
-   to it first. Hidden until hover/focus to keep the list visually calm,
-   but always focusable for keyboard/touch accessibility. */
+   to it first.
+
+   v2.2 refinement: hover-only reveal is not touch-friendly (touch devices
+   have no hover state at all), so visibility now depends on input
+   capability rather than just screen width:
+     - Desktop / mouse (hover: hover): unchanged — hidden until the row is
+       hovered, plus the active assistant's gear also stays persistently
+       visible for convenience.
+     - Touch (hover: none): ONLY the active/selected assistant's gear icon
+       is shown; every other assistant keeps its gear hidden so the list
+       stays visually calm and no row exposes settings it shouldn't. */
 .assistant-gear-btn {
   flex-shrink: 0;
   width: 28px;
@@ -547,13 +556,31 @@ body {
   opacity: 0;
   transition: opacity var(--transition), background var(--transition), color var(--transition);
 }
-.conv-item:hover .assistant-gear-btn,
-.assistant-gear-btn:focus-visible {
-  opacity: 1;
-}
 .assistant-gear-btn:hover {
   background: var(--bg-input);
   color: var(--primary);
+}
+/* Keyboard focus always reveals the gear, regardless of input device. */
+.assistant-gear-btn:focus-visible {
+  opacity: 1;
+}
+
+/* Desktop / any device that supports true hover: keep existing hover
+   reveal, and also keep the active assistant's gear icon persistently
+   visible (doesn't affect other assistants — they still need hover). */
+@media (hover: hover) {
+  .conv-item:hover .assistant-gear-btn,
+  .conv-item.active .assistant-gear-btn {
+    opacity: 1;
+  }
+}
+
+/* Touch devices (cannot hover): only the active/selected assistant shows
+   its gear icon at all times; all other assistants stay hidden. */
+@media (hover: none) {
+  .conv-item.active .assistant-gear-btn {
+    opacity: 1;
+  }
 }
 
 .add-assistant-btn {
@@ -2725,5 +2752,146 @@ body {
   background: none;
   padding: 0;
   overflow: hidden;
+}
+
+
+/* ================================================================
+   v2.2 — Global Settings Button & Panel
+   ================================================================ */
+
+/* ── Global Settings Button (beside theme toggle) ── */
+.global-settings-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+.global-settings-btn:hover {
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+
+/* ── Global Settings Panel (slides in from left, same as assistant settings) ── */
+.global-settings-panel {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--sidebar-width);
+  height: 100%;
+  background: var(--bg-sidebar);
+  z-index: 201;
+  transform: translateX(-100%);
+  transition: transform var(--transition);
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+
+.global-settings-panel.open {
+  transform: translateX(0);
+}
+
+/* ── Settings panels: render above the mobile sidebar ────────────
+   On desktop .sidebar has no `position` set, so its z-index: 100
+   (base rule above) never actually applies — z-index only affects
+   positioned elements — and these settings panels (position: absolute,
+   z-index 200/201) simply paint on top as expected, since they come
+   later in the DOM.
+   On mobile (see "Mobile (≤ 768px)" rules earlier in this file),
+   .sidebar switches to `position: fixed` and gains z-index: 300, which
+   makes that z-index take effect for the first time and puts the
+   sidebar above these panels' 200/201. Re-assert both panels above the
+   mobile sidebar's z-index here — placed after both panels' base rules
+   so it always wins the cascade on mobile — rather than blindly raising
+   their base (desktop) z-index. */
+@media (max-width: 768px) {
+  .settings-panel,
+  .global-settings-panel {
+    z-index: 310;
+  }
+}
+
+/* ── Backup Timestamp Display ── */
+.backup-timestamp {
+  font-size: 13px;
+  color: var(--text-secondary);
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  font-family: 'Inter', sans-serif;
+}
+
+/* ── Import Confirmation Overlay ── */
+.import-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.import-confirm-card {
+  background: var(--bg-secondary);
+  border-radius: var(--radius-md);
+  padding: 28px 24px;
+  max-width: 420px;
+  width: 100%;
+  box-shadow: var(--shadow-lg);
+}
+
+.import-confirm-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.import-confirm-header i {
+  font-size: 22px;
+  color: var(--primary);
+}
+
+.import-confirm-header h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.import-confirm-message {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.import-confirm-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border);
+  line-height: 1.6;
+}
+
+.import-confirm-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
 }
 
