@@ -937,6 +937,162 @@ const WAKE_PRESETS = [
 ];
 
 // ================================================================
+// SHERPA-ONNX KWS ENGINE — WakeWordEngine implementation
+// Loads the emscripten module lazily from static/wake/ and feeds it
+// 16 kHz mono PCM from the capture pipeline. Keywords are runtime
+// text (phones/pinyin + '@' display), so no rebuild is needed to
+// change them. Model files are preloaded inside the .data archive.
+// ================================================================
+const SherpaKwsEngine = (() => {
+  const ASSET_BASE = '/static/wake/';  // same-origin; matches how app.js itself is served
+  const MODEL = {
+    encoder: './encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx',
+    decoder: './decoder-epoch-13-avg-2-chunk-8-left-64.onnx',
+    joiner: './joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx',
+    tokens: './tokens.txt',
+  };
+
+  // Minimal WebAssembly SIMD probe module (magic + one v128 op).
+  const SIMD_PROBE = new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10,
+    1, 8, 0, 65, 0, 253, 15, 253, 98, 11,
+  ]);
+
+  let module = null;        // emscripten Module (after init)
+  let fs = null;            // emscripten FS — a script global in this build (Module.FS is not exported)
+  let kws = null;           // Kws instance
+  let stream = null;
+  let keywordCb = null;
+  let loadPromise = null;
+  let lexicon = null;
+
+  function isSupported() {
+    return typeof WebAssembly === 'object' && WebAssembly.validate(SIMD_PROBE);
+  }
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Failed to load ' + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  function load() {
+    if (module) return Promise.resolve();
+    if (loadPromise) return loadPromise;
+    if (!isSupported()) return Promise.reject(new Error('Browser lacks WebAssembly SIMD'));
+    loadPromise = loadScript(ASSET_BASE + 'sherpa-onnx-kws.js').then(() =>
+      new Promise((resolve, reject) => {
+        // The emscripten main script consumes a global Module config object.
+        window.Module = {
+          locateFile: (f) => ASSET_BASE + f,
+          onRuntimeInitialized: () => resolve(),
+          onAbort: () => reject(new Error('Wake engine aborted during init')),
+        };
+        loadScript(ASSET_BASE + 'sherpa-onnx-wasm-kws-main.js').catch(reject);
+      })
+    ).then(() => {
+      module = window.Module;
+      fs = window.FS;
+      // window.Module must stay on window: this non-modularized emscripten
+      // build keeps referencing the global Module from its JS syscalls
+      // (e.g. file open during model load), even after runtime init.
+      Logger.info('Wake word engine ready (sherpa-onnx KWS wasm)');
+    });
+    return loadPromise;
+  }
+
+  function getLexicon() {
+    if (lexicon) return lexicon;
+    if (!module) throw new Error('Engine not loaded');
+    lexicon = new Map();
+    const text = fs.readFile('en.phone', { encoding: 'utf8' });
+    for (const line of text.split('\n')) {
+      const t = line.trim();
+      if (!t || t.startsWith('//') || t.startsWith('#')) continue;
+      const parts = t.split(/\s+/);
+      if (parts.length < 2) continue;
+      lexicon.set(parts[0], parts.slice(1).filter(p => !p.startsWith('//')).join(' '));
+    }
+    return lexicon;
+  }
+
+  function start(keywords, threshold, onKeyword) {
+    return load().then(() => {
+      stop();
+      const config = {
+        featConfig: { samplingRate: 16000, featureDim: 80 },
+        modelConfig: {
+          transducer: {
+            encoder: MODEL.encoder, decoder: MODEL.decoder, joiner: MODEL.joiner,
+          },
+          tokens: MODEL.tokens, provider: 'cpu', numThreads: 1, debug: 0,
+          modelingUnit: 'cjkchar', bpeVocab: '',
+        },
+        maxActivePaths: 4,
+        numTrailingBlanks: 1,
+        keywordsScore: 1.0,
+        keywordsThreshold: threshold,
+        keywords: keywords,
+      };
+      kws = createKws(module, config);
+      stream = kws.createStream();
+      keywordCb = onKeyword;
+      Logger.info(`Wake word engine started (threshold=${threshold})`);
+    });
+  }
+
+  function stop() {
+    if (stream) { stream.free(); stream = null; }
+    if (kws) { kws.free(); kws = null; }
+    keywordCb = null;
+  }
+
+  function isRunning() { return !!kws; }
+
+  function feedPcm(samples) {
+    if (!kws || !stream) return;
+    stream.acceptWaveform(16000, samples);
+    while (kws.isReady(stream)) {
+      kws.decode(stream);
+      const result = kws.getResult(stream);
+      if (result.keyword && result.keyword.length > 0) {
+        kws.reset(stream);
+        const cb = keywordCb;
+        if (cb) cb(result.keyword);
+      }
+    }
+  }
+
+  // Offline detection over decoded audio (16 kHz mono Float32) for the
+  // debug self-test — same code path as live detection.
+  function detectOffline(samples, keywords, threshold) {
+    return start(keywords, threshold, null).then(() => {
+      const hits = [];
+      const CHUNK = 4096;
+      for (let off = 0; off < samples.length; off += CHUNK) {
+        const block = samples.subarray(off, off + CHUNK);
+        stream.acceptWaveform(16000, block);
+        while (kws.isReady(stream)) {
+          kws.decode(stream);
+          const result = kws.getResult(stream);
+          if (result.keyword && result.keyword.length > 0) {
+            kws.reset(stream);
+            hits.push({ keyword: result.keyword, at: (off / 16000).toFixed(2) + 's' });
+          }
+        }
+      }
+      return hits;
+    });
+  }
+
+  return { isSupported, load, start, stop, isRunning, feedPcm, getLexicon, detectOffline };
+})();
+
+// ================================================================
 // MODULE: AssistantManager  (PHASE 1 — Multi-Assistant Foundation)
 // ================================================================
 // Olivia now models every paired "device" as an independent Assistant
@@ -6575,6 +6731,11 @@ window.XiaozhiDebug = {
   theme:          ThemeManager,
   backup:         BackupSystem,
   logger:         Logger,
+  wakeWord: {
+    engine: SherpaKwsEngine,
+    storage: WakeWordStorage,
+    presets: WAKE_PRESETS,
+  },
   get protocol()     { return SessionManager.getActiveSession()?.protocol; },
   get provisioning() { return SessionManager.getActiveSession()?.provisioning; },
   get device()       { return SessionManager.getActiveSession()?.deviceEmulator; },
