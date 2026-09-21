@@ -2025,7 +2025,13 @@ const AudioEngine = (() => {
   let scriptProcessorNode = null;
   let analyzerNode = null;
   let isCapturing = false;
-  let onAudioChunkCallback = null;
+  // Opus packet sink: receives every encoded frame. Defaults to the
+  // startCapture(onChunk) callback; reroutable/droppable via setOpusFrameSink
+  // without stopping the mic.
+  let opusFrameSink = null;
+  // Optional raw-PCM tap: receives a copy of each 16kHz mono capture block
+  // via setRawBlockSink. null = no tap.
+  let rawBlockSink = null;
   let ttsQueue = [];
   let isTTSPlaying = false;
 
@@ -2098,6 +2104,10 @@ const AudioEngine = (() => {
   // 60ms frame at 16kHz = 960 samples (matches OPUS_FRAME_DURATION_MS in firmware)
   const OPUS_FRAME_SAMPLES  = 960;
   const OPUS_FRAME_DURATION = 60;   // ms
+  // ScriptProcessor capture block size (samples per onaudioprocess callback,
+  // ~256ms at 16kHz). Also the slice size encodePcmChunk() feeds through
+  // processBlock() so re-encoded chunks mirror live capture blocks.
+  const CAPTURE_BLOCK_SAMPLES = 4096;
   // libopus-wasm CDN URL (ES module, inlines WASM — no second request needed)
   const OPUS_WASM_CDN = 'https://cdn.jsdelivr.net/npm/libopus-wasm@0.2.0/dist/index.js';
 
@@ -2221,7 +2231,7 @@ const AudioEngine = (() => {
 
   /**
    * Process accumulated PCM samples — chunk into exact OPUS_FRAME_SAMPLES (960)
-   * frames, encode each, and call onAudioChunkCallback.
+   * frames, encode each, and hand each packet to opusFrameSink.
    *
    * BUG 3 FIX: Use flushInProgress guard to prevent concurrent calls from the
    * ScriptProcessor onaudioprocess handler racing on the shared pcmAccumulator.
@@ -2243,19 +2253,39 @@ const AudioEngine = (() => {
         const opusPacket = await encodeFloat32Frame(frame);
         if (opusPacket && opusPacket.byteLength > 0) {
           Logger.audio(`→ Opus frame ${opusPacket.byteLength}b (${OPUS_FRAME_SAMPLES} samples → ${OPUS_FRAME_DURATION}ms)`);
-          if (onAudioChunkCallback) {
-            // Produce a clean, detached ArrayBuffer copy for the callback
+          if (opusFrameSink) {
+            // Produce a clean, detached ArrayBuffer copy for the sink
             const buf = opusPacket.buffer.slice(
               opusPacket.byteOffset,
               opusPacket.byteOffset + opusPacket.byteLength
             );
-            onAudioChunkCallback(buf);
+            opusFrameSink(buf);
           }
         }
       }
     } finally {
       flushInProgress = false;
     }
+  }
+
+  /**
+   * Append a 16kHz mono PCM block to the accumulator, then flush every
+   * complete 960-sample frame through the encoder to opusFrameSink.
+   * Shared by the live onaudioprocess handler and encodePcmChunk(), so
+   * re-encoded chunks keep frame-order continuity with live capture
+   * (sub-frame remainders stay buffered in pcmAccumulator).
+   */
+  function processBlock(block) {
+    // Append to accumulator
+    const merged = new Float32Array(pcmAccumulator.length + block.length);
+    merged.set(pcmAccumulator, 0);
+    merged.set(block, pcmAccumulator.length);
+    pcmAccumulator = merged;
+
+    // Flush complete 960-sample frames (async but fire-and-forget is fine here)
+    flushAccumulator().catch(err => {
+      Logger.error('Audio flush error', err.message);
+    });
   }
 
   /**
@@ -2268,7 +2298,7 @@ const AudioEngine = (() => {
       return true;
     }
 
-    onAudioChunkCallback = onChunk;
+    opusFrameSink = onChunk;
     pcmAccumulator = new Float32Array(0);
 
     try {
@@ -2300,23 +2330,15 @@ const AudioEngine = (() => {
 
       // ScriptProcessor: 4096-sample buffer gives us ~256ms chunks at 16kHz.
       // We accumulate and slice into exact 960-sample Opus frames.
-      const bufferSize = 4096;
-      scriptProcessorNode = captureContext.createScriptProcessor(bufferSize, 1, 1);
+      scriptProcessorNode = captureContext.createScriptProcessor(CAPTURE_BLOCK_SAMPLES, 1, 1);
       scriptProcessorNode.onaudioprocess = (e) => {
         if (!isCapturing) return;
 
-        const incoming = e.inputBuffer.getChannelData(0);  // Float32, already at 16kHz
-
-        // Append to accumulator
-        const merged = new Float32Array(pcmAccumulator.length + incoming.length);
-        merged.set(pcmAccumulator, 0);
-        merged.set(incoming, pcmAccumulator.length);
-        pcmAccumulator = merged;
-
-        // Flush complete 960-sample frames (async but fire-and-forget is fine here)
-        flushAccumulator().catch(err => {
-          Logger.error('Audio flush error', err.message);
-        });
+        // Copy — getChannelData returns a reused buffer, and rawBlockSink
+        // may hold onto the block beyond this callback.
+        const block = new Float32Array(e.inputBuffer.getChannelData(0));
+        processBlock(block);
+        if (rawBlockSink) rawBlockSink(block);
       };
 
       micSourceNode.connect(scriptProcessorNode);
@@ -2342,6 +2364,9 @@ const AudioEngine = (() => {
   function stopCapture() {
     isCapturing = false;
     pcmAccumulator = new Float32Array(0);
+    // A stopped mic must never call stale sinks
+    opusFrameSink = null;
+    rawBlockSink = null;
     stopLevelMeter();
 
     if (scriptProcessorNode) {
@@ -2540,6 +2565,18 @@ const AudioEngine = (() => {
   return {
     startCapture,
     stopCapture,
+    // Wake-word standby taps on the capture path. When never called, capture
+    // behaves exactly as before (opusFrameSink = the startCapture callback,
+    // rawBlockSink = null).
+    setOpusFrameSink: (fn) => { opusFrameSink = fn; },
+    setRawBlockSink: (fn) => { rawBlockSink = fn; },
+    encodePcmChunk: (pcm) => {
+      // Slice into capture-sized blocks so re-encoded audio goes through the
+      // exact same accumulator/frame/encode path as live capture.
+      for (let off = 0; off < pcm.length; off += CAPTURE_BLOCK_SAMPLES) {
+        processBlock(pcm.subarray(off, Math.min(off + CAPTURE_BLOCK_SAMPLES, pcm.length)));
+      }
+    },
     enqueueTTSChunk,
     clearTTSQueue,
     isCapturing: () => isCapturing,
