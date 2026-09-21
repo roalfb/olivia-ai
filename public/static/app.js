@@ -892,6 +892,51 @@ const VolumeSystem = (() => {
 })();
 
 // ================================================================
+// WAKE WORD STORAGE (per-assistant, own localStorage namespace)
+// ================================================================
+const WakeWordStorage = (() => {
+  const KEY_PREFIX = 'olivia_wakeword_v1_';
+  const DEFAULTS = { enabled: false, presets: ['hey_olivia'], custom: null, threshold: 0.25 };
+
+  function load(assistantId) {
+    try {
+      const raw = localStorage.getItem(KEY_PREFIX + assistantId);
+      if (!raw) return { ...DEFAULTS };
+      const parsed = JSON.parse(raw);
+      return { ...DEFAULTS, ...parsed };
+    } catch (e) {
+      Logger.warn('WakeWordStorage: corrupt record, returning defaults');
+      return { ...DEFAULTS };
+    }
+  }
+
+  function save(assistantId, cfg) {
+    localStorage.setItem(KEY_PREFIX + assistantId, JSON.stringify(cfg));
+  }
+
+  function remove(assistantId) {
+    localStorage.removeItem(KEY_PREFIX + assistantId);
+  }
+
+  return { load, save, remove };
+})();
+
+// Pre-tokenized wake word presets. Token lines follow the sherpa-onnx KWS
+// keywords format: space-separated phones (en, from the model lexicon) or
+// tone-marked pinyin (zh), then '@' + display form (no spaces; use '_').
+// Regenerate with the command documented in README → "Wake word engine build".
+const WAKE_PRESETS = [
+  { id: 'hey_olivia', label: 'Hey Olivia', lang: 'en',
+    tokens: 'HH EY1 OW0 L IH1 V IY0 AH0 @HEY_OLIVIA' },
+  { id: 'hi_esp',     label: 'Hi ESP',     lang: 'en',
+    tokens: 'HH AY1 IY1 EH1 S P IY1 @HI_ESP' },
+  { id: 'hey_jarvis', label: 'Hey Jarvis', lang: 'en',
+    tokens: 'HH EY1 JH AA1 R V AH0 S @HEY_JARVIS' },
+  { id: 'nihao_xiaozhi', label: '你好小智 (Ni hao XiaoZhi)', lang: 'zh',
+    tokens: 'n ǐ h ǎo x iǎo zh ì @你好小智' },
+];
+
+// ================================================================
 // MODULE: AssistantManager  (PHASE 1 — Multi-Assistant Foundation)
 // ================================================================
 // Olivia now models every paired "device" as an independent Assistant
@@ -4453,6 +4498,10 @@ const SessionManager = (() => {
     // OLIVIA FEATURE: remove this assistant's saved volume too, so
     // localStorage doesn't accumulate orphaned entries for deleted assistants.
     try { VolumeStorage.remove(id); } catch(e) { /* non-fatal */ }
+
+    // OLIVIA FEATURE: remove the wake word config with the assistant, so
+    // localStorage doesn't accumulate orphaned entries for deleted assistants.
+    try { WakeWordStorage.remove(id); } catch(e) { /* non-fatal */ }
 
     const removed = AssistantManager.removeAssistant(id);
     if (!removed) return false;
