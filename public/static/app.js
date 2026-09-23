@@ -3134,6 +3134,9 @@ const ProtocolClient = (() => {
         Logger.error('Server hello timeout (10s)');
         const msg = 'Server did not respond to hello within 10 seconds';
         if (callbacks.onError) callbacks.onError(msg);
+        // forceClose() nulls our ws reference but does NOT detach the
+        // handlers: the browser still fires close (1006, wasClean=false)
+        // → handleClose → onDisconnected, where shouldArm rejects it.
         forceClose();
       }
     }, 10000);
@@ -3870,7 +3873,11 @@ const ProtocolClient = (() => {
   }
 
   function isConnecting() {
-    return ws !== null && (ws.readyState === WebSocket.CONNECTING || !helloReceived);
+    // CONNECTING, or OPEN still awaiting the server hello. handleClose
+    // resets helloReceived and leaves the CLOSED socket behind, so the
+    // hello check must not apply past OPEN — a closed socket is not
+    // "connecting", or reconnect guards would block forever.
+    return ws !== null && (ws.readyState === WebSocket.CONNECTING || (ws.readyState === WebSocket.OPEN && !helloReceived));
   }
 
   function getSessionId() { return sessionId; }
