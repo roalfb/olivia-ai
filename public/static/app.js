@@ -1195,6 +1195,7 @@ const WakeWordSystem = (() => {
 
     state = 'LOADING';
     showToast(`Listening for: ${keywordLabels}`, 'info', 'Wake word');
+    if (!SherpaKwsEngine.isRunning()) showToast('Loading wake word engine…', 'info', 'Wake word');
     UIController.setConnectionState('wake', keywordLabels);
     UIController.addSystemMessage(
       `Session closed by server — listening for wake word: ${keywordLabels}`, 'fa-microphone-lines');
@@ -1301,7 +1302,11 @@ const WakeWordSystem = (() => {
     }
     chimeBufferPromise
       .then(buf => AudioEngine.playLocalBuffer(buf))
-      .catch(err => Logger.warn('Chime playback failed', err));
+      .catch(err => {
+        // Drop the cached promise so the next trigger retries the fetch/decode.
+        chimeBufferPromise = null;
+        Logger.warn('Chime playback failed', err);
+      });
   }
 
   function disarm(reason) {
@@ -1314,6 +1319,7 @@ const WakeWordSystem = (() => {
     AudioEngine.setRawBlockSink(null);
     AudioEngine.setOpusFrameSink(null);
     AudioEngine.stopCapture();
+    SherpaKwsEngine.stop();
     UIController.hideAudioMeter();
     UIController.updateMicButtonState(false);
     UIController.setConnectionState('disconnected');
@@ -1341,6 +1347,12 @@ const WakeWordSystem = (() => {
     const cfg = WakeWordStorage.load(armedAssistantId);
     if (!cfg.enabled || (cfg.presets.length === 0 && !cfg.custom)) {
       disarm('disabled-in-settings');
+      return;
+    }
+    // Standby only exists in auto mode — a save that flipped the mode to
+    // manual ends it instead of re-arming behind the user's back.
+    if (AssistantManager.getFlatField(armedAssistantId, 'listeningMode') !== 'auto') {
+      disarm('mode-not-auto');
       return;
     }
     keywordLabels = activeKeywordsLabel(cfg);
@@ -4871,6 +4883,12 @@ const SessionManager = (() => {
       return;
     }
 
+    // Manual connect takes the shared mic back from wake-word standby —
+    // except when the connect IS the wake resume itself (TRIGGERED).
+    if (WakeWordSystem.getState() !== 'TRIGGERED') {
+      WakeWordSystem.disarmFor(id, 'user-action');
+    }
+
     const wsUrl = AssistantManager.getFlatField(id, 'wsUrl');
     if (!wsUrl) {
       if (isActiveId(id)) showToast('Please configure the WebSocket URL in Settings', 'error');
@@ -5289,6 +5307,9 @@ const UIController = (() => {
   // resource, so voice input always targets the CURRENTLY ACTIVE
   // assistant's session — there is no concept of "background" voice input.
   function handleMicMouseDown(e) {
+    // A mic press during wake-word standby only disarms it — the session
+    // is closed anyway, so there is nothing to capture into.
+    if (WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action')) return;
     const session = SessionManager.getActiveSession();
     if (!session || !session.protocol.isConnected()) return;
     micClickTimeout = setTimeout(() => {
@@ -5314,6 +5335,9 @@ const UIController = (() => {
   }
 
   function handleMicClick(e) {
+    // A mic press during wake-word standby only disarms it (see
+    // handleMicMouseDown).
+    if (WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action')) return;
     const session = SessionManager.getActiveSession();
     if (!session || !session.protocol.isConnected()) {
       showToast('Connect to server first', 'warning');
@@ -5538,6 +5562,7 @@ const UIController = (() => {
   let wakeEngineReady = false;
   let wakeEngineError = null;
   let wakeLexicon = null;
+  let wakePhoneSet = null;
   let wakeTestActive = false;
 
   function renderWakePresets() {
@@ -5580,7 +5605,7 @@ const UIController = (() => {
     document.querySelectorAll('#wakeWordPresetBox input').forEach(cb => { cb.disabled = disableAll; });
 
     const engineUsable = wakeEngineReady && !wakeEngineError;
-    el('wakeWordTestBtn').disabled = !engineUsable;
+    el('wakeWordTestBtn').disabled = disableAll || !engineUsable;
     el('wakeWordCustomInput').disabled = disableAll || !engineUsable;
     el('wakeWordPhonesInput').disabled = disableAll || !engineUsable;
 
@@ -5612,8 +5637,27 @@ const UIController = (() => {
     applyWakeSectionAvailability();
   }
 
+  // Inventory of every phone in the lexicon (lazily derived, cached) —
+  // used to validate advanced phone-string overrides.
+  function getWakePhoneSet() {
+    if (!wakeLexicon) return null;
+    if (!wakePhoneSet) {
+      wakePhoneSet = new Set();
+      for (const phones of wakeLexicon.values()) {
+        for (const p of phones.split(/\s+/)) wakePhoneSet.add(p);
+      }
+    }
+    return wakePhoneSet;
+  }
+
   function customToTokens(text, phonesOverride) {
     if (phonesOverride) {
+      const phoneSet = getWakePhoneSet();
+      if (!phoneSet) {
+        return { ok: false, unavailable: true, missing: phonesOverride.split(/\s+/) };
+      }
+      const badPhones = phonesOverride.split(/\s+/).filter(p => !phoneSet.has(p));
+      if (badPhones.length) return { ok: false, badPhones };
       return { ok: true, tokens: `${phonesOverride} @${text.replace(/\s+/g, '_')}` };
     }
     const lex = wakeLexicon;
@@ -5639,13 +5683,22 @@ const UIController = (() => {
     let custom = null;
     let error = null;
     if (customText) {
-      const tokens = customToTokens(customText, phonesText);
-      if (!tokens.ok) {
-        error = tokens.unavailable
-          ? 'Wake word engine not ready — custom words cannot be validated yet'
-          : `Not in the pronunciation lexicon: ${tokens.missing.join(', ')} — use the advanced phone string instead`;
+      if (!wakeEngineReady || wakeEngineError) {
+        // The engine can't validate right now — trust the persisted
+        // custom word (already validated when it was saved) instead of
+        // failing the save on the disabled input's text.
+        custom = WakeWordStorage.load(getSettingsTargetId()).custom || null;
       } else {
-        custom = { display: customText.replace(/\s+/g, '_'), tokens: tokens.tokens };
+        const tokens = customToTokens(customText, phonesText);
+        if (!tokens.ok) {
+          error = tokens.unavailable
+            ? 'Wake word engine not ready — custom words cannot be validated yet'
+            : tokens.badPhones
+              ? `Unknown phones: ${tokens.badPhones.join(', ')} — use phones from the engine lexicon only`
+              : `Not in the pronunciation lexicon: ${tokens.missing.join(', ')} — use the advanced phone string instead`;
+        } else {
+          custom = { display: customText.replace(/\s+/g, '_'), tokens: tokens.tokens };
+        }
       }
     }
     return {
@@ -5679,6 +5732,15 @@ const UIController = (() => {
       // because the panel closes right after the save.
       showWakeCustomError(wake.error);
       showToast(wake.error, 'error', 'Wake word');
+      return;
+    }
+    // Enabling with zero keywords would pass the storage check but never
+    // arm (maybeArm skips it) — reject the wake save instead.
+    const cfg = wake.cfg;
+    if (cfg.enabled && cfg.presets.length === 0 && !cfg.custom) {
+      const message = 'Pick a preset or enter a custom wake word first';
+      showWakeCustomError(message);
+      showToast(message, 'error', 'Wake word');
       return;
     }
     showWakeCustomError(null);

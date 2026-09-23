@@ -825,7 +825,7 @@ Wiring it up in a future phase would take a single additional `protocol.on('cust
 
 ## Wake Word Resume
 
-When the Xiaozhi server closes an auto-mode session — its inactivity watchdog typically ends the session after roughly a minute of silence — Olivia can keep the microphone open locally and listen for a **wake word** instead of dropping you back to the connect button. Saying the wake word plays a chime, reconnects the session, and sends the speech captured during standby first — a ring buffer keeps up to 4 seconds of audio, flushed from 200 ms before the detection moment so the wake phrase itself is not echoed back — then live audio flows. You can start talking the moment the chime sounds and never lose your first words.
+When the Xiaozhi server closes an auto-mode session — after a few minutes of silence (server-side inactivity timeout) — Olivia can keep the microphone open locally and listen for a **wake word** instead of dropping you back to the connect button. Saying the wake word plays a chime, reconnects the session, and sends the speech captured during standby first — a ring buffer keeps up to 4 seconds of audio, flushed from 200 ms before the detection moment so the wake phrase itself is not echoed back — then live audio flows. You can start talking the moment the chime sounds and never lose your first words.
 
 This mirrors what a physical ESP32 does with its on-device WakeNet: the hardware listens locally so the cloud connection can be re-established by voice alone.
 
