@@ -7352,6 +7352,28 @@ window.XiaozhiDebug = {
     engine: SherpaKwsEngine,
     storage: WakeWordStorage,
     presets: WAKE_PRESETS,
+    // Offline self-test: decode each URL as audio and run the same
+    // detection path as live standby over it. detectOffline leaves the
+    // engine running when it finishes, so stop() runs in finally — a
+    // failed clip must never leave a live engine behind.
+    selfTest: async (urls) => {
+      const results = [];
+      const offline = new OfflineAudioContext(1, 16000, 16000);
+      try {
+        for (const url of urls) {
+          const buf = await (await fetch(url)).arrayBuffer();
+          const decoded = await offline.decodeAudioData(buf);
+          const samples = decoded.getChannelData(0);
+          const cfg = WakeWordStorage.load(AssistantManager.getActiveId());
+          const hits = await SherpaKwsEngine.detectOffline(
+            samples, WakeWordSystem.keywordsString(cfg), cfg.threshold);
+          results.push({ url, hits });
+        }
+      } finally {
+        SherpaKwsEngine.stop();
+      }
+      return results;
+    },
   },
   get protocol()     { return SessionManager.getActiveSession()?.protocol; },
   get provisioning() { return SessionManager.getActiveSession()?.provisioning; },

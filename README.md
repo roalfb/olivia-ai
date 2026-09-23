@@ -56,6 +56,7 @@ What started as a single virtual device has grown into a full **multi-assistant 
 - [Brand Identity](#brand-identity)
 - [Assistant Avatars](#assistant-avatars)
 - [Per-Assistant Speech Volume](#per-assistant-speech-volume)
+- [Wake Word Resume](#wake-word-resume)
 - [Backup & Restore](#backup--restore)
 - [Usage Guide](#usage-guide)
 - [Installation](#installation)
@@ -819,6 +820,132 @@ The Xiaozhi protocol's existing (and previously unused) `custom` message type al
 ```
 
 Wiring it up in a future phase would take a single additional `protocol.on('custom', ...)` listener — no changes to the WebSocket handshake or any new message type required.
+
+---
+
+## Wake Word Resume
+
+When the Xiaozhi server closes an auto-mode session — its inactivity watchdog typically ends the session after roughly a minute of silence — Olivia can keep the microphone open locally and listen for a **wake word** instead of dropping you back to the connect button. Saying the wake word plays a chime, reconnects the session, and sends the speech captured during standby first — a ring buffer keeps up to 4 seconds of audio, flushed from 200 ms before the detection moment so the wake phrase itself is not echoed back — then live audio flows. You can start talking the moment the chime sounds and never lose your first words.
+
+This mirrors what a physical ESP32 does with its on-device WakeNet: the hardware listens locally so the cloud connection can be re-established by voice alone.
+
+### Enabling It
+
+Open the assistant's settings (gear icon) and find the **Wake Word** section:
+
+1. Set **Wake word resume** to *On (auto listening only)*
+2. Tick at least one wake word (preset or custom)
+3. Adjust **Sensitivity** if needed (see below)
+
+Standby only ever arms when **all** of these hold:
+
+- The server itself closed the connection cleanly (its inactivity goodbye) — never on a manual disconnect, an authentication failure, or a network error
+- The session was in **auto** listening mode with the microphone capturing
+- The assistant was the active one on screen
+- The feature is enabled and at least one wake word is selected
+
+While standby is armed, the connection chip shows which phrases are being listened for and a system message is added to the chat. A chime plays on detection, the session reconnects automatically (with one retry), and buffered speech is sent before live audio. Any manual action — connect, disconnect, mic off — disarms standby. Changing the keywords mid-standby takes effect immediately, and turning the feature off disarms it.
+
+### The Four Presets
+
+| Preset | Say |
+|---|---|
+| Hey Olivia | "Hey Olivia" |
+| Hi ESP | "Hi ESP" |
+| Hey Jarvis | "Hey Jarvis" |
+| 你好小智 (Ni hao XiaoZhi) | "Nǐ hǎo xiǎozhì" |
+
+### Custom Wake Words
+
+Type any English word or short phrase into the custom field (e.g. `HEY KITTY`) and save — Olivia converts it to the engine's phone string using the model's built-in pronunciation lexicon and validates it before accepting it. If validation fails because a word is not in the lexicon, expand the **Advanced: phone string** field and supply the phones yourself.
+
+The phone string format is space-separated phonemes from the lexicon followed by `@` and the display form (no spaces — use `_`). For example, `HEY KITTY` becomes:
+
+```
+HH EY1 K IH1 T IY0 @HEY_KITTY
+```
+
+The same format (with tone-marked pinyin instead of phones) is used for Chinese; only the built-in 你好小智 preset uses it — custom Chinese keywords are not supported.
+
+### Sensitivity
+
+The **Sensitivity** slider (0.10–0.50, default 0.25) is the engine's keyword threshold. **Higher means stricter**: fewer false accepts, but more misses when your pronunciation or the mic input differs from training data. Lower it if Olivia rarely reacts; raise it if it wakes on background speech or TV audio.
+
+Use the **Test wake word** button to check recognition without ending your session: it starts a short live listening pass and reports every phrase it hears.
+
+### Privacy: Everything Stays in Your Browser
+
+The engine is a WebAssembly build of [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s keyword-spotting model, loaded lazily from the same server that serves the app itself. During standby it runs entirely in your browser; no audio leaves it until the session reconnects. Encoded audio only starts flowing to the Xiaozhi server again when the wake word fires and the session is re-established. Wake word settings are stored per assistant in `localStorage` (key `olivia_wakeword_v1_<assistantId>`) and never leave the browser.
+
+### Limitations
+
+- **Custom keywords are English-only.** The pronunciation lexicon used to validate custom words covers English; Chinese is available through the built-in 你好小智 preset only.
+- **Background-tab behavior varies by browser.** Some browsers throttle or suspend audio processing in inactive tabs, which can pause detection. Keep the Olivia tab visible for reliable wake word standby.
+
+### Wake word engine build (contributors)
+
+The `public/static/wake/` directory holds four prebuilt artifacts (`sherpa-onnx-kws.js`, `sherpa-onnx-wasm-kws-main.js`, `sherpa-onnx-wasm-kws-main.wasm`, `sherpa-onnx-wasm-kws-main.data`) — a WebAssembly build of sherpa-onnx's KWS demo with the model preloaded inside the `.data` archive. Keywords are runtime text, so adding wake words never requires a rebuild; rebuild only when updating the engine or model. To reproduce the artifacts from scratch:
+
+1. **Install emsdk 4.0.23** (pinned — other versions are untested):
+
+   ```bash
+   git clone https://github.com/emscripten-core/emsdk.git
+   cd emsdk && ./emsdk install 4.0.23 && ./emsdk activate 4.0.23 && source ./emsdk_env.sh
+   emcc --version   # must print 4.0.23
+   ```
+
+2. **Clone sherpa-onnx and download the model** (pin the commit you build; `--depth 1` of current master works):
+
+   ```bash
+   git clone --depth 1 https://github.com/k2-fsa/sherpa-onnx.git
+   wget https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+   tar xf sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+   ```
+
+3. **Populate the build's asset directory** with our model files. The build's CMakeLists fatals unless a file named for an older model revision exists — satisfy it with a 0-byte stub. It is only an existence guard and is never opened at runtime (it does get packed into `.data`, costing nothing):
+
+   ```bash
+   cd sherpa-onnx/wasm/kws/assets
+   M=/path/to/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20
+   cp $M/encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx .
+   cp $M/decoder-epoch-13-avg-2-chunk-8-left-64.onnx .
+   cp $M/joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx .
+   cp $M/tokens.txt .
+   cp $M/en.phone .
+   touch decoder-epoch-12-avg-2-chunk-16-left-64.onnx   # build-guard stub, 0 bytes
+   ```
+
+4. **Build** (needs `cmake` and `make`; the build downloads an onnxruntime static lib on first configure):
+
+   ```bash
+   cd ../../.. && ./build-wasm-simd-kws.sh
+   ls -lh build-wasm-simd-kws/install/bin/wasm/
+   ```
+
+5. **Copy the four artifacts** (`sherpa-onnx-kws.js`, `sherpa-onnx-wasm-kws-main.js`, `sherpa-onnx-wasm-kws-main.wasm`, `sherpa-onnx-wasm-kws-main.data`) to `public/static/wake/`. Do not copy the demo `app.js`/`index.html` from that directory.
+
+**Regenerating preset token lines.** The four preset lines embedded in `app.js` (`WAKE_PRESETS`) were produced with sherpa-onnx's own tokenizer and must be regenerated from the same model if the model ever changes. Install `sherpa-onnx-cli`, then run **one keyword per invocation** — in batch mode the tool skips lines whose words are missing from the lexicon but keeps their `@tags`, silently misaligning every following line:
+
+```bash
+echo 'Hey Olivia' > kw.txt
+sherpa-onnx-cli text2token \
+  --tokens $M/tokens.txt --tokens-type phone+ppinyin --lexicon $M/en.phone \
+  kw.txt kw-tokens.txt    # repeat with a fresh one-line file per keyword
+```
+
+The canonical current lines are:
+
+```
+HH EY1 OW0 L IH1 V IY0 AH0 @HEY_OLIVIA
+HH AY1 IY1 EH1 S P IY1 @HI_ESP
+HH EY1 JH AA1 R V AH0 S @HEY_JARVIS
+n ǐ h ǎo x iǎo zh ì @你好小智
+```
+
+Notes:
+
+- Words absent from the `en.phone` lexicon need hand-written phone lines. `ESP` is such a case: the canonical line spells the letters out (`E S P` → `IY1 EH1 S P IY1`, i.e. "ee-ess-pee"), which also matches how the acronym is spoken.
+- Tokens must all exist in `tokens.txt` — a line referencing an unknown phone or pinyin token silently never fires.
 
 ---
 
