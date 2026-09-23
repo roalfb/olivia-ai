@@ -764,6 +764,80 @@ body {
   accent-color: var(--primary);
 }
 
+/* OLIVIA FEATURE: wake word settings section — the preset checkbox list
+   (rendered dynamically from app.js) mirrors .checkbox-group, plus the
+   hint/error text styles and the section's disabled state. */
+#wakeWordPresetBox {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+#wakeWordPresetBox label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.wake-preset {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+
+.settings-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.settings-error {
+  display: block;
+  font-size: 11px;
+  color: var(--danger);
+  margin-top: 4px;
+}
+
+#wakeWordSection.disabled {
+  opacity: 0.5;
+}
+
+#wakeWordSection.disabled input,
+#wakeWordSection.disabled select,
+#wakeWordSection.disabled button {
+  pointer-events: none;
+}
+
+#wakeWordSection details {
+  margin-top: 8px;
+}
+
+#wakeWordSection summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+#wakeWordSection input[type="range"] {
+  width: 100%;
+  accent-color: var(--primary);
+}
+
+#wakeWordThresholdValue {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+#wakeWordTestBtn {
+  width: 100%;
+}
+
 .settings-actions {
   display: flex;
   flex-direction: column;

@@ -761,6 +761,48 @@ app.get('/', (c) => {
       </div>
 
       <div class="settings-section">
+        <h3>Wake Word</h3>
+        <div id="wakeWordSection">
+          <div class="form-group">
+            <label for="wakeWordEnabledInput">Wake word resume</label>
+            <select id="wakeWordEnabledInput">
+              <option value="off" selected>Off</option>
+              <option value="on">On (auto listening only)</option>
+            </select>
+            <div id="wakeWordAutoHint" class="settings-hint">
+              Only applies when Listening Mode is Auto.
+            </div>
+          </div>
+          <div class="form-group" id="wakeWordKeywordsGroup">
+            <label>Wake words</label>
+            <!-- Preset checkboxes render dynamically from app.js
+                 (WAKE_PRESETS) into this empty container. -->
+            <div id="wakeWordPresetBox"></div>
+            <input type="text" id="wakeWordCustomInput"
+                   placeholder="Custom words, e.g. HEY KITTY" />
+            <details>
+              <summary>Advanced: phone string</summary>
+              <input type="text" id="wakeWordPhonesInput"
+                     placeholder="K IH1 T IY0" />
+            </details>
+            <div id="wakeWordCustomError" class="settings-error" hidden></div>
+          </div>
+          <div class="form-group">
+            <label for="wakeWordThresholdInput">Sensitivity</label>
+            <input type="range" id="wakeWordThresholdInput"
+                   min="0.10" max="0.50" step="0.05" />
+            <span id="wakeWordThresholdValue">0.25</span>
+          </div>
+          <div class="form-group">
+            <button type="button" id="wakeWordTestBtn" class="btn-secondary btn-block">
+              Test wake word
+            </button>
+            <div id="wakeWordStatus" class="settings-hint"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-section">
         <h3>Audio</h3>
         <div class="form-group checkbox-group">
           <label>

@@ -1328,7 +1328,33 @@ const WakeWordSystem = (() => {
     return true;
   }
 
-  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel };
+  // Spec §9: settings saved mid-standby must reach the detector. Rebuilds
+  // the engine from the just-saved config without touching the mic — the
+  // ring buffer keeps filling via onRawBlock meanwhile (feedPcm no-ops
+  // while the engine is between instances, so at most a few hundred ms of
+  // audio skip detection). Optional assistantId limits the rearm to saves
+  // that targeted the armed assistant; a config that turned the feature
+  // (or all keywords) off disarms instead.
+  function rearmKeywords(assistantId) {
+    if (state !== 'ARMED' && state !== 'LOADING') return;
+    if (assistantId && armedAssistantId !== assistantId) return;
+    const cfg = WakeWordStorage.load(armedAssistantId);
+    if (!cfg.enabled || (cfg.presets.length === 0 && !cfg.custom)) {
+      disarm('disabled-in-settings');
+      return;
+    }
+    keywordLabels = activeKeywordsLabel(cfg);
+    UIController.setConnectionState('wake', keywordLabels);
+    SherpaKwsEngine.stop();
+    SherpaKwsEngine.start(keywordsString(cfg), cfg.threshold, onKeyword)
+      .catch(err => {
+        Logger.error('Wake word engine failed to rearm', err);
+        showToast(`Wake word engine failed: ${err.message}`, 'error', 'Wake word');
+        disarm('engine-failed');
+      });
+  }
+
+  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel, rearmKeywords };
 })();
 
 // ================================================================
@@ -5086,6 +5112,20 @@ const UIController = (() => {
     el('resetSettingsBtn').addEventListener('click', resetSettings);
     el('resetPairingBtn').addEventListener('click', resetPairing);
 
+    // OLIVIA WAKE WORD: render the preset checkboxes once from
+    // WAKE_PRESETS (runtime data — the JSX ships an empty container,
+    // matching the Audio section's label/checkbox markup) and wire the
+    // section controls. Per-assistant values load in
+    // loadSettingsIntoForm(); the engine itself lazy-loads on first
+    // panel open (see openSettingsFor).
+    renderWakePresets();
+    el('wakeWordThresholdInput').addEventListener('input', () => {
+      el('wakeWordThresholdValue').textContent =
+        parseFloat(el('wakeWordThresholdInput').value).toFixed(2);
+    });
+    el('wakeWordTestBtn').addEventListener('click', handleWakeWordTest);
+    el('listeningModeInput').addEventListener('change', applyWakeSectionAvailability);
+
     // PHASE 2: Assistant-level actions inside the Settings panel — all
     // target getSettingsTargetId(), NOT necessarily the active assistant.
     if (el('settingsReconnectBtn')) {
@@ -5473,6 +5513,11 @@ const UIController = (() => {
   function openSettingsFor(assistantId) {
     settingsTargetId = assistantId;
     loadSettingsIntoForm();
+    // OLIVIA WAKE WORD: kick off the sherpa-onnx KWS engine on first
+    // panel open — wakeWordStatus shows "engine loading…" until ready,
+    // and the Test button / custom-word validation stay disabled until
+    // then (a load failure is permanent until page reload).
+    ensureWakeEngineLoaded();
     el('settingsPanel').classList.add('open');
   }
 
@@ -5480,6 +5525,218 @@ const UIController = (() => {
     el('settingsPanel').classList.remove('open');
     // Revert to "always follow the active assistant" once the panel closes.
     settingsTargetId = null;
+  }
+
+  // ── WAKE WORD SETTINGS [OLIVIA FEATURE] ────────────────────────────
+  // Per-assistant config lives in WakeWordStorage; the panel reads and
+  // writes it via the helpers below. The sherpa-onnx engine lazy-loads
+  // on first panel open and its en.phone lexicon is cached once per
+  // session for custom-word validation. Known engine limitation: a
+  // load() failure is permanent until page reload, so the Test button
+  // and the lexicon-dependent custom-word path stay disabled after one.
+  let wakeEngineStarted = false;
+  let wakeEngineReady = false;
+  let wakeEngineError = null;
+  let wakeLexicon = null;
+  let wakeTestActive = false;
+
+  function renderWakePresets() {
+    const box = el('wakeWordPresetBox');
+    if (!box || box.childElementCount) return;
+    // Labels come from the static WAKE_PRESETS table (no user input).
+    box.innerHTML = WAKE_PRESETS.map(p =>
+      `<label><input type="checkbox" class="wake-preset" data-id="${p.id}" /> <span>${p.label}</span></label>`
+    ).join('');
+  }
+
+  function ensureWakeEngineLoaded() {
+    renderWakePresets();
+    if (wakeEngineStarted) { applyWakeSectionAvailability(); return; }
+    wakeEngineStarted = true;
+    if (!SherpaKwsEngine.isSupported()) { applyWakeSectionAvailability(); return; }
+    applyWakeSectionAvailability();
+    SherpaKwsEngine.load().then(() => {
+      wakeEngineReady = true;
+      try { wakeLexicon = SherpaKwsEngine.getLexicon(); } catch (e) { wakeLexicon = null; }
+    }).catch(err => {
+      wakeEngineError = err;
+      Logger.error('Wake word engine failed to load', err);
+    }).finally(applyWakeSectionAvailability);
+  }
+
+  // Availability + status text for the whole section: requires auto
+  // listening mode and a browser that runs the engine; the Test button
+  // additionally needs a loaded engine, the custom-word inputs need the
+  // lexicon (both off while loading or after a permanent load failure).
+  function applyWakeSectionAvailability() {
+    const section = el('wakeWordSection');
+    if (!section) return;
+    const modeAuto = el('listeningModeInput').value === 'auto';
+    const supported = SherpaKwsEngine.isSupported();
+    const disableAll = !modeAuto || !supported;
+
+    section.classList.toggle('disabled', disableAll);
+    ['wakeWordEnabledInput', 'wakeWordThresholdInput'].forEach(id => { el(id).disabled = disableAll; });
+    document.querySelectorAll('#wakeWordPresetBox input').forEach(cb => { cb.disabled = disableAll; });
+
+    const engineUsable = wakeEngineReady && !wakeEngineError;
+    el('wakeWordTestBtn').disabled = !engineUsable;
+    el('wakeWordCustomInput').disabled = disableAll || !engineUsable;
+    el('wakeWordPhonesInput').disabled = disableAll || !engineUsable;
+
+    const status = el('wakeWordStatus');
+    if (!supported) {
+      status.textContent = 'Wake word engine not supported in this browser';
+    } else if (wakeEngineError) {
+      status.textContent = `Wake word engine failed to load (${wakeEngineError.message}) — reload the page to retry`;
+    } else if (wakeEngineStarted && !wakeEngineReady) {
+      status.textContent = 'engine loading…';
+    } else {
+      status.textContent = '';
+    }
+  }
+
+  function loadWakeWordSettings(id) {
+    renderWakePresets();
+    const cfg = WakeWordStorage.load(id);
+    el('wakeWordEnabledInput').value = cfg.enabled ? 'on' : 'off';
+    document.querySelectorAll('#wakeWordPresetBox input[type="checkbox"]').forEach(cb => {
+      cb.checked = cfg.presets.includes(cb.dataset.id);
+    });
+    el('wakeWordCustomInput').value = cfg.custom ? cfg.custom.display.replace(/_/g, ' ') : '';
+    // The phone-string override is a per-save escape hatch, not persisted.
+    el('wakeWordPhonesInput').value = '';
+    el('wakeWordThresholdInput').value = String(cfg.threshold);
+    el('wakeWordThresholdValue').textContent = Number(cfg.threshold).toFixed(2);
+    el('wakeWordCustomError').hidden = true;
+    applyWakeSectionAvailability();
+  }
+
+  function customToTokens(text, phonesOverride) {
+    if (phonesOverride) {
+      return { ok: true, tokens: `${phonesOverride} @${text.replace(/\s+/g, '_')}` };
+    }
+    const lex = wakeLexicon;
+    if (!lex) return { ok: false, unavailable: true, missing: text.split(/\s+/) };
+    const missing = [];
+    const parts = [];
+    for (const w of text.split(/\s+/)) {
+      const phones = lex.get(w);
+      if (phones) parts.push(phones);
+      else missing.push(w);
+    }
+    if (missing.length) return { ok: false, missing };
+    return { ok: true, tokens: `${parts.join(' ')} @${text.replace(/\s+/g, '_')}` };
+  }
+
+  // Single source of truth for the panel's wake config — reused by the
+  // save path and the Test button. ok=false carries the inline error.
+  function readWakeConfigFromPanel() {
+    const presets = Array.from(document.querySelectorAll('#wakeWordPresetBox input:checked'))
+      .map(cb => cb.dataset.id);
+    const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
+    const phonesText = el('wakeWordPhonesInput').value.trim().toUpperCase();
+    let custom = null;
+    let error = null;
+    if (customText) {
+      const tokens = customToTokens(customText, phonesText);
+      if (!tokens.ok) {
+        error = tokens.unavailable
+          ? 'Wake word engine not ready — custom words cannot be validated yet'
+          : `Not in the pronunciation lexicon: ${tokens.missing.join(', ')} — use the advanced phone string instead`;
+      } else {
+        custom = { display: customText.replace(/\s+/g, '_'), tokens: tokens.tokens };
+      }
+    }
+    return {
+      ok: !error,
+      error,
+      cfg: {
+        enabled: el('wakeWordEnabledInput').value === 'on',
+        presets,
+        custom,
+        threshold: parseFloat(el('wakeWordThresholdInput').value),
+      },
+    };
+  }
+
+  function showWakeCustomError(message) {
+    const box = el('wakeWordCustomError');
+    if (!box) return;
+    if (message) {
+      box.textContent = message;
+      box.hidden = false;
+    } else {
+      box.hidden = true;
+    }
+  }
+
+  function saveWakeWordSettings(id) {
+    const wake = readWakeConfigFromPanel();
+    if (!wake.ok) {
+      // An invalid custom word aborts ONLY the wake section — the rest
+      // of the settings were already persisted by saveSettings(). Toast
+      // because the panel closes right after the save.
+      showWakeCustomError(wake.error);
+      showToast(wake.error, 'error', 'Wake word');
+      return;
+    }
+    showWakeCustomError(null);
+    WakeWordStorage.save(id, wake.cfg);
+    // Spec §9: mid-standby changes must reach the detector — no-op
+    // unless THIS assistant is the one currently armed.
+    WakeWordSystem.rearmKeywords(id);
+  }
+
+  // Live audition: borrows the mic for 15 s (refused while a session or
+  // standby holds it — the mic is a shared resource), feeds raw capture
+  // blocks into the engine with the panel's current keywords, and
+  // reports the first hit.
+  function handleWakeWordTest() {
+    if (wakeTestActive) return;
+    const wake = readWakeConfigFromPanel();
+    if (!wake.ok) {
+      showWakeCustomError(wake.error);
+      showToast(wake.error, 'error', 'Wake word');
+      return;
+    }
+    const cfg = wake.cfg;
+    if (!cfg.presets.length && !cfg.custom) {
+      showToast('Pick a preset or enter a custom wake word first', 'info', 'Wake word');
+      return;
+    }
+    if (AudioEngine.isCapturing() ||
+        ['ARMED', 'LOADING', 'TRIGGERED'].includes(WakeWordSystem.getState())) {
+      showToast('Microphone busy — stop the session or standby first', 'error', 'Wake word');
+      return;
+    }
+
+    const status = el('wakeWordStatus');
+    let timer = null;
+    const finish = (message) => {
+      wakeTestActive = false;
+      clearTimeout(timer);
+      SherpaKwsEngine.stop();
+      AudioEngine.setRawBlockSink(null);
+      AudioEngine.stopCapture();
+      if (message) status.textContent = message;
+    };
+
+    wakeTestActive = true;
+    status.textContent = 'Listening for 15 s — say the wake word…';
+    SherpaKwsEngine.start(WakeWordSystem.keywordsString(cfg), cfg.threshold, (word) => {
+      finish(`Heard: ${word}`);
+      showToast(`Wake word heard: ${word.replace(/_/g, ' ')}`, 'success', 'Wake word');
+    }).catch(err => {
+      finish(`Test failed: ${err.message}`);
+    });
+    // Encoded packets are discarded — the test never sends audio.
+    AudioEngine.setRawBlockSink((b) => SherpaKwsEngine.feedPcm(b));
+    AudioEngine.startCapture(() => {}).then(ok => {
+      if (!wakeTestActive) { AudioEngine.stopCapture(); return; }
+      if (!ok) finish('Microphone unavailable — test cancelled');
+    });
+    timer = setTimeout(() => finish('No wake word heard (timeout).'), 15000);
   }
 
   function loadSettingsIntoForm() {
@@ -5497,6 +5754,7 @@ const UIController = (() => {
     el('listeningModeInput').value    = s.listeningMode || 'auto';
     el('audioEnabled').checked        = s.audioEnabled !== false;
     el('ttsPlayback').checked         = s.ttsPlayback !== false;
+    loadWakeWordSettings(id);
     updatePairingStatusDisplay();
     updateSettingsConnectionStatusDisplay();
 
@@ -5658,6 +5916,7 @@ const UIController = (() => {
     AssistantManager.setFlatField(id, 'listeningMode',   el('listeningModeInput').value);
     AssistantManager.setFlatField(id, 'audioEnabled',    el('audioEnabled').checked);
     AssistantManager.setFlatField(id, 'ttsPlayback',     el('ttsPlayback').checked);
+    saveWakeWordSettings(id);
 
     // Update device ID / client ID only if user entered a value
     // Normalize deviceId to lowercase to match firmware format (required by server)
