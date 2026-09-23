@@ -1093,6 +1093,245 @@ const SherpaKwsEngine = (() => {
 })();
 
 // ================================================================
+// WAKE WORD SYSTEM — post-goodbye standby and voice session resume
+// Mirrors the ESP32's on-device wake word (WakeNet) role: after the
+// server closes an auto-mode session for inactivity, the mic stays
+// open locally, a wake phrase reconnects the session, and buffered
+// speech flows on without losing the user's words.
+// ================================================================
+const WakeWordSystem = (() => {
+  const RING_SECONDS = 4;
+  const RING_SAMPLES = 16000 * RING_SECONDS;   // 4 s @ 16 kHz = 256 KB
+  const FLUSH_MARGIN_SAMPLES = 3200;           // 200 ms before detection
+  const MAX_RECONNECT_ATTEMPTS = 2;
+
+  let state = 'INACTIVE';                      // INACTIVE|LOADING|ARMED|TRIGGERED
+  let armedAssistantId = null;
+  let ring = null;                             // Float32Array(RING_SAMPLES)
+  let ringWrite = 0;                           // next write index (mod RING_SAMPLES)
+  let totalSamples = 0;                        // samples seen since arm
+  let detectionAt = -1;                        // totalSamples at detection
+  let keywordLabels = '';                      // for UI text
+  let micTrackEnded = null;                    // 'ended' listener on the live mic track
+
+  function getState() { return state; }
+
+  function keywordsString(cfg) {
+    const lines = WAKE_PRESETS
+      .filter(p => cfg.presets.includes(p.id))
+      .map(p => p.tokens);
+    if (cfg.custom && cfg.custom.tokens) lines.push(cfg.custom.tokens);
+    return lines.join('\n');
+  }
+
+  function activeKeywordsLabel(cfg) {
+    const names = WAKE_PRESETS.filter(p => cfg.presets.includes(p.id)).map(p => p.label);
+    if (cfg.custom && cfg.custom.display) names.push(cfg.custom.display.replace(/_/g, ' '));
+    return names.join(' / ');
+  }
+
+  function ringPush(block) {
+    for (let i = 0; i < block.length && ring; i++) {
+      ring[ringWrite] = block[i];
+      ringWrite = (ringWrite + 1) % RING_SAMPLES;
+    }
+    totalSamples += block.length;
+  }
+
+  // Ordered PCM from absolute sample index `from` to `totalSamples`.
+  function ringSlice(from) {
+    const len = Math.max(0, totalSamples - from);
+    const outLen = Math.min(len, RING_SAMPLES);
+    const out = new Float32Array(outLen);
+    let start = totalSamples - outLen;
+    for (let i = 0; i < outLen; i++, start++) {
+      const src = ((start % RING_SAMPLES) + RING_SAMPLES) % RING_SAMPLES;
+      out[i] = ring[src];
+    }
+    return out;
+  }
+
+  function onRawBlock(block) {
+    ringPush(block);
+    SherpaKwsEngine.feedPcm(block);
+  }
+
+  function shouldArm({ enabled, active, autoMode, capturing, intentional, code, wasClean }) {
+    if (!enabled || !active || !autoMode || !capturing || intentional) return false;
+    if (code !== 1000 && code !== 1001) return false;
+    if (wasClean === false) return false;
+    return true;
+  }
+
+  function maybeArm(ctx) {
+    if (state !== 'INACTIVE') return false;
+    if (!shouldArm(ctx)) return false;
+    const cfg = WakeWordStorage.load(ctx.assistantId);
+    if (!cfg.enabled || (cfg.presets.length === 0 && !cfg.custom)) return false;
+
+    armedAssistantId = ctx.assistantId;
+    keywordLabels = activeKeywordsLabel(cfg);
+    ring = new Float32Array(RING_SAMPLES);
+    ringWrite = 0; totalSamples = 0; detectionAt = -1;
+
+    // Mic keeps running; encoded packets are dropped while there is no
+    // session, raw blocks feed the detector and the ring buffer.
+    AudioEngine.setOpusFrameSink(null);
+    AudioEngine.setRawBlockSink(onRawBlock);
+
+    // If the mic permission is revoked or the device disappears mid-standby,
+    // the track ends silently — disarm cleanly instead of a zombie standby.
+    micTrackEnded = () => disarm('mic-ended');
+    const micTrack = AudioEngine.getMicTrack();
+    if (micTrack) micTrack.addEventListener('ended', micTrackEnded);
+
+    // A suspended capture context (autoplay policy) would silently stop
+    // onaudioprocess — detection would never run.
+    AudioEngine.resumeCaptureContext().catch(err => {
+      Logger.warn('Capture context would not resume — disarming standby', err && err.message);
+      showToast('Microphone audio unavailable — wake word standby off', 'error', 'Wake word');
+      disarm('capture-context-suspended');
+    });
+
+    state = 'LOADING';
+    showToast(`Listening for: ${keywordLabels}`, 'info', 'Wake word');
+    UIController.setConnectionState('wake', keywordLabels);
+    UIController.addSystemMessage(
+      `Session closed by server — listening for wake word: ${keywordLabels}`, 'fa-microphone-lines');
+
+    SherpaKwsEngine.start(keywordsString(cfg), cfg.threshold, onKeyword)
+      .then(() => { if (state === 'LOADING') state = 'ARMED'; })
+      .catch(err => {
+        Logger.error('Wake word engine failed to load', err);
+        showToast(`Wake word engine failed: ${err.message}`, 'error', 'Wake word');
+        disarm('engine-failed');
+      });
+    return true;
+  }
+
+  function detachMicEndedListener() {
+    if (!micTrackEnded) return;
+    const micTrack = AudioEngine.getMicTrack();
+    if (micTrack) micTrack.removeEventListener('ended', micTrackEnded);
+    micTrackEnded = null;
+  }
+
+  function onKeyword(word) {
+    if (state !== 'ARMED') return;
+    state = 'TRIGGERED';
+    detectionAt = totalSamples;
+    Logger.info(`Wake word detected: ${word}`);
+    playChime();
+    UIController.addSystemMessage(`Wake word detected (${word}) — reconnecting…`, 'fa-bolt');
+    connectWithRetry(0);
+  }
+
+  // protocol.connect() resolves once the WebSocket is constructed, long
+  // before the server hello — poll until isConnected() (open + hello) so
+  // resumeStreaming only runs on a genuinely established session.
+  function waitForConnected(timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const session = SessionManager.getSession(armedAssistantId);
+      if (!session) { reject(new Error('no session')); return; }
+      const protocol = session.protocol;
+      const startedAt = Date.now();
+      (function check() {
+        if (state !== 'TRIGGERED') { reject(new Error('disarmed')); return; }
+        if (protocol.isConnected()) { resolve(); return; }
+        if (!protocol.isConnecting() || Date.now() - startedAt > timeoutMs) {
+          reject(new Error('server hello not received'));
+          return;
+        }
+        setTimeout(check, 100);
+      })();
+    });
+  }
+
+  function connectWithRetry(attempt) {
+    if (state !== 'TRIGGERED') return;
+    SessionManager.connectAssistant(armedAssistantId)
+      .then(() => waitForConnected(11000))
+      .then(() => resumeStreaming())
+      .catch(err => {
+        if (state !== 'TRIGGERED') return;
+        if (attempt + 1 < MAX_RECONNECT_ATTEMPTS) {
+          Logger.warn(`Wake reconnect failed (${err.message}), retry ${attempt + 1}`);
+          setTimeout(() => { if (state === 'TRIGGERED') connectWithRetry(attempt + 1); }, 2000);
+        } else {
+          showToast('Could not reconnect after wake word — standby off', 'error', 'Wake word');
+          disarm('reconnect-failed');
+        }
+      });
+  }
+
+  function resumeStreaming() {
+    if (state !== 'TRIGGERED') return;
+    const session = SessionManager.getSession(armedAssistantId);
+    if (!session || !session.protocol.isConnected()) { disarm('no-session'); return; }
+    const protocol = session.protocol;
+    detachMicEndedListener();
+    // Before sendListenStart: the LISTENING device-state change it fires
+    // must win over the 'connected' repaint below (same order as a
+    // normal auto-mode session).
+    UIController.setConnectionState('connected');
+    protocol.sendListenStart('auto');
+    // Buffered speech first (from 200 ms before the detection — the wake
+    // word itself excluded, trailing coarticulation kept), then live.
+    // setOpusFrameSink below runs synchronously before any asynchronously
+    // encoded packet is delivered to the sink, so buffered frames are not
+    // dropped.
+    const pcm = ringSlice(Math.max(0, detectionAt - FLUSH_MARGIN_SAMPLES));
+    AudioEngine.encodePcmChunk(pcm);
+    AudioEngine.setOpusFrameSink((packet) => protocol.sendAudio(packet));
+    AudioEngine.setRawBlockSink(null);
+    ring = null;
+    state = 'INACTIVE';
+    armedAssistantId = null;
+    showToast('Session resumed — listening', 'success', 'Wake word');
+  }
+
+  let chimeBufferPromise = null;
+  function playChime() {
+    // Decode once, cache; play through the shared TTS gain node so the
+    // assistant's volume setting applies.
+    if (!chimeBufferPromise) {
+      chimeBufferPromise = fetch('/static/wake-chime.ogg')
+        .then(r => r.arrayBuffer())
+        .then(b => AudioEngine.decodeToArrayBuffer(b));
+    }
+    chimeBufferPromise
+      .then(buf => AudioEngine.playLocalBuffer(buf))
+      .catch(err => Logger.warn('Chime playback failed', err));
+  }
+
+  function disarm(reason) {
+    if (state === 'INACTIVE' && !ring) return;
+    Logger.info(`Wake word standby disarmed (${reason})`);
+    state = 'INACTIVE';
+    armedAssistantId = null;
+    ring = null;
+    detachMicEndedListener();
+    AudioEngine.setRawBlockSink(null);
+    AudioEngine.setOpusFrameSink(null);
+    AudioEngine.stopCapture();
+    UIController.hideAudioMeter();
+    UIController.updateMicButtonState(false);
+    UIController.setConnectionState('disconnected');
+  }
+
+  // Disarm only if standby is armed for this assistant — safe to call on
+  // any manual action targeting any assistant (the mic is only ever held
+  // by the armed one).
+  function disarmFor(assistantId, reason) {
+    if (state === 'INACTIVE' || armedAssistantId !== assistantId) return false;
+    disarm(reason);
+    return true;
+  }
+
+  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel };
+})();
+
+// ================================================================
 // MODULE: AssistantManager  (PHASE 1 — Multi-Assistant Foundation)
 // ================================================================
 // Olivia now models every paired "device" as an independent Assistant
@@ -2436,6 +2675,16 @@ const AudioEngine = (() => {
   }
 
   /**
+   * Decode an encoded audio container (OGG/WAV) to an AudioBuffer via the
+   * TTS playback context — shared by the TTS Web Audio fallback and local
+   * sound effects (wake chime).
+   */
+  async function decodeAudioContainer(arrayBuffer) {
+    const ctx = await ensureAudioContext();
+    return ctx.decodeAudioData(arrayBuffer);
+  }
+
+  /**
    * Play raw Opus binary data received from server TTS.
    * Uses libopus-wasm decoder to convert Opus → Float32 PCM → Web Audio.
    * Server sends 24kHz mono Opus frames.
@@ -2501,7 +2750,7 @@ const AudioEngine = (() => {
       if (!pcmFloat) {
         try {
           const buf = chunk instanceof ArrayBuffer ? chunk : chunk.buffer;
-          const audioBuffer = await audioContext.decodeAudioData(buf.slice(0));
+          const audioBuffer = await decodeAudioContainer(buf.slice(0));
           // Schedule this frame back-to-back with the previous one
           const source = audioContext.createBufferSource();
           source.buffer = audioBuffer;
@@ -2576,6 +2825,26 @@ const AudioEngine = (() => {
       for (let off = 0; off < pcm.length; off += CAPTURE_BLOCK_SAMPLES) {
         processBlock(pcm.subarray(off, Math.min(off + CAPTURE_BLOCK_SAMPLES, pcm.length)));
       }
+    },
+    // Wake-word standby / local sound helpers.
+    // decodeToArrayBuffer: encoded container (OGG/WAV) → AudioBuffer via
+    // the TTS decode path. playLocalBuffer: schedule a decoded buffer
+    // through the shared TTS gain node so the assistant's volume setting
+    // applies to local sounds. getMicTrack: the live capture track (null
+    // when not capturing). resumeCaptureContext: undo autoplay suspension
+    // so onaudioprocess keeps firing during standby.
+    decodeToArrayBuffer: decodeAudioContainer,
+    playLocalBuffer: (audioBuffer) => {
+      if (!audioContext) return;
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ensureGainNode() || audioContext.destination);
+      source.start();
+    },
+    getMicTrack: () => (micStream && micStream.getTracks()[0]) || null,
+    resumeCaptureContext: () => {
+      if (!captureContext || captureContext.state !== 'suspended') return Promise.resolve();
+      return captureContext.resume();
     },
     enqueueTTSChunk,
     clearTTSQueue,
@@ -3369,7 +3638,7 @@ const ProtocolClient = (() => {
       return;
     }
 
-    if (callbacks.onDisconnected) callbacks.onDisconnected(event.code, event.reason);
+    if (callbacks.onDisconnected) callbacks.onDisconnected(event.code, event.reason, event.wasClean, isIntentionalClose);
 
     // Auto-reconnect logic (disabled by default)
     if (!isIntentionalClose && autoReconnect && reconnectAttempts < maxReconnectAttempts) {
@@ -4378,15 +4647,30 @@ const SessionManager = (() => {
       }
     });
 
-    protocol.on('disconnected', (code, reason) => {
+    protocol.on('disconnected', (code, reason, wasClean, intentional) => {
       Logger.ws(`[${assistantId.slice(0, 8)}] Disconnected: ${code} ${reason}`);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
-      // Same local state as a user-initiated disconnect: mic, encoder,
-      // meter, mic button and TTS all stop. Previously the mic kept
-      // capturing and encoding Opus into a dead socket ("talking into
-      // the void"). clearTTSQueue() is now active-gated too, so a
-      // background session closing can no longer cut off the active
-      // assistant's playback.
+      // Server-initiated goodbye on a live auto-mode session with the mic
+      // open: keep the mic and enter wake-word standby instead of tearing
+      // down. Every other close (manual, auth, watchdog/network, wrong
+      // mode, mic off) falls through to the normal disconnected path,
+      // which stops mic, encoder, meter and TTS like a user disconnect.
+      const armed = WakeWordSystem.maybeArm({
+        assistantId,
+        code, wasClean, intentional,
+        autoMode: AssistantManager.getFlatField(assistantId, 'listeningMode') === 'auto',
+        capturing: isActiveId(assistantId) && AudioEngine.isCapturing(),
+        active: isActiveId(assistantId),
+        enabled: WakeWordStorage.load(assistantId).enabled,
+      });
+      if (armed) {
+        // maybeArm owns the chip ('wake'), system message and toast; the
+        // session id is gone and no reply can be pending anymore.
+        AudioEngine.clearTTSQueue();
+        UIController.updateSessionId('');
+        UIController.hideTypingIndicator();
+        return;
+      }
       teardownSessionAudio(session);
       if (isActiveId(assistantId)) {
         UIController.setConnectionState('disconnected');
@@ -4508,6 +4792,12 @@ const SessionManager = (() => {
    * touching any other session's connection.
    */
   function switchTo(assistantId) {
+    // Wake-word standby belongs to the currently-active assistant, and the
+    // mic is a single shared resource — disarm before a real switch lands.
+    // (Re-selecting the already-active assistant is a no-op switch.)
+    if (assistantId !== AssistantManager.getActiveId()) {
+      WakeWordSystem.disarm('assistant-switch');
+    }
     const switched = AssistantManager.setActive(assistantId);
     if (!switched) return false;
 
@@ -4641,6 +4931,9 @@ const SessionManager = (() => {
   /** User clicks Disconnect for a specific assistant (defaults to active). */
   function disconnectAssistant(assistantId) {
     const id = assistantId || AssistantManager.getActiveId();
+    // Manual action: a wake-word standby armed for this assistant ends
+    // here (releases the mic before the intentional close fires).
+    WakeWordSystem.disarmFor(id, 'user-action');
     const session = sessions.get(id);
     if (!session) return;
 
@@ -4956,6 +5249,7 @@ const UIController = (() => {
       Logger.audio('PTT (push-to-talk) start');
       // BUG #4 FIX: Close mobile sidebar when voice input starts
       closeMobileSidebar();
+      WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action');
       session.chat.startVoiceInput('manual');
       updateMicButtonState(true);
     }, 300);
@@ -4984,6 +5278,7 @@ const UIController = (() => {
         micToggled = true;
         // BUG #4 FIX: Close mobile sidebar when voice input starts
         closeMobileSidebar();
+        WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action');
         session.chat.startVoiceInput('auto');
         updateMicButtonState(true);
         showToast('Listening... (click again to stop)', 'info');
@@ -5410,6 +5705,7 @@ const UIController = (() => {
 
     // Remove all state classes
     stateChip.className = 'device-state-chip';
+    stateChip.title = '';
     deviceAvatar.className = 'device-avatar';
 
     switch (state) {
@@ -5463,6 +5759,24 @@ const UIController = (() => {
         stateChipIcon.className = 'fas fa-volume-high';
         chatSubtitle.textContent = 'Powered by Olivia \u2014 Speaking';
         deviceAvatar.classList.add('speaking');
+        break;
+
+      case 'wake':
+        // Wake-word standby: session closed, mic stays open locally
+        // waiting for the wake phrase. Listening accent, manual
+        // disconnect stays available (it disarms standby).
+        statusDot.className = 'status-dot listening';
+        statusText.textContent = 'Standby';
+        stateChip.classList.add('listening');
+        stateChipText.textContent = 'WAKE';
+        stateChip.title = message;
+        stateChipIcon.className = 'fas fa-microphone-lines';
+        chatSubtitle.textContent = 'Powered by Olivia \u2014 Wake word standby';
+        deviceAvatar.classList.add('listening');
+        connectBtn.style.display = 'none';
+        disconnectBtn.style.display = 'flex';
+        sessionInfo.style.display = 'none';
+        inputHint.textContent = 'Say the wake word to resume';
         break;
 
       case 'disconnected':
