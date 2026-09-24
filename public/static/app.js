@@ -922,33 +922,67 @@ const WakeWordStorage = (() => {
 })();
 
 // Pre-tokenized wake word presets. Token lines follow the sherpa-onnx KWS
-// keywords format: space-separated phones (en, from the model lexicon) or
-// tone-marked pinyin (zh), then '@' + display form (no spaces; use '_').
-// Regenerate with the command documented in README → "Wake word engine build".
+// keywords format for the GigaSpeech English model: sentencepiece BPE
+// pieces, then '@' + display form (no spaces; use '_'). Regenerate with
+// the command documented in README → "Wake word engine build".
 const WAKE_PRESETS = [
-  { id: 'hey_olivia', label: 'Hey Olivia', lang: 'en',
-    tokens: 'HH EY1 OW0 L IH1 V IY0 AH0 @HEY_OLIVIA' },
-  { id: 'hi_esp',     label: 'Hi ESP',     lang: 'en',
-    tokens: 'HH AY1 IY1 EH1 S P IY1 @HI_ESP' },
-  { id: 'hey_jarvis', label: 'Hey Jarvis', lang: 'en',
-    tokens: 'HH EY1 JH AA1 R V AH0 S @HEY_JARVIS' },
-  { id: 'nihao_xiaozhi', label: '你好小智 (Ni hao XiaoZhi)', lang: 'zh',
-    tokens: 'n ǐ h ǎo x iǎo zh ì @你好小智' },
+  { id: 'hey_olivia', label: 'Hey Olivia',
+    tokens: '▁HE Y ▁O LI VI A @HEY_OLIVIA' },
+  { id: 'hi_esp',     label: 'Hi ESP',
+    tokens: '▁HI ▁E S P @HI_ESP' },
+  { id: 'hey_jarvis', label: 'Hey Jarvis',
+    tokens: '▁HE Y ▁JA R VI S @HEY_JARVIS' },
 ];
+
+// Sentencepiece BPE vocabulary of the GigaSpeech model (500 pieces, special
+// tokens removed), longest first so greedy longest-match segmentation equals
+// the reference tokenizer on real words. Used to turn custom wake words into
+// keyword token lines without needing the engine or a lexicon file.
+const WAKE_BPE_PIECES = (  '▁UNDERSTAND ▁EVERYTHING ▁SOMETHING ▁DIFFERENT ▁IMPORTANT ▁ACTUALLY ▁QUESTION ▁INTEREST '
+  + '▁THOUSAND ▁ANYTHING ▁TOGETHER ▁BECAUSE ▁THROUGH ▁ANOTHER ▁COMMUNI ▁AMERICA ▁HUNDRED '
+  + '▁WITHOUT ▁BELIEVE ▁BETWEEN ▁PROBLEM ▁NOTHING ▁PEOPLE ▁REALLY ▁LITTLE ▁THINGS ▁THOUGH '
+  + '▁SHOULD ▁BEFORE ▁HAPPEN ▁PERSON ▁AROUND ▁CHANGE ▁ALWAYS ▁SCHOOL ▁FRIEND ▁BETTER ▁TWENTY '
+  + '▁NUMBER ▁COURSE ▁SYSTEM ▁HAVING ▁SECOND ▁PUBLIC ▁HEALTH ▁THERE ▁ABOUT ▁THINK ▁WOULD ▁WHICH '
+  + '▁THEIR ▁OTHER ▁GOING ▁RIGHT ▁COULD ▁THESE ▁WHERE ▁THOSE ▁FIRST ▁AGAIN ▁AFTER ▁EVERY ▁GREAT '
+  + '▁THING ▁START ▁THREE ▁WORLD ▁NEVER ▁THANK ▁STATE ▁STILL ▁PLACE ▁MIGHT ▁COUNT ▁POINT ▁UNDER '
+  + '▁FOUND ▁LEARN ▁HOUSE ▁WHILE ▁POWER ▁MAYBE ▁BUILD ▁MONEY ▁GONNA ▁WHITE ▁SPEAK ▁BLACK ▁THAT '
+  + '▁THIS ▁WITH ▁HAVE ▁THEY ATION ▁WHAT ▁LIKE ▁FROM ▁YOUR ▁KNOW ▁JUST ▁WHEN ▁SOME ▁WERE ▁MORE '
+  + '▁TIME ▁WILL ▁SAID ▁VERY ▁THEM ▁BEEN ▁WANT ▁LOOK ▁WORK ▁INTO ▁THEN ▁HERE ▁OVER ▁WELL ▁COMP '
+  + '▁EVEN ▁MAKE ▁BACK ▁YEAR ▁ALSO CTION ▁GOOD ▁TAKE ▁COME ▁MUCH ▁THAN ▁PART ▁MEAN ▁DOWN ▁NEED '
+  + '▁TALK ▁CALL ▁KIND ▁ONLY ▁DOES ▁MOST ▁LIFE ▁MANY ▁FEEL ITION ▁GIVE ▁LONG ▁SHOW ▁LOVE ▁HELP '
+  + '▁MADE ▁HAND ▁TELL ▁CAME ▁FIND ▁HIGH ▁LAST ▁SAME ▁FOUR ▁HOME ATIVE ▁TURN ▁YEAH ▁NEXT ▁WORD '
+  + '▁BOOK ▁PLAY ▁AWAY ▁PLAN ▁KEEP ▁IDEA ▁HARD ▁WEEK ▁OKAY PRESS ▁NINE ▁LEFT ▁THE ▁AND ▁YOU '
+  + '▁FOR ▁WAS ▁BUT ▁NOT ▁ARE ▁CAN ▁ALL ▁CON ▁HIS ▁ONE ▁SHE ▁HAD MENT ▁WHO ▁OUT ▁HER ▁PRO IGHT '
+  + '▁SEE ▁OUR ▁HOW ▁GET ▁DON ▁NOW ▁SAY TION THER ▁HAS ABLE ▁DID ▁HIM ▁DIS ▁PRE ENCE ALLY ▁WAY '
+  + '▁ANY ▁COM ▁TWO ▁TRA ▁CHA ANCE ▁NEW ICAL ▁MAR ▁MAN SIDE ▁APP ▁PER ▁STA ▁LET ATED ▁SHA ▁DAY '
+  + '▁CHI ▁GRA ▁MIN ▁GOT ▁COL ▁LOT IOUS NESS ▁WHY PORT FORM ▁PUT ▁OWN WARD IBLE ▁TEA ▁IMP ▁OLD '
+  + 'SHIP ▁YES LAND LINE ▁SIX ▁TO ING ▁OF ▁IN ▁IT ▁IS ▁RE ▁WE ▁SO ▁BE ▁HE ▁ON ▁ME ▁DO ▁DE ENT '
+  + '▁AS TER ▁ST ▁OR ▁AT ▁MO ▁AN ▁MA ▁SU ▁MY ▁SE VER ▁CA ▁IF ▁NO ▁PA ION ▁UP ▁US ▁GO ▁EX ▁PO '
+  + '▁FA ATE ▁BY ▁LA ▁CO ▁LE ▁LI ▁BO ▁HO URE ▁MI IES ▁UN ▁FI IVE ITY ▁HA ▁RO IST AGE ▁RA ERS '
+  + '▁LO ▁SP ▁DA ▁EN EST ACT ▁BA ▁WA ▁SA ▁VI ▁DR ▁DI ▁FE TED ▁NA ▁TH ▁JO ▁QU MAN PER ▁HU ▁MU '
+  + 'FUL ARD ANT END ▁NE DER ONE ▁BI UGH ISH TIC ▁GA ▁GU LES ▁RU ROW AIN ▁BU ▁TA IAN ▁RI DAY '
+  + 'OUS IZE BER ▁VA ▁PI ▁HI ▁MR ▁PH ▁DU ▁JA ▁OH ▁JE ▁JU ▁A ▁I ED RE ▁S AL ER ▁C OR AR IN LE LY '
+  + '▁E ▁F VE RI CH LL ▁T EN IT CE ▁B ▁W ▁P UR ON IC TE ES RA TH RO IL AN SE LI ▁G NE NG LA LO '
+  + 'CK AD IR EL ▁O RY UN ME ND CI AT PE AS GE ▁K VI DE OM CO ET UL IG IS US TY RU LU HO OL MA '
+  + 'KE ID TI IM FF TA MO OW HE SH QU CA UM DI IF PP PO HA IA VO PH IV S T N E D \' Y M ▁ O C R '
+  + 'A P U G L B I F K W V H - Z X J Q ').split(' ');
+
+
 
 // ================================================================
 // SHERPA-ONNX KWS ENGINE — WakeWordEngine implementation
 // Loads the emscripten module lazily from static/wake/ and feeds it
 // 16 kHz mono PCM from the capture pipeline. Keywords are runtime
-// text (phones/pinyin + '@' display), so no rebuild is needed to
-// change them. Model files are preloaded inside the .data archive.
+// text (sentencepiece BPE pieces + '@' display), so no rebuild is
+// needed to change them. Model files are preloaded inside the .data
+// archive (GigaSpeech English model, Apache-2.0).
 // ================================================================
 const SherpaKwsEngine = (() => {
   const ASSET_BASE = '/static/wake/';  // same-origin; matches how app.js itself is served
   const MODEL = {
-    encoder: './encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx',
-    decoder: './decoder-epoch-13-avg-2-chunk-8-left-64.onnx',
-    joiner: './joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx',
+    encoder: './encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+    decoder: './decoder-epoch-12-avg-2-chunk-16-left-64.onnx',
+    joiner: './joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
     tokens: './tokens.txt',
   };
 
@@ -959,12 +993,10 @@ const SherpaKwsEngine = (() => {
   ]);
 
   let module = null;        // emscripten Module (after init)
-  let fs = null;            // emscripten FS — a script global in this build (Module.FS is not exported)
   let kws = null;           // Kws instance
   let stream = null;
   let keywordCb = null;
   let loadPromise = null;
-  let lexicon = null;
 
   function isSupported() {
     return typeof WebAssembly === 'object' && WebAssembly.validate(SIMD_PROBE);
@@ -996,28 +1028,12 @@ const SherpaKwsEngine = (() => {
       })
     ).then(() => {
       module = window.Module;
-      fs = window.FS;
       // window.Module must stay on window: this non-modularized emscripten
       // build keeps referencing the global Module from its JS syscalls
       // (e.g. file open during model load), even after runtime init.
       Logger.info('Wake word engine ready (sherpa-onnx KWS wasm)');
     });
     return loadPromise;
-  }
-
-  function getLexicon() {
-    if (lexicon) return lexicon;
-    if (!module) throw new Error('Engine not loaded');
-    lexicon = new Map();
-    const text = fs.readFile('en.phone', { encoding: 'utf8' });
-    for (const line of text.split('\n')) {
-      const t = line.trim();
-      if (!t || t.startsWith('//') || t.startsWith('#')) continue;
-      const parts = t.split(/\s+/);
-      if (parts.length < 2) continue;
-      lexicon.set(parts[0], parts.slice(1).filter(p => !p.startsWith('//')).join(' '));
-    }
-    return lexicon;
   }
 
   function start(keywords, threshold, onKeyword) {
@@ -1030,7 +1046,7 @@ const SherpaKwsEngine = (() => {
             encoder: MODEL.encoder, decoder: MODEL.decoder, joiner: MODEL.joiner,
           },
           tokens: MODEL.tokens, provider: 'cpu', numThreads: 1, debug: 0,
-          modelingUnit: 'cjkchar', bpeVocab: '',
+          modelingUnit: 'bpe', bpeVocab: './bpe.vocab',
         },
         maxActivePaths: 4,
         numTrailingBlanks: 1,
@@ -1089,7 +1105,7 @@ const SherpaKwsEngine = (() => {
     });
   }
 
-  return { isSupported, load, start, stop, isRunning, feedPcm, getLexicon, detectOffline };
+  return { isSupported, load, start, stop, isRunning, feedPcm, detectOffline };
 })();
 
 // ================================================================
@@ -5566,15 +5582,13 @@ const UIController = (() => {
   // ── WAKE WORD SETTINGS [OLIVIA FEATURE] ────────────────────────────
   // Per-assistant config lives in WakeWordStorage; the panel reads and
   // writes it via the helpers below. The sherpa-onnx engine lazy-loads
-  // on first panel open and its en.phone lexicon is cached once per
-  // session for custom-word validation. Known engine limitation: a
-  // load() failure is permanent until page reload, so the Test button
-  // and the lexicon-dependent custom-word path stay disabled after one.
+  // on first panel open. Known engine limitation: a load() failure is
+  // permanent until page reload, so the Test button stays disabled after
+  // one. Custom-word encoding is pure JS (WAKE_BPE_PIECES) and does not
+  // depend on the engine.
   let wakeEngineStarted = false;
   let wakeEngineReady = false;
   let wakeEngineError = null;
-  let wakeLexicon = null;
-  let wakePhoneSet = null;
   let wakeTestActive = false;
 
   function renderWakePresets() {
@@ -5594,7 +5608,6 @@ const UIController = (() => {
     applyWakeSectionAvailability();
     SherpaKwsEngine.load().then(() => {
       wakeEngineReady = true;
-      try { wakeLexicon = SherpaKwsEngine.getLexicon(); } catch (e) { wakeLexicon = null; }
     }).catch(err => {
       wakeEngineError = err;
       Logger.error('Wake word engine failed to load', err);
@@ -5603,8 +5616,7 @@ const UIController = (() => {
 
   // Availability + status text for the whole section: requires auto
   // listening mode and a browser that runs the engine; the Test button
-  // additionally needs a loaded engine, the custom-word inputs need the
-  // lexicon (both off while loading or after a permanent load failure).
+  // additionally needs a loaded engine (custom-word encoding does not).
   function applyWakeSectionAvailability() {
     const section = el('wakeWordSection');
     if (!section) return;
@@ -5618,8 +5630,8 @@ const UIController = (() => {
 
     const engineUsable = wakeEngineReady && !wakeEngineError;
     el('wakeWordTestBtn').disabled = disableAll || !engineUsable;
-    el('wakeWordCustomInput').disabled = disableAll || !engineUsable;
-    el('wakeWordPhonesInput').disabled = disableAll || !engineUsable;
+    el('wakeWordCustomInput').disabled = disableAll;
+    el('wakeWordPhonesInput').disabled = disableAll;
 
     const status = el('wakeWordStatus');
     if (!supported) {
@@ -5641,7 +5653,7 @@ const UIController = (() => {
       cb.checked = cfg.presets.includes(cb.dataset.id);
     });
     el('wakeWordCustomInput').value = cfg.custom ? cfg.custom.display.replace(/_/g, ' ') : '';
-    // The phone-string override is a per-save escape hatch, not persisted.
+    // The BPE-pieces override is a per-save escape hatch, not persisted.
     el('wakeWordPhonesInput').value = '';
     el('wakeWordThresholdInput').value = String(cfg.threshold);
     el('wakeWordThresholdValue').textContent = Number(cfg.threshold).toFixed(2);
@@ -5649,40 +5661,45 @@ const UIController = (() => {
     applyWakeSectionAvailability();
   }
 
-  // Inventory of every phone in the lexicon (lazily derived, cached) —
-  // used to validate advanced phone-string overrides.
-  function getWakePhoneSet() {
-    if (!wakeLexicon) return null;
-    if (!wakePhoneSet) {
-      wakePhoneSet = new Set();
-      for (const phones of wakeLexicon.values()) {
-        for (const p of phones.split(/\s+/)) wakePhoneSet.add(p);
-      }
-    }
-    return wakePhoneSet;
+  let wakeBpePieceSet = null;
+  function getBpePieceSet() {
+    if (!wakeBpePieceSet) wakeBpePieceSet = new Set(WAKE_BPE_PIECES);
+    return wakeBpePieceSet;
   }
 
-  function customToTokens(text, phonesOverride) {
-    if (phonesOverride) {
-      const phoneSet = getWakePhoneSet();
-      if (!phoneSet) {
-        return { ok: false, unavailable: true, missing: phonesOverride.split(/\s+/) };
+  // Greedy longest-match segmentation against the model's BPE vocabulary.
+  // Every word is preceded by the '▁' whitespace marker (GigaSpeech
+  // convention). Returns null when a character is not covered by the
+  // vocabulary (accents, digits, punctuation).
+  function bpeEncode(text) {
+    const pieces = WAKE_BPE_PIECES;
+    const out = [];
+    for (const word of text.split(/\s+/)) {
+      const withMarker = '▁' + word;
+      let i = 0;
+      while (i < withMarker.length) {
+        let match = null;
+        for (const p of pieces) {
+          if (withMarker.startsWith(p, i)) { match = p; break; }
+        }
+        if (!match) return { ok: false, uncovered: withMarker[i] };
+        out.push(match);
+        i += match.length;
       }
-      const badPhones = phonesOverride.split(/\s+/).filter(p => !phoneSet.has(p));
-      if (badPhones.length) return { ok: false, badPhones };
-      return { ok: true, tokens: `${phonesOverride} @${text.replace(/\s+/g, '_')}` };
     }
-    const lex = wakeLexicon;
-    if (!lex) return { ok: false, unavailable: true, missing: text.split(/\s+/) };
-    const missing = [];
-    const parts = [];
-    for (const w of text.split(/\s+/)) {
-      const phones = lex.get(w);
-      if (phones) parts.push(phones);
-      else missing.push(w);
+    return { ok: true, pieces: out.join(' ') };
+  }
+
+  function customToTokens(text, piecesOverride) {
+    if (piecesOverride) {
+      const pieceSet = getBpePieceSet();
+      const badPieces = piecesOverride.split(/\s+/).filter(p => !pieceSet.has(p));
+      if (badPieces.length) return { ok: false, badPieces };
+      return { ok: true, tokens: `${piecesOverride} @${text.replace(/\s+/g, '_')}` };
     }
-    if (missing.length) return { ok: false, missing };
-    return { ok: true, tokens: `${parts.join(' ')} @${text.replace(/\s+/g, '_')}` };
+    const encoded = bpeEncode(text);
+    if (!encoded.ok) return encoded;
+    return { ok: true, tokens: `${encoded.pieces} @${text.replace(/\s+/g, '_')}` };
   }
 
   // Single source of truth for the panel's wake config — reused by the
@@ -5691,26 +5708,18 @@ const UIController = (() => {
     const presets = Array.from(document.querySelectorAll('#wakeWordPresetBox input:checked'))
       .map(cb => cb.dataset.id);
     const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
-    const phonesText = el('wakeWordPhonesInput').value.trim().toUpperCase();
+    const piecesText = el('wakeWordPhonesInput').value.trim().toUpperCase()
+      .replace(/@[\w]+/g, '').trim();
     let custom = null;
     let error = null;
     if (customText) {
-      if (!wakeEngineReady || wakeEngineError) {
-        // The engine can't validate right now — trust the persisted
-        // custom word (already validated when it was saved) instead of
-        // failing the save on the disabled input's text.
-        custom = WakeWordStorage.load(getSettingsTargetId()).custom || null;
+      const tokens = customToTokens(customText, piecesText);
+      if (!tokens.ok) {
+        error = tokens.badPieces
+          ? `Unknown BPE pieces: ${tokens.badPieces.join(', ')} — use pieces from the engine vocabulary only`
+          : `Character not covered by the wake-word vocabulary: "${tokens.uncovered}" — try another spelling`;
       } else {
-        const tokens = customToTokens(customText, phonesText);
-        if (!tokens.ok) {
-          error = tokens.unavailable
-            ? 'Wake word engine not ready — custom words cannot be validated yet'
-            : tokens.badPhones
-              ? `Unknown phones: ${tokens.badPhones.join(', ')} — use phones from the engine lexicon only`
-              : `Not in the pronunciation lexicon: ${tokens.missing.join(', ')} — use the advanced phone string instead`;
-        } else {
-          custom = { display: customText.replace(/\s+/g, '_'), tokens: tokens.tokens };
-        }
+        custom = { display: customText.replace(/\s+/g, '_'), tokens: tokens.tokens };
       }
     }
     return {

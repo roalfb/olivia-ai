@@ -781,9 +781,9 @@ app.get('/', (c) => {
             <input type="text" id="wakeWordCustomInput"
                    placeholder="Custom words, e.g. HEY KITTY" />
             <details>
-              <summary>Advanced: phone string</summary>
+              <summary>Advanced: BPE pieces</summary>
               <input type="text" id="wakeWordPhonesInput"
-                     placeholder="K IH1 T IY0" />
+                     placeholder="▁K IT TY" />
             </details>
             <div id="wakeWordCustomError" class="settings-error" hidden></div>
           </div>

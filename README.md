@@ -848,26 +848,25 @@ If the network itself is down when the wake word fires, the reconnect retries tw
 
 While standby is armed, the connection chip shows which phrases are being listened for and a system message is added to the chat. A chime plays on detection, the session reconnects automatically (with one retry), and buffered speech is sent before live audio. Any manual action — connect, disconnect, mic off — disarms standby. Changing the keywords mid-standby takes effect immediately, and turning the feature off disarms it.
 
-### The Four Presets
+### The Three Presets
 
 | Preset | Say |
 |---|---|
 | Hey Olivia | "Hey Olivia" |
 | Hi ESP | "Hi ESP" |
 | Hey Jarvis | "Hey Jarvis" |
-| 你好小智 (Ni hao XiaoZhi) | "Nǐ hǎo xiǎozhì" |
 
 ### Custom Wake Words
 
-Type any English word or short phrase into the custom field (e.g. `HEY KITTY`) and save — Olivia converts it to the engine's phone string using the model's built-in pronunciation lexicon and validates it before accepting it. If validation fails because a word is not in the lexicon, expand the **Advanced: phone string** field and supply the phones yourself.
+Type any English word or short phrase into the custom field (e.g. `HEY KITTY`) and save — Olivia converts it to the engine's token line by segmenting it into the model's sentencepiece BPE vocabulary and validates the result before accepting it. Letters outside the vocabulary (accents, digits, punctuation) are reported with an inline error.
 
-The phone string format is space-separated phonemes from the lexicon followed by `@` and the display form (no spaces — use `_`). For example, `HEY KITTY` becomes:
+The token format is space-separated BPE pieces (each word prefixed by the `▁` whitespace marker) followed by `@` and the display form (no spaces — use `_`). For example, `HEY KITTY` becomes:
 
 ```
-HH EY1 K IH1 T IY0 @HEY_KITTY
+▁HE Y ▁K IT TY @HEY_KITTY
 ```
 
-The same format (with tone-marked pinyin instead of phones) is used for Chinese; only the built-in 你好小智 preset uses it — custom Chinese keywords are not supported.
+If you want exact control over the segmentation, expand the **Advanced: BPE pieces** field and supply the pieces yourself — each must exist in the model vocabulary.
 
 ### Sensitivity
 
@@ -881,7 +880,7 @@ The engine is a WebAssembly build of [sherpa-onnx](https://github.com/k2-fsa/she
 
 ### Limitations
 
-- **Custom keywords are English-only.** The pronunciation lexicon used to validate custom words covers English; Chinese is available through the built-in 你好小智 preset only.
+- **Wake words are English-only.** The bundled GigaSpeech model is an English keyword-spotting model; its vocabulary does not cover accented letters, digits, or other scripts.
 - **Background-tab behavior varies by browser.** Some browsers throttle or suspend audio processing in inactive tabs, which can pause detection. Keep the Olivia tab visible for reliable wake word standby.
 
 ### Wake word engine build (contributors)
@@ -900,21 +899,27 @@ The `public/static/wake/` directory holds four prebuilt artifacts (`sherpa-onnx-
 
    ```bash
    git clone --depth 1 https://github.com/k2-fsa/sherpa-onnx.git
-   wget https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
-   tar xf sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+   wget https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2
+   tar xf sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2
    ```
 
-3. **Populate the build's asset directory** with our model files. The build's CMakeLists fatals unless a file named for an older model revision exists — satisfy it with a 0-byte stub. It is only an existence guard and is never opened at runtime (it does get packed into `.data`, costing nothing):
+3. **Populate the build's asset directory** with the model files. The demo's CMakeLists guards on a decoder file name that happens to match this model's real decoder, so no stub is needed:
 
    ```bash
    cd sherpa-onnx/wasm/kws/assets
-   M=/path/to/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20
-   cp $M/encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx .
-   cp $M/decoder-epoch-13-avg-2-chunk-8-left-64.onnx .
-   cp $M/joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx .
+   rm -f *.onnx tokens.txt en.phone
+   M=/path/to/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01
+   cp $M/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx .
+   cp $M/decoder-epoch-12-avg-2-chunk-16-left-64.onnx .
+   cp $M/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx .
    cp $M/tokens.txt .
-   cp $M/en.phone .
-   touch decoder-epoch-12-avg-2-chunk-16-left-64.onnx   # build-guard stub, 0 bytes
+   ```
+
+   One more asset, `bpe.vocab`, is generated from the model's `bpe.model` with sentencepiece — the app points `bpe_vocab` at it so custom keyword pieces can be validated against the real vocabulary:
+
+   ```bash
+   pip install sentencepiece
+   python3 -c "import sentencepiece as spm; sp = spm.SentencePieceProcessor(model_file='$M/bpe.model'); open('bpe.vocab','w').write(''.join(f'{sp.id_to_piece(i)} {sp.get_score(i)}\n' for i in range(sp.get_piece_size())))"
    ```
 
 4. **Build** (needs `cmake` and `make`; the build downloads an onnxruntime static lib on first configure):
@@ -926,28 +931,24 @@ The `public/static/wake/` directory holds four prebuilt artifacts (`sherpa-onnx-
 
 5. **Copy the four artifacts** (`sherpa-onnx-kws.js`, `sherpa-onnx-wasm-kws-main.js`, `sherpa-onnx-wasm-kws-main.wasm`, `sherpa-onnx-wasm-kws-main.data`) to `public/static/wake/`. Do not copy the demo `app.js`/`index.html` from that directory.
 
-**Regenerating preset token lines.** The four preset lines embedded in `app.js` (`WAKE_PRESETS`) were produced with sherpa-onnx's own tokenizer and must be regenerated from the same model if the model ever changes. Install `sherpa-onnx-cli`, then run **one keyword per invocation** — in batch mode the tool skips lines whose words are missing from the lexicon but keeps their `@tags`, silently misaligning every following line:
+**Regenerating preset token lines.** The preset lines embedded in `app.js` (`WAKE_PRESETS`) are sentencepiece BPE segmentations of the phrase and must be regenerated from the same model if the model ever changes:
 
 ```bash
-echo 'Hey Olivia' > kw.txt
-sherpa-onnx-cli text2token \
-  --tokens $M/tokens.txt --tokens-type phone+ppinyin --lexicon $M/en.phone \
-  kw.txt kw-tokens.txt    # repeat with a fresh one-line file per keyword
+python3 -c "import sentencepiece as spm; sp = spm.SentencePieceProcessor(model_file='$M/bpe.model'); [print(' '.join(sp.encode(p, out_type=str)) + ' @' + p.replace(' ', '_')) for p in ['Hey Olivia', 'Hi ESP', 'Hey Jarvis']]"
 ```
 
 The canonical current lines are:
 
 ```
-HH EY1 OW0 L IH1 V IY0 AH0 @HEY_OLIVIA
-HH AY1 IY1 EH1 S P IY1 @HI_ESP
-HH EY1 JH AA1 R V AH0 S @HEY_JARVIS
-n ǐ h ǎo x iǎo zh ì @你好小智
+▁HE Y ▁O LI VI A @HEY_OLIVIA
+▁HI ▁E S P @HI_ESP
+▁HE Y ▁JA R VI S @HEY_JARVIS
 ```
 
 Notes:
 
-- Words absent from the `en.phone` lexicon need hand-written phone lines. `ESP` is such a case: the canonical line spells the letters out (`E S P` → `IY1 EH1 S P IY1`, i.e. "ee-ess-pee"), which also matches how the acronym is spoken.
-- Tokens must all exist in `tokens.txt` — a line referencing an unknown phone or pinyin token silently never fires.
+- Every piece must exist in `tokens.txt` — a line referencing an unknown token silently never fires.
+- Before shipping a preset, verify it against real speech: the previous bilingual model accepted only its two shipped demo keywords and silently ignored every other English keyword.
 
 ---
 
