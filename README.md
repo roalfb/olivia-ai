@@ -825,7 +825,7 @@ Wiring it up in a future phase would take a single additional `protocol.on('cust
 
 ## Wake Word Resume
 
-When the Xiaozhi server closes an auto-mode session — after a few minutes of silence (server-side inactivity timeout) — Olivia can keep the microphone open locally and listen for a **wake word** instead of dropping you back to the connect button. Saying the wake word plays a chime, reconnects the session, and sends the speech captured during standby first — a ring buffer keeps up to 4 seconds of audio, flushed from 200 ms before the detection moment so the wake phrase itself is not echoed back — then live audio flows. You can start talking the moment the chime sounds and never lose your first words.
+When an auto-mode session ends from under you — the Xiaozhi server saying its inactivity goodbye and closing, or the connection going silent and being closed by Olivia's dead-channel watchdog — Olivia can keep the microphone open locally and listen for a **wake word** instead of dropping you back to the connect button. Saying the wake word plays a chime, reconnects the session, and sends the speech captured during standby first — a ring buffer keeps up to 4 seconds of audio, flushed from 200 ms before the detection moment so the wake phrase itself is not echoed back — then live audio flows. You can start talking the moment the chime sounds and never lose your first words.
 
 This mirrors what a physical ESP32 does with its on-device WakeNet: the hardware listens locally so the cloud connection can be re-established by voice alone.
 
@@ -839,10 +839,12 @@ Open the assistant's settings (gear icon) and find the **Wake Word** section:
 
 Standby only ever arms when **all** of these hold:
 
-- The server itself closed the connection cleanly (its inactivity goodbye) — never on a manual disconnect, an authentication failure, or a network error
+- The session ended on its own: either the server closed it cleanly (its inactivity goodbye) or the channel died silently and the watchdog closed it — never on a manual disconnect, an authentication failure, or any other abnormal close
 - The session was in **auto** listening mode with the microphone capturing
 - The assistant was the active one on screen
 - The feature is enabled and at least one wake word is selected
+
+If the network itself is down when the wake word fires, the reconnect retries twice, reports the failure and drops standby — you are never left with a dead-looking session.
 
 While standby is armed, the connection chip shows which phrases are being listened for and a system message is added to the chat. A chime plays on detection, the session reconnects automatically (with one retry), and buffered speech is sent before live audio. Any manual action — connect, disconnect, mic off — disarms standby. Changing the keywords mid-standby takes effect immediately, and turning the feature off disarms it.
 

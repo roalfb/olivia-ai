@@ -1156,10 +1156,15 @@ const WakeWordSystem = (() => {
     SherpaKwsEngine.feedPcm(block);
   }
 
-  function shouldArm({ enabled, active, autoMode, capturing, intentional, code, wasClean }) {
+  function shouldArm({ enabled, active, autoMode, capturing, intentional, code, wasClean, source }) {
     if (!enabled || !active || !autoMode || !capturing || intentional) return false;
     if (code !== 1000 && code !== 1001) return false;
-    if (wasClean === false) return false;
+    // Clean goodbye closes and watchdog-declared dead channels both leave
+    // the session voice-recoverable; every other abnormal close (auth,
+    // error, 1006) still refuses standby. If the network is truly down
+    // when the wake word fires, the bounded reconnect retries disarm
+    // standby with a toast — graceful, not a zombie.
+    if (wasClean === false && source !== 'watchdog') return false;
     return true;
   }
 
@@ -1197,8 +1202,11 @@ const WakeWordSystem = (() => {
     showToast(`Listening for: ${keywordLabels}`, 'info', 'Wake word');
     if (!SherpaKwsEngine.isRunning()) showToast('Loading wake word engine…', 'info', 'Wake word');
     UIController.setConnectionState('wake', keywordLabels);
+    const cause = ctx.source === 'watchdog'
+      ? 'Server stopped responding — connection closed'
+      : 'Session closed by server';
     UIController.addSystemMessage(
-      `Session closed by server — listening for wake word: ${keywordLabels}`, 'fa-microphone-lines');
+      `${cause} — listening for wake word: ${keywordLabels}`, 'fa-microphone-lines');
 
     SherpaKwsEngine.start(keywordsString(cfg), cfg.threshold, onKeyword)
       .then(() => { if (state === 'LOADING') state = 'ARMED'; })
@@ -3785,9 +3793,11 @@ const ProtocolClient = (() => {
     helloReceived = false;
     deviceEmulator.setState(deviceEmulator.STATES.IDLE, 'server silent');
     forceClose();
-    // wasClean=false: a watchdog-declared dead channel must never satisfy
-    // a downstream reconnect/standby path that accepts clean 1000 closes.
-    if (callbacks.onDisconnected) callbacks.onDisconnected(1000, 'Server activity timeout', false);
+    // wasClean=false: this is not a server goodbye. The trailing 'watchdog'
+    // source lets downstream listeners (wake-word standby) treat a dead
+    // channel as voice-recoverable while every other abnormal close stays
+    // rejected — detection is local and a failed reconnect disarms cleanly.
+    if (callbacks.onDisconnected) callbacks.onDisconnected(1000, 'Server activity timeout', false, false, 'watchdog');
   }
 
   /** Send a JSON text message */
@@ -4692,17 +4702,19 @@ const SessionManager = (() => {
       }
     });
 
-    protocol.on('disconnected', (code, reason, wasClean, intentional) => {
+    protocol.on('disconnected', (code, reason, wasClean, intentional, source) => {
       Logger.ws(`[${assistantId.slice(0, 8)}] Disconnected: ${code} ${reason}`);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
-      // Server-initiated goodbye on a live auto-mode session with the mic
-      // open: keep the mic and enter wake-word standby instead of tearing
-      // down. Every other close (manual, auth, watchdog/network, wrong
-      // mode, mic off) falls through to the normal disconnected path,
-      // which stops mic, encoder, meter and TTS like a user disconnect.
+      // A session that ended without the user — the server's inactivity
+      // goodbye, or a silently dead channel closed by the watchdog
+      // (source='watchdog') — can keep the mic and enter wake-word
+      // standby on a live auto-mode session. Every other close (manual,
+      // auth, other abnormal, wrong mode, mic off) falls through to the
+      // normal disconnected path, which stops mic, encoder, meter and
+      // TTS like a user disconnect.
       const armed = WakeWordSystem.maybeArm({
         assistantId,
-        code, wasClean, intentional,
+        code, wasClean, intentional, source,
         autoMode: AssistantManager.getFlatField(assistantId, 'listeningMode') === 'auto',
         capturing: isActiveId(assistantId) && AudioEngine.isCapturing(),
         active: isActiveId(assistantId),
