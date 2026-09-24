@@ -6092,7 +6092,10 @@ const UIController = (() => {
       case 'wake':
         // Wake-word standby: session closed, mic stays open locally
         // waiting for the wake phrase. Listening accent, manual
-        // disconnect stays available (it disarms standby).
+        // disconnect stays available (it disarms standby), and Connect
+        // stays visible too — the wake word is the hands-free path, but
+        // a manual reconnect must remain discoverable while standby is
+        // armed (it disarms and reconnects).
         statusDot.className = 'status-dot listening';
         statusText.textContent = 'Standby';
         stateChip.classList.add('listening');
@@ -6101,7 +6104,8 @@ const UIController = (() => {
         stateChipIcon.className = 'fas fa-microphone-lines';
         chatSubtitle.textContent = 'Powered by Olivia \u2014 Wake word standby';
         deviceAvatar.classList.add('listening');
-        connectBtn.style.display = 'none';
+        connectBtn.style.display = 'flex';
+        connectBtn.title = 'Reconnect now';
         disconnectBtn.style.display = 'flex';
         sessionInfo.style.display = 'none';
         inputHint.textContent = 'Say the wake word to resume';
@@ -6119,6 +6123,7 @@ const UIController = (() => {
         stateChipIcon.className = 'fas fa-circle';
         chatSubtitle.textContent = 'Powered by Olivia \u2014 Disconnected';
         connectBtn.style.display = 'flex';
+        connectBtn.title = 'Connect to server';
         disconnectBtn.style.display = 'none';
         sessionInfo.style.display = 'none';
         inputHint.textContent = 'Connect to server to start chatting';
@@ -7341,6 +7346,16 @@ const AppController = (() => {
     }).catch(err => {
       Logger.warn('Opus WASM pre-load failed (will retry on use)', err.message);
     });
+
+    // Pre-warm the wake-word engine when any assistant has the feature
+    // enabled: a cold arm-time load (21 MB of assets + wasm compile)
+    // leaves standby deaf for seconds after the server goodbye; a warm
+    // engine detects from the first audio block.
+    if (AssistantManager.getAllAssistants().some(a => WakeWordStorage.load(a.id).enabled)) {
+      SherpaKwsEngine.load().catch(err => {
+        Logger.warn('Wake word engine pre-load failed (will retry on use)', err && err.message);
+      });
+    }
 
     // Hide loading overlay
     setTimeout(() => {
