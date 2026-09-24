@@ -1036,9 +1036,32 @@ const SherpaKwsEngine = (() => {
     return loadPromise;
   }
 
+  // A keyword line referencing a token that is not in the model vocabulary
+  // makes the wasm runtime terminate the whole page (EncodeBase fatal +
+  // exit(-1)) — it must never reach createKws. Stale localStorage from an
+  // older model generation is the realistic source of such lines, since
+  // save-time validation only sees what the panel submits.
+  function validateKeywords(keywords) {
+    const pieceSet = new Set(WAKE_BPE_PIECES);
+    const bad = [];
+    for (const line of keywords.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const at = trimmed.indexOf('@');
+      const tokens = (at >= 0 ? trimmed.slice(0, at) : trimmed).trim().split(/\s+/);
+      for (const t of tokens) {
+        if (t && !pieceSet.has(t)) bad.push(t);
+      }
+    }
+    if (bad.length) {
+      throw new Error(`keyword token(s) not in the model vocabulary: ${bad.join(', ')}`);
+    }
+  }
+
   function start(keywords, threshold, onKeyword) {
     return load().then(() => {
       stop();
+      validateKeywords(keywords);
       const config = {
         featConfig: { samplingRate: 16000, featureDim: 80 },
         modelConfig: {
