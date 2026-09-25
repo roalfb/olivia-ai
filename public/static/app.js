@@ -1095,7 +1095,9 @@ const SherpaKwsEngine = (() => {
   function feedPcm(samples) {
     if (!kws || !stream) return;
     stream.acceptWaveform(16000, samples);
-    while (kws.isReady(stream)) {
+    // The keyword callback may stop() the engine (the panel Test does),
+    // nulling kws mid-loop — re-check before every iteration.
+    while (kws && kws.isReady(stream)) {
       kws.decode(stream);
       const result = kws.getResult(stream);
       if (result.keyword && result.keyword.length > 0) {
@@ -1235,12 +1237,25 @@ const WakeWordSystem = (() => {
       detectorProc.onaudioprocess = (e) => {
         if (detectorCtx && detectorCtx.state !== 'running') detectorStats.ctxState = detectorCtx.state;
         else detectorStats.ctxState = 'running';
-        const block = new Float32Array(e.inputBuffer.getChannelData(0));
+        // Digital input gain: raw (AGC-less) capture sits ~10 dB below the
+        // level the KWS model fires on reliably (verified empirically —
+        // quiet-mic speech at peak ~0.07 misses, the same voice at ~0.28
+        // hits). ×4 restores it; louder mics simply clip peaks, which the
+        // feature extractor tolerates far better than being too quiet.
+        const raw = e.inputBuffer.getChannelData(0);
+        const block = new Float32Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+          const v = raw[i] * 4;
+          block[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+        }
         detectorStats.blocks++;
+        let blockPeak = 0;
         for (let i = 0; i < block.length; i += 512) {
           const a = Math.abs(block[i]);
           if (a > detectorStats.peak) detectorStats.peak = a;
+          if (a > blockPeak) blockPeak = a;
         }
+        detectorStats.gainAdjustedPeak = blockPeak;
         onBlock(block);
       };
       detectorSrc.connect(detectorProc);
