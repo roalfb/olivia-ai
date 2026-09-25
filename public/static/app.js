@@ -1208,6 +1208,9 @@ const WakeWordSystem = (() => {
   let detectorSrc = null;
   let detectorProc = null;
   let detectorTrackEnded = null;
+  // Runtime counters surfaced through XiaozhiDebug.wakeDetectorStats() —
+  // a deaf standby must be diagnosable without a debugger attached.
+  let detectorStats = { blocks: 0, peak: 0, ctxState: 'closed', micLabel: '' };
 
   function startDetector(onBlock, opts = {}) {
     const standby = opts.standby !== false; // default: standby semantics
@@ -1223,10 +1226,23 @@ const WakeWordSystem = (() => {
         return;
       }
       detectorStream = stream;
+      detectorStats = { blocks: 0, peak: 0, ctxState: 'starting', micLabel: stream.getAudioTracks()[0]?.label || '' };
+      Logger.info(`Wake detector mic opened (${detectorStats.micLabel || 'unknown device'})`);
       detectorCtx = new AudioContext({ sampleRate: 16000 });
+      detectorCtx.resume().catch(() => {}); // autoplay policy: run even if created outside a gesture
       detectorSrc = detectorCtx.createMediaStreamSource(stream);
       detectorProc = detectorCtx.createScriptProcessor(4096, 1, 1);
-      detectorProc.onaudioprocess = (e) => onBlock(new Float32Array(e.inputBuffer.getChannelData(0)));
+      detectorProc.onaudioprocess = (e) => {
+        if (detectorCtx && detectorCtx.state !== 'running') detectorStats.ctxState = detectorCtx.state;
+        else detectorStats.ctxState = 'running';
+        const block = new Float32Array(e.inputBuffer.getChannelData(0));
+        detectorStats.blocks++;
+        for (let i = 0; i < block.length; i += 512) {
+          const a = Math.abs(block[i]);
+          if (a > detectorStats.peak) detectorStats.peak = a;
+        }
+        onBlock(block);
+      };
       detectorSrc.connect(detectorProc);
       detectorProc.connect(detectorCtx.destination);
       detectorTrackEnded = () => {
@@ -1473,7 +1489,7 @@ const WakeWordSystem = (() => {
       });
   }
 
-  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel, rearmKeywords, startDetector, stopDetector };
+  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel, rearmKeywords, startDetector, stopDetector, detectorStats: () => ({ ...detectorStats }) };
 })();
 
 // ================================================================
@@ -7564,6 +7580,8 @@ window.XiaozhiDebug = {
   sendDetect: (text) => SessionManager.getActiveSession()?.protocol.sendListenDetect(text),
   // Check opus status
   opusStatus: () => AudioEngine.loadOpus().then(m => ({ loaded: true, version: m.version })).catch(e => ({ loaded: false, error: e.message })),
+  // Wake detector liveness: blocks flowing, input level, AudioContext state.
+  wakeDetectorStats: () => WakeWordSystem.detectorStats(),
 };
 
 console.log('%c[Xiaozhi Web Client]', 'color: #0084ff; font-weight: bold; font-size: 14px;',
