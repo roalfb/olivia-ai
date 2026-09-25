@@ -878,6 +878,8 @@ Use the **Test wake word** button to check recognition without ending your sessi
 
 The engine is a WebAssembly build of [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s keyword-spotting model, loaded lazily from the same server that serves the app itself. During standby it runs entirely in your browser; no audio leaves it until the session reconnects. Encoded audio only starts flowing to the Xiaozhi server again when the wake word fires and the session is re-established. Wake word settings are stored per assistant in `localStorage` (key `olivia_wakeword_v1_<assistantId>`) and never leave the browser.
 
+The detector (and the **Test wake word** button) listen on their own microphone stream with the browser's audio processing disabled (echo cancellation, noise suppression and auto gain control off). The keyword-spotting model is small and fails on processed audio — the WebRTC chain reshapes the speech spectrum enough to make detection never fire. That is safe during standby because the session is closed and nothing is playing through the speakers; the session's own mic keeps its normal processing so assistant speech cannot leak back into the microphone.
+
 ### Limitations
 
 - **Wake words are English-only.** The bundled GigaSpeech model is an English keyword-spotting model; its vocabulary does not cover accented letters, digits, or other scripts.

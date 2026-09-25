@@ -1195,6 +1195,65 @@ const WakeWordSystem = (() => {
     SherpaKwsEngine.feedPcm(block);
   }
 
+  // The KWS model fails on browser-processed audio: the WebRTC chain
+  // (echo cancellation, noise suppression, auto gain control) reshapes
+  // the spectrum enough that keyword spotting goes from reliable to
+  // never-firing. The detector therefore listens on its OWN getUserMedia
+  // stream with all processing disabled — valid because standby runs
+  // with the session closed (no TTS playing, so nothing to echo-cancel).
+  // The session mic (with AEC) stays open the whole time so the resume
+  // path never has to re-open it mid-utterance.
+  let detectorCtx = null;
+  let detectorStream = null;
+  let detectorSrc = null;
+  let detectorProc = null;
+  let detectorTrackEnded = null;
+
+  function startDetector(onBlock, opts = {}) {
+    const standby = opts.standby !== false; // default: standby semantics
+    if (detectorStream) return Promise.resolve();
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1, sampleRate: 16000,
+        echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+      },
+    }).then(stream => {
+      if (standby && state === 'INACTIVE') { // disarmed while the prompt was up
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+      detectorStream = stream;
+      detectorCtx = new AudioContext({ sampleRate: 16000 });
+      detectorSrc = detectorCtx.createMediaStreamSource(stream);
+      detectorProc = detectorCtx.createScriptProcessor(4096, 1, 1);
+      detectorProc.onaudioprocess = (e) => onBlock(new Float32Array(e.inputBuffer.getChannelData(0)));
+      detectorSrc.connect(detectorProc);
+      detectorProc.connect(detectorCtx.destination);
+      detectorTrackEnded = () => {
+        if (standby) disarm('detector-mic-ended');
+        else if (opts.onEnded) opts.onEnded();
+      };
+      stream.getTracks().forEach(t => t.addEventListener('ended', detectorTrackEnded));
+    }).catch(err => {
+      Logger.warn('Detector mic could not be opened', err && err.message);
+      if (standby) {
+        showToast('Microphone audio unavailable — wake word standby off', 'error', 'Wake word');
+        disarm('detector-mic-failed');
+      } else if (opts.onFail) opts.onFail(err);
+    });
+  }
+
+  function stopDetector() {
+    if (detectorTrackEnded && detectorStream) {
+      detectorStream.getTracks().forEach(t => t.removeEventListener('ended', detectorTrackEnded));
+    }
+    detectorTrackEnded = null;
+    if (detectorProc) { detectorProc.disconnect(); detectorProc = null; }
+    if (detectorSrc) { detectorSrc.disconnect(); detectorSrc = null; }
+    if (detectorCtx) { detectorCtx.close().catch(() => {}); detectorCtx = null; }
+    if (detectorStream) { detectorStream.getTracks().forEach(t => t.stop()); detectorStream = null; }
+  }
+
   function shouldArm({ enabled, active, autoMode, capturing, intentional, code, wasClean, source }) {
     if (!enabled || !active || !autoMode || !capturing || intentional) return false;
     if (code !== 1000 && code !== 1001) return false;
@@ -1218,10 +1277,11 @@ const WakeWordSystem = (() => {
     ring = new Float32Array(RING_SAMPLES);
     ringWrite = 0; totalSamples = 0; detectionAt = -1;
 
-    // Mic keeps running; encoded packets are dropped while there is no
-    // session, raw blocks feed the detector and the ring buffer.
+    // Session mic keeps running (it must NOT be re-opened mid-utterance on
+    // resume); encoded packets are dropped while there is no session. The
+    // detector and ring buffer listen on their own unprocessed stream.
     AudioEngine.setOpusFrameSink(null);
-    AudioEngine.setRawBlockSink(onRawBlock);
+    startDetector(onRawBlock);
 
     // If the mic permission is revoked or the device disappears mid-standby,
     // the track ends silently — disarm cleanly instead of a zombie standby.
@@ -1331,7 +1391,7 @@ const WakeWordSystem = (() => {
     const pcm = ringSlice(Math.max(0, detectionAt - FLUSH_MARGIN_SAMPLES));
     AudioEngine.encodePcmChunk(pcm);
     AudioEngine.setOpusFrameSink((packet) => protocol.sendAudio(packet));
-    AudioEngine.setRawBlockSink(null);
+    stopDetector();
     ring = null;
     state = 'INACTIVE';
     armedAssistantId = null;
@@ -1363,7 +1423,7 @@ const WakeWordSystem = (() => {
     armedAssistantId = null;
     ring = null;
     detachMicEndedListener();
-    AudioEngine.setRawBlockSink(null);
+    stopDetector();
     AudioEngine.setOpusFrameSink(null);
     AudioEngine.stopCapture();
     SherpaKwsEngine.stop();
@@ -1413,7 +1473,7 @@ const WakeWordSystem = (() => {
       });
   }
 
-  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel, rearmKeywords };
+  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel, rearmKeywords, startDetector, stopDetector };
 })();
 
 // ================================================================
@@ -2353,9 +2413,6 @@ const AudioEngine = (() => {
   // startCapture(onChunk) callback; reroutable/droppable via setOpusFrameSink
   // without stopping the mic.
   let opusFrameSink = null;
-  // Optional raw-PCM tap: receives a copy of each 16kHz mono capture block
-  // via setRawBlockSink. null = no tap.
-  let rawBlockSink = null;
   let ttsQueue = [];
   let isTTSPlaying = false;
 
@@ -2658,11 +2715,10 @@ const AudioEngine = (() => {
       scriptProcessorNode.onaudioprocess = (e) => {
         if (!isCapturing) return;
 
-        // Copy — getChannelData returns a reused buffer, and rawBlockSink
-        // may hold onto the block beyond this callback.
+        // Copy — getChannelData returns a reused buffer, and processBlock
+        // merges it into the pcm accumulator beyond this callback.
         const block = new Float32Array(e.inputBuffer.getChannelData(0));
         processBlock(block);
-        if (rawBlockSink) rawBlockSink(block);
       };
 
       micSourceNode.connect(scriptProcessorNode);
@@ -2690,7 +2746,6 @@ const AudioEngine = (() => {
     pcmAccumulator = new Float32Array(0);
     // A stopped mic must never call stale sinks
     opusFrameSink = null;
-    rawBlockSink = null;
     stopLevelMeter();
 
     if (scriptProcessorNode) {
@@ -2899,11 +2954,10 @@ const AudioEngine = (() => {
   return {
     startCapture,
     stopCapture,
-    // Wake-word standby taps on the capture path. When never called, capture
-    // behaves exactly as before (opusFrameSink = the startCapture callback,
-    // rawBlockSink = null).
+    // Wake-word standby reroutes encoded packets without stopping the mic.
+    // When never called, capture behaves exactly as before (opusFrameSink =
+    // the startCapture callback).
     setOpusFrameSink: (fn) => { opusFrameSink = fn; },
-    setRawBlockSink: (fn) => { rawBlockSink = fn; },
     encodePcmChunk: (pcm) => {
       // Slice into capture-sized blocks so re-encoded audio goes through the
       // exact same accumulator/frame/encode path as live capture.
@@ -5823,8 +5877,7 @@ const UIController = (() => {
       wakeTestActive = false;
       clearTimeout(timer);
       SherpaKwsEngine.stop();
-      AudioEngine.setRawBlockSink(null);
-      AudioEngine.stopCapture();
+      WakeWordSystem.stopDetector();
       if (message) status.textContent = message;
     };
 
@@ -5836,11 +5889,12 @@ const UIController = (() => {
     }).catch(err => {
       finish(`Test failed: ${err.message}`);
     });
-    // Encoded packets are discarded — the test never sends audio.
-    AudioEngine.setRawBlockSink((b) => SherpaKwsEngine.feedPcm(b));
-    AudioEngine.startCapture(() => {}).then(ok => {
-      if (!wakeTestActive) { AudioEngine.stopCapture(); return; }
-      if (!ok) finish('Microphone unavailable — test cancelled');
+    // The test listens on the same unprocessed detector stream standby
+    // uses, so what it reports is what standby will hear.
+    WakeWordSystem.startDetector((b) => SherpaKwsEngine.feedPcm(b), {
+      standby: false,
+      onFail: () => finish('Microphone unavailable — test cancelled'),
+      onEnded: () => finish('Microphone ended — test cancelled'),
     });
     timer = setTimeout(() => finish('No wake word heard (timeout).'), 15000);
   }
