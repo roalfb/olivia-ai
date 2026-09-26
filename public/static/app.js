@@ -1191,9 +1191,28 @@ const WakeWordSystem = (() => {
     return out;
   }
 
+  // Blocks that arrive while the engine is being (re)created are queued
+  // (bounded, ~4 s) and flushed in order once it is live — createKws takes
+  // ~2 s, and without this the first wake-word utterance after arming is
+  // spoken straight into an engine that does not exist yet.
+  let pendingEngineBlocks = null;
+
+  function flushPendingEngineBlocks() {
+    if (!pendingEngineBlocks) return;
+    const queue = pendingEngineBlocks;
+    pendingEngineBlocks = null;
+    for (const b of queue) SherpaKwsEngine.feedPcm(b);
+  }
+
   function onRawBlock(block) {
     ringPush(block);
-    SherpaKwsEngine.feedPcm(block);
+    if (SherpaKwsEngine.isRunning()) {
+      SherpaKwsEngine.feedPcm(block);
+    } else if (state === 'LOADING' || state === 'ARMED') {
+      if (!pendingEngineBlocks) pendingEngineBlocks = [];
+      pendingEngineBlocks.push(block);
+      if (pendingEngineBlocks.length > 16) pendingEngineBlocks.shift();
+    }
   }
 
   // The KWS model fails on browser-processed audio: the WebRTC chain
@@ -1331,7 +1350,7 @@ const WakeWordSystem = (() => {
       `${cause} — listening for wake word: ${keywordLabels}`, 'fa-microphone-lines');
 
     SherpaKwsEngine.start(keywordsString(cfg), cfg.threshold, onKeyword)
-      .then(() => { if (state === 'LOADING') state = 'ARMED'; })
+      .then(() => { if (state === 'LOADING') state = 'ARMED'; flushPendingEngineBlocks(); })
       .catch(err => {
         Logger.error('Wake word engine failed to load', err);
         showToast(`Wake word engine failed: ${err.message}`, 'error', 'Wake word');
@@ -1489,6 +1508,7 @@ const WakeWordSystem = (() => {
     UIController.setConnectionState('wake', keywordLabels);
     SherpaKwsEngine.stop();
     SherpaKwsEngine.start(keywordsString(cfg), cfg.threshold, onKeyword)
+      .then(() => flushPendingEngineBlocks())
       .catch(err => {
         Logger.error('Wake word engine failed to rearm', err);
         showToast(`Wake word engine failed: ${err.message}`, 'error', 'Wake word');
