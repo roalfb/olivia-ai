@@ -1153,7 +1153,6 @@ const WakeWordSystem = (() => {
   let totalSamples = 0;                        // samples seen since arm
   let detectionAt = -1;                        // totalSamples at detection
   let keywordLabels = '';                      // for UI text
-  let micTrackEnded = null;                    // 'ended' listener on the live mic track
 
   function getState() { return state; }
 
@@ -1308,25 +1307,18 @@ const WakeWordSystem = (() => {
     ring = new Float32Array(RING_SAMPLES);
     ringWrite = 0; totalSamples = 0; detectionAt = -1;
 
-    // Session mic keeps running (it must NOT be re-opened mid-utterance on
-    // resume); encoded packets are dropped while there is no session. The
-    // detector and ring buffer listen on their own unprocessed stream.
-    AudioEngine.setOpusFrameSink(null);
+    // The detector must own the microphone EXCLUSIVELY during standby:
+    // on PipeWire/Linux a second raw stream opened beside the processed
+    // session stream captures pure digital silence (verified — hundreds
+    // of blocks, peak 0.0). Closing the session capture also stops the
+    // encoder from producing packets nobody consumes. On resume the
+    // session mic re-opens in parallel with the reconnect (it takes
+    // seconds; the detector's ring buffer keeps capturing speech the
+    // whole time and is flushed ahead of live audio).
+    AudioEngine.stopCapture();
+    UIController.hideAudioMeter();
+    UIController.updateMicButtonState(false);
     startDetector(onRawBlock);
-
-    // If the mic permission is revoked or the device disappears mid-standby,
-    // the track ends silently — disarm cleanly instead of a zombie standby.
-    micTrackEnded = () => disarm('mic-ended');
-    const micTrack = AudioEngine.getMicTrack();
-    if (micTrack) micTrack.addEventListener('ended', micTrackEnded);
-
-    // A suspended capture context (autoplay policy) would silently stop
-    // onaudioprocess — detection would never run.
-    AudioEngine.resumeCaptureContext().catch(err => {
-      Logger.warn('Capture context would not resume — disarming standby', err && err.message);
-      showToast('Microphone audio unavailable — wake word standby off', 'error', 'Wake word');
-      disarm('capture-context-suspended');
-    });
 
     state = 'LOADING';
     showToast(`Listening for: ${keywordLabels}`, 'info', 'Wake word');
@@ -1348,13 +1340,6 @@ const WakeWordSystem = (() => {
     return true;
   }
 
-  function detachMicEndedListener() {
-    if (!micTrackEnded) return;
-    const micTrack = AudioEngine.getMicTrack();
-    if (micTrack) micTrack.removeEventListener('ended', micTrackEnded);
-    micTrackEnded = null;
-  }
-
   function onKeyword(word) {
     if (state !== 'ARMED') return;
     state = 'TRIGGERED';
@@ -1362,6 +1347,13 @@ const WakeWordSystem = (() => {
     Logger.info(`Wake word detected: ${word}`);
     playChime();
     UIController.addSystemMessage(`Wake word detected (${word}) — reconnecting…`, 'fa-bolt');
+    // Re-open the session mic (processed constraints) in parallel with the
+    // reconnect: the handshake takes seconds, so it is live well before
+    // resumeStreaming wires its sink. The detector keeps filling the ring
+    // meanwhile, so nothing said during the reconnect is lost.
+    AudioEngine.startCapture(() => {}).catch(err => {
+      Logger.warn('Session mic could not re-open at wake resume', err && err.message);
+    });
     connectWithRetry(0);
   }
 
@@ -1408,7 +1400,6 @@ const WakeWordSystem = (() => {
     const session = SessionManager.getSession(armedAssistantId);
     if (!session || !session.protocol.isConnected()) { disarm('no-session'); return; }
     const protocol = session.protocol;
-    detachMicEndedListener();
     // Before sendListenStart: the LISTENING device-state change it fires
     // must win over the 'connected' repaint below (same order as a
     // normal auto-mode session).
@@ -1422,6 +1413,8 @@ const WakeWordSystem = (() => {
     const pcm = ringSlice(Math.max(0, detectionAt - FLUSH_MARGIN_SAMPLES));
     AudioEngine.encodePcmChunk(pcm);
     AudioEngine.setOpusFrameSink((packet) => protocol.sendAudio(packet));
+    UIController.showAudioMeter();
+    UIController.updateMicButtonState(true);
     stopDetector();
     ring = null;
     state = 'INACTIVE';
@@ -1453,7 +1446,6 @@ const WakeWordSystem = (() => {
     state = 'INACTIVE';
     armedAssistantId = null;
     ring = null;
-    detachMicEndedListener();
     stopDetector();
     AudioEngine.setOpusFrameSink(null);
     AudioEngine.stopCapture();
@@ -3000,9 +2992,7 @@ const AudioEngine = (() => {
     // decodeToArrayBuffer: encoded container (OGG/WAV) → AudioBuffer via
     // the TTS decode path. playLocalBuffer: schedule a decoded buffer
     // through the shared TTS gain node so the assistant's volume setting
-    // applies to local sounds. getMicTrack: the live capture track (null
-    // when not capturing). resumeCaptureContext: undo autoplay suspension
-    // so onaudioprocess keeps firing during standby.
+    // applies to local sounds.
     decodeToArrayBuffer: decodeAudioContainer,
     playLocalBuffer: (audioBuffer) => {
       if (!audioContext) return;
@@ -3010,11 +3000,6 @@ const AudioEngine = (() => {
       source.buffer = audioBuffer;
       source.connect(ensureGainNode() || audioContext.destination);
       source.start();
-    },
-    getMicTrack: () => (micStream && micStream.getTracks()[0]) || null,
-    resumeCaptureContext: () => {
-      if (!captureContext || captureContext.state !== 'suspended') return Promise.resolve();
-      return captureContext.resume();
     },
     enqueueTTSChunk,
     clearTTSQueue,
