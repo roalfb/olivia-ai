@@ -5283,8 +5283,10 @@ const UIController = (() => {
         parseFloat(el('wakeWordThresholdInput').value).toFixed(2);
     });
     el('wakeWordTestBtn').addEventListener('click', handleWakeWordTest);
-    ['wakeWordCustomInput', 'wakeWordPhonesInput'].forEach(id => {
-      el(id).addEventListener('input', updateWakeCustomPreview);
+    el('wakeWordCustomInput').addEventListener('input', updateWakeCustomPreview);
+    el('wakeWordPhonesInput').addEventListener('input', () => {
+      wakePhonesDirty = true;
+      updateWakeCustomPreview();
     });
     el('listeningModeInput').addEventListener('change', applyWakeSectionAvailability);
 
@@ -5774,6 +5776,7 @@ const UIController = (() => {
     el('wakeWordThresholdInput').value = String(cfg.threshold);
     el('wakeWordThresholdValue').textContent = Number(cfg.threshold).toFixed(2);
     el('wakeWordCustomError').hidden = true;
+    wakePhonesDirty = false;
     updateWakeCustomPreview();
     applyWakeSectionAvailability();
   }
@@ -5855,19 +5858,34 @@ const UIController = (() => {
       : `Character not covered by the wake-word vocabulary: "${tokens.uncovered}" — try another spelling`;
   }
 
+  // The Advanced field mirrors the derived encoding until the user edits
+  // it by hand — a manual override survives custom-text changes.
+  let wakePhonesDirty = false;
+
   // Live feedback for the custom field: shows the exact keyword line the
-  // save path would store, or why the text cannot be encoded.
+  // save path would store (mirrored into the Advanced field) or why the
+  // text cannot be encoded.
   function updateWakeCustomPreview() {
     const preview = el('wakeWordCustomPreview');
+    const phones = el('wakeWordPhonesInput');
     const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
-    const piecesText = el('wakeWordPhonesInput').value.trim().toUpperCase()
-      .replace(/@[\w]+/g, '').trim();
     if (!customText) {
       preview.hidden = true;
+      if (!wakePhonesDirty) phones.value = '';
       return;
     }
-    const tokens = customToTokens(customText, piecesText);
-    preview.textContent = tokens.ok ? `→ ${tokens.tokens}` : wakeEncodeError(tokens);
+    const piecesText = phones.value.trim().toUpperCase()
+      .replace(/@[\w]+/g, '').trim();
+    const tokens = customToTokens(customText, wakePhonesDirty ? piecesText : '');
+    if (tokens.ok) {
+      if (!wakePhonesDirty) {
+        const at = tokens.tokens.indexOf(' @');
+        phones.value = at === -1 ? tokens.tokens : tokens.tokens.slice(0, at);
+      }
+      preview.textContent = `→ ${tokens.tokens}`;
+    } else {
+      preview.textContent = wakeEncodeError(tokens);
+    }
     preview.hidden = false;
   }
 
