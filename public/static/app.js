@@ -892,14 +892,29 @@ const VolumeSystem = (() => {
 })();
 
 // ================================================================
+// Pre-tokenized wake word presets. Token lines follow the sherpa-onnx KWS
+// keywords format for the GigaSpeech English model: sentencepiece BPE
+// pieces, then '@' + display form (no spaces; use '_'). Regenerate with
+// the command documented in README → "Wake word engine build". "Hello
+// Olivia" is the only shipped preset — the one verified end to end
+// against real speech; everything else belongs to per-user custom
+// phrases.
+const WAKE_PRESETS = [
+  { id: 'hello_olivia', label: 'Hello Olivia',
+    tokens: '▁HE LL O ▁O LI VI A @HELLO_OLIVIA' },
+];
+
 // WAKE WORD STORAGE (per-assistant, own localStorage namespace)
 // ================================================================
 const WakeWordStorage = (() => {
   const KEY_PREFIX = 'olivia_wakeword_v1_';
-  const DEFAULTS = { enabled: false, presets: ['hey_olivia'], customs: [], threshold: 0.25 };
+  const DEFAULTS = { enabled: false, presets: ['hello_olivia'], customs: [], threshold: 0.25 };
 
   // Records written before multi-phrase support stored a single `custom`
   // object — fold it into the `customs` list and pin the record shape.
+  // Preset ids that no longer exist in WAKE_PRESETS are pruned so a
+  // stale selection can never yield an empty keywords file; the preset
+  // itself was re-worded from "Hey" to "Hello", so that id is remapped.
   function normalize(cfg) {
     const customs = Array.isArray(cfg.customs)
       ? cfg.customs.filter(c => c && c.tokens && c.display) : [];
@@ -909,7 +924,11 @@ const WakeWordStorage = (() => {
     }
     return {
       enabled: !!cfg.enabled,
-      presets: Array.isArray(cfg.presets) ? cfg.presets : [],
+      presets: Array.isArray(cfg.presets)
+        ? cfg.presets
+            .map(id => (id === 'hey_olivia' ? 'hello_olivia' : id))
+            .filter(id => WAKE_PRESETS.some(p => p.id === id))
+        : [],
       customs,
       threshold: typeof cfg.threshold === 'number' ? cfg.threshold : 0.25,
     };
@@ -936,19 +955,6 @@ const WakeWordStorage = (() => {
 
   return { load, save, remove };
 })();
-
-// Pre-tokenized wake word presets. Token lines follow the sherpa-onnx KWS
-// keywords format for the GigaSpeech English model: sentencepiece BPE
-// pieces, then '@' + display form (no spaces; use '_'). Regenerate with
-// the command documented in README → "Wake word engine build".
-const WAKE_PRESETS = [
-  { id: 'hey_olivia', label: 'Hey Olivia',
-    tokens: '▁HE Y ▁O LI VI A @HEY_OLIVIA' },
-  { id: 'hi_esp',     label: 'Hi ESP',
-    tokens: '▁HI ▁E S P @HI_ESP' },
-  { id: 'hey_jarvis', label: 'Hey Jarvis',
-    tokens: '▁HE Y ▁JA R VI S @HEY_JARVIS' },
-];
 
 // Sentencepiece BPE vocabulary of the GigaSpeech model (500 pieces, special
 // tokens removed), longest first so greedy longest-match segmentation equals

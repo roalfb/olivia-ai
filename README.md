@@ -848,13 +848,13 @@ If the network itself is down when the wake word fires, the reconnect retries tw
 
 While standby is armed, the connection chip shows which phrases are being listened for and a system message is added to the chat. A chime plays on detection, the session reconnects automatically (with one retry), and buffered speech is sent before live audio. Any manual action — connect, disconnect, mic off — disarms standby. Changing the keywords mid-standby takes effect immediately, and turning the feature off disarms it.
 
-### The Three Presets
+### The Preset
 
 | Preset | Say |
 |---|---|
-| Hey Olivia | "Hey Olivia" |
-| Hi ESP | "Hi ESP" |
-| Hey Jarvis | "Hey Jarvis" |
+| Hello Olivia | "Hello Olivia" |
+
+It is the only shipped preset, verified end to end against real speech. Anything else you want Olivia to answer to is a custom wake word (below).
 
 ### Custom Wake Words
 
@@ -936,7 +936,7 @@ The `public/static/wake/` directory holds four prebuilt artifacts (`sherpa-onnx-
 **Regenerating preset token lines.** The preset lines embedded in `app.js` (`WAKE_PRESETS`) are sentencepiece BPE segmentations of the phrase and must be regenerated from the same model if the model ever changes:
 
 ```bash
-python3 -c "import sentencepiece as spm; sp = spm.SentencePieceProcessor(model_file='$M/bpe.model'); [print(' '.join(sp.encode(p, out_type=str)) + ' @' + p.replace(' ', '_')) for p in ['Hey Olivia', 'Hi ESP', 'Hey Jarvis']]"
+python3 -c "import sentencepiece as spm; sp = spm.SentencePieceProcessor(model_file='$M/bpe.model'); [print(' '.join(sp.encode(p, out_type=str)) + ' @' + p.replace(' ', '_')) for p in ['Hello Olivia']]"
 ```
 
 The canonical current lines are:
