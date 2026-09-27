@@ -161,11 +161,19 @@ app.get('/api/ws', async (c) => {
     pending.length = 0
   }
 
+  /** Close codes that may legally be SENT in an outgoing close frame.
+   *  The WHATWG close() accepts only 1000 and 3000–4999 — anything else
+   *  (1001 going-away on page unload, 1005/1006/1015 abnormal close)
+   *  throws SyntaxError, which the catch below would swallow, skipping
+   *  the handshake entirely. */
+  const sendableCloseCode = (code: number) =>
+    code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000
+
   const closeLocal = (code = 1011, reason = 'Upstream connection closed') => {
     if (localClosed) return
     localClosed = true
     try {
-      localSocket.close(code, reason)
+      localSocket.close(sendableCloseCode(code), reason)
     } catch {
       /* already closed */
     }
@@ -175,7 +183,7 @@ app.get('/api/ws', async (c) => {
     if (upstreamClosed || !upstream) return
     upstreamClosed = true
     try {
-      upstream.close(code, reason)
+      upstream.close(sendableCloseCode(code), reason)
     } catch {
       /* already closed */
     }
@@ -195,7 +203,14 @@ app.get('/api/ws', async (c) => {
   })
 
   localSocket.addEventListener('close', (event) => {
-    closeUpstream(event.code || 1000, event.reason || 'Client disconnected')
+    // Complete BOTH legs: forward the close upstream, and mirror the
+    // browser's close frame back at it — with allowHalfOpen our side
+    // stays in CLOSING until we call close(), and without the mirror
+    // the browser socket hangs half-closed with no close event.
+    const code = event.code || 1000
+    const reason = event.reason || 'Client disconnected'
+    closeUpstream(code, reason)
+    closeLocal(code, reason)
   })
 
   ;(async () => {
@@ -230,6 +245,14 @@ app.get('/api/ws', async (c) => {
       // allowHalfOpen: true — coordinate close frames independently on both sides
       upstream.accept({ allowHalfOpen: true })
 
+      // The browser may have closed while the upstream fetch was in
+      // flight — nothing left to proxy, drop the fresh upstream socket
+      // instead of wiring it into a dead connection.
+      if (localClosed) {
+        closeUpstream(1000, 'Client disconnected')
+        return
+      }
+
       await flushPending()
 
       upstream.addEventListener('message', async (event) => {
@@ -243,10 +266,20 @@ app.get('/api/ws', async (c) => {
       })
 
       upstream.addEventListener('close', (event) => {
-        closeLocal(event.code || 1000, event.reason || 'Upstream closed')
+        // Complete the close handshake on BOTH legs. With allowHalfOpen the
+        // runtime leaves our ends in CLOSING until we call close() ourselves
+        // — skipping it parks the sockets in CLOSE_WAIT forever after the
+        // server hangs up.
+        const code = event.code || 1000
+        const reason = event.reason || 'Upstream closed'
+        closeUpstream(code, reason)
+        closeLocal(code, reason)
       })
 
       upstream.addEventListener('error', (event) => {
+        // An error may not be followed by a close event — complete both
+        // handshakes ourselves (idempotent via the closed flags).
+        closeUpstream()
         closeLocal(1011, 'Upstream WebSocket error')
       })
     } catch (err: unknown) {

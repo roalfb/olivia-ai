@@ -2191,6 +2191,24 @@ const AudioEngine = (() => {
     if (meterEl) meterEl.style.width = '0%';
   }
 
+  // Byte-frequency average (0-255) above which the meter shows ~10% —
+  // the practical speech/silence floor used by isInputAudible().
+  const METER_AUDIBLE_AVG = 8;
+
+  /** One-shot probe: is the microphone currently picking up sound above
+   *  the level meter's floor? Reads the live analyser directly instead of
+   *  the rAF meter loop, which freezes in background tabs. Used by
+   *  ProtocolClient's channel watchdog to track when the user speaks and
+   *  when an utterance ends, so a server that never responds to speech
+   *  can be detected as a dead channel. */
+  function isInputAudible() {
+    if (!isCapturing || !analyzerNode) return false;
+    const data = new Uint8Array(analyzerNode.frequencyBinCount);
+    analyzerNode.getByteFrequencyData(data);
+    const avg = data.reduce((a, b) => a + b, 0) / data.length;
+    return avg > METER_AUDIBLE_AVG;
+  }
+
   /**
    * Play raw Opus binary data received from server TTS.
    * Uses libopus-wasm decoder to convert Opus → Float32 PCM → Web Audio.
@@ -2324,6 +2342,7 @@ const AudioEngine = (() => {
     enqueueTTSChunk,
     clearTTSQueue,
     isCapturing: () => isCapturing,
+    isInputAudible,
     checkMicPermission,
     ensureAudioContext,
     loadOpus,           // expose so AppController can pre-warm
@@ -2437,6 +2456,33 @@ const ProtocolClient = (() => {
   let autoReconnect = false;
   let isIntentionalClose = false;
 
+  // ── Channel liveness watchdog (mirrors Protocol::IsTimeout in the
+  // ESP32 firmware, protocol.cc: the device treats a server that sends
+  // nothing as a dead channel) ────────────────────────────────────────
+  // The server can kill our connection without a Close frame ever
+  // reaching the browser (an LB-level idle drop leaves the proxy's
+  // upstream leg half-closed), so the client cannot trust readyState
+  // alone: it must notice the silence itself.
+  //
+  // Idle rule: no incoming frame at all for 150s → dead (just under the
+  // server's own no-voice close, ~180s in the reference server).
+  //
+  // Speaking rule: the server never talks OVER the user — VAD only
+  // produces a response AFTER an utterance ends. So "silence while the
+  // mic is audible" is normal, and the dead-channel signature is: the
+  // user finished an utterance and the server said NOTHING since before
+  // that utterance began. Detection: "no response within 30s after
+  // speech ended, with zero server frames since speech started".
+  const SERVER_SILENCE_IDLE_MS = 150000;
+  const SERVER_SPEECH_RESPONSE_MS = 30000;
+  // Quiet gap after which new mic activity counts as a new utterance.
+  const SERVER_SPEECH_GAP_MS = 10000;
+  const SERVER_WATCHDOG_INTERVAL_MS = 5000;
+  let lastServerActivityAt = 0;
+  let serverWatchdogTimerId = null;
+  let speechStartedAt = 0;
+  let lastAudibleAt = 0;
+
   // Callbacks
   const callbacks = {
     onConnected:    null,
@@ -2509,6 +2555,8 @@ const ProtocolClient = (() => {
     Logger.auth(`[${assistantId.slice(0,8)}] Using token: ${s.token === 'test-token' ? 'test-token (Xiaozhi cloud token)' : '***' + s.token.slice(-8)}`);
 
     isIntentionalClose = false;
+    stopServerWatchdog();
+    lastServerActivityAt = Date.now();
     deviceEmulator.setState(deviceEmulator.STATES.CONNECTING);
 
     Logger.ws(`Connecting to: ${s.wsUrl}`);
@@ -2586,6 +2634,9 @@ const ProtocolClient = (() => {
 
   /** Handle incoming WebSocket messages */
   function handleMessage(event) {
+    // Any frame — JSON or binary audio — proves the channel is alive.
+    lastServerActivityAt = Date.now();
+
     if (event.data instanceof ArrayBuffer) {
       // Binary message = Opus audio from server
       handleBinaryMessage(event.data);
@@ -2698,6 +2749,9 @@ const ProtocolClient = (() => {
     helloReceived = true;
     sessionId = msg.session_id || '';
     reconnectAttempts = 0;
+    // Channel is live — start tracking server silence from now.
+    lastServerActivityAt = Date.now();
+    startServerWatchdog();
 
     Logger.ws(`Server hello received. Session: ${sessionId}`);
     Logger.auth(`Server audio params: ${JSON.stringify(msg.audio_params || {})}`);
@@ -3061,6 +3115,7 @@ const ProtocolClient = (() => {
       helloTimeoutId = null;
     }
 
+    stopServerWatchdog();
     helloReceived = false;
     deviceEmulator.setState(deviceEmulator.STATES.IDLE);
 
@@ -3092,6 +3147,7 @@ const ProtocolClient = (() => {
     isIntentionalClose = true;
     helloReceived = false;
     sessionId = '';
+    stopServerWatchdog();
     if (ws) {
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close(1000, 'User disconnect');
@@ -3102,10 +3158,88 @@ const ProtocolClient = (() => {
   }
 
   function forceClose() {
+    stopServerWatchdog();
     if (ws) {
+      // Detach handlers before closing: a locally initiated close is not
+      // answered by the proxy's half-open local leg, so the close event
+      // may fire much later (or with 1006) — we already handled this
+      // connection's teardown and must ignore that late echo.
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
       ws.close();
       ws = null;
     }
+  }
+
+  // ── Channel liveness watchdog ────────────────────────────────────
+
+  function startServerWatchdog() {
+    stopServerWatchdog();
+    lastAudibleAt = 0;
+    speechStartedAt = 0;
+    serverWatchdogTimerId = setInterval(checkServerWatchdog, SERVER_WATCHDOG_INTERVAL_MS);
+  }
+
+  function stopServerWatchdog() {
+    if (serverWatchdogTimerId) {
+      clearInterval(serverWatchdogTimerId);
+      serverWatchdogTimerId = null;
+    }
+  }
+
+  function checkServerWatchdog() {
+    if (!helloReceived || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+
+    // The mic is a single shared resource that only ever captures for
+    // the ACTIVE assistant — a background session must never be judged
+    // by audio that belongs to a different assistant's connection.
+    const audibleNow = isActive() && AudioEngine.isCapturing() && AudioEngine.isInputAudible();
+
+    if (audibleNow) {
+      if (!lastAudibleAt || now - lastAudibleAt > SERVER_SPEECH_GAP_MS) {
+        speechStartedAt = now;
+      }
+      lastAudibleAt = now;
+      return; // mid-utterance: server silence is normal until VAD cuts
+    }
+
+    if (lastAudibleAt) {
+      // An utterance was seen (at watchdog sampling cadence — bursts
+      // shorter than one tick may fall through to the idle rule). Give
+      // the server time to answer it once speech ends (stt/llm/tts)…
+      if (now - lastAudibleAt < SERVER_SPEECH_RESPONSE_MS) return;
+      // …then, if it said NOTHING since the utterance began, the user
+      // has been talking into a dead channel.
+      if (lastServerActivityAt < speechStartedAt) {
+        declareChannelDead(now - lastServerActivityAt, SERVER_SPEECH_RESPONSE_MS);
+        return;
+      }
+    }
+
+    const silentForMs = now - lastServerActivityAt;
+    if (silentForMs >= SERVER_SILENCE_IDLE_MS) {
+      declareChannelDead(silentForMs, SERVER_SILENCE_IDLE_MS);
+    }
+  }
+
+  /** Treat the connection as dead without waiting for a close event that
+   *  may never arrive (that is exactly the failure mode this watchdog
+   *  exists for). Notifies onDisconnected directly — forceClose() detaches
+   *  ws.onclose, so the normal handleClose pipeline intentionally does
+   *  not run here. That also bypasses handleClose's auto-reconnect
+   *  branch — deliberate: reconnect-after-timeout is intentionally not
+   *  wired anywhere (mirrors the firmware, which returns to idle and
+   *  waits for the user to start the next interaction). */
+  function declareChannelDead(silentForMs, limitMs) {
+    Logger.error(`No data from server for ${Math.round(silentForMs / 1000)}s (limit ${Math.round(limitMs / 1000)}s) — closing dead audio channel`);
+    stopServerWatchdog();
+    sessionId = '';
+    helloReceived = false;
+    deviceEmulator.setState(deviceEmulator.STATES.IDLE, 'server silent');
+    forceClose();
+    // wasClean=false: a watchdog-declared dead channel must never satisfy
+    // a downstream reconnect/standby path that accepts clean 1000 closes.
+    if (callbacks.onDisconnected) callbacks.onDisconnected(1000, 'Server activity timeout', false);
   }
 
   /** Send a JSON text message */
@@ -3217,7 +3351,10 @@ const ProtocolClient = (() => {
     };
     Logger.proto('→ abort', msg);
     deviceEmulator.setState(deviceEmulator.STATES.IDLE);
-    AudioEngine.clearTTSQueue();
+    // The TTS queue is a shared resource that only ever holds the ACTIVE
+    // assistant's playback — clearing it from a background session would
+    // cut off whoever is on screen mid-sentence.
+    if (isActive()) AudioEngine.clearTTSQueue();
     return sendText(msg);
   }
 
@@ -3486,11 +3623,20 @@ const ChatEngine = (() => {
       return false;
     }
 
+    // The connection may have died while getUserMedia/encoder were
+    // loading (the awaits above): stop immediately so a late-starting
+    // mic never outlives the teardown that already ran for the close.
+    if (!protocol.isConnected()) {
+      AudioEngine.stopCapture();
+      showToast('Not connected to server', 'error');
+      return false;
+    }
+
     // 2. Capture is live — NOW tell server to start accepting audio
     protocol.sendListenStart(mode);
 
     // Show audio meter
-    document.getElementById('audioMeterSection').style.display = 'block';
+    UIController.showAudioMeter();
 
     Logger.chat(`Voice input started — streaming Opus @ ${AudioEngine.INPUT_SAMPLE_RATE}Hz`);
     return true;
@@ -3498,7 +3644,7 @@ const ChatEngine = (() => {
 
   function stopVoiceInput() {
     AudioEngine.stopCapture();
-    document.getElementById('audioMeterSection').style.display = 'none';
+    UIController.hideAudioMeter();
     protocol.sendListenStop();
     Logger.chat('Voice input stopped');
   }
@@ -3959,6 +4105,23 @@ const SessionManager = (() => {
     });
   }
 
+  /** Full local audio/UI teardown for a session whose connection just
+   *  ended — whether the user clicked Disconnect or the server closed on
+   *  us (idle timeout, dropped socket, auth rejection). SSOT for: stop mic
+   *  capture (and with it the Opus encoder), reset the mic toggle button,
+   *  hide the level meter, drop queued TTS, and clear the typing
+   *  indicator. Mic capture and TTS playback only ever run for the ACTIVE
+   *  assistant (single shared hardware resource), so everything here is a
+   *  no-op unless the disconnecting session is the one on screen. */
+  function teardownSessionAudio(session) {
+    if (!isActiveId(session.assistantId)) return;
+    AudioEngine.stopCapture();
+    AudioEngine.clearTTSQueue();
+    UIController.hideTypingIndicator();
+    UIController.updateMicButtonState(false);
+    UIController.hideAudioMeter();
+  }
+
   /** ProtocolClient events -> persisted status/session-id + (if active) UI/chat */
   function wireProtocolCallbacks(session) {
     const { assistantId, deviceEmulator, protocol, chat } = session;
@@ -3980,11 +4143,16 @@ const SessionManager = (() => {
     protocol.on('disconnected', (code, reason) => {
       Logger.ws(`[${assistantId.slice(0, 8)}] Disconnected: ${code} ${reason}`);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
-      AudioEngine.clearTTSQueue();
+      // Same local state as a user-initiated disconnect: mic, encoder,
+      // meter, mic button and TTS all stop. Previously the mic kept
+      // capturing and encoding Opus into a dead socket ("talking into
+      // the void"). clearTTSQueue() is now active-gated too, so a
+      // background session closing can no longer cut off the active
+      // assistant's playback.
+      teardownSessionAudio(session);
       if (isActiveId(assistantId)) {
         UIController.setConnectionState('disconnected');
         UIController.updateSessionId('');
-        UIController.hideTypingIndicator();
         if (!reason || reason === 'User disconnect') {
           UIController.addSystemMessage('Disconnected from server.', 'fa-plug-circle-xmark');
         } else {
@@ -3997,9 +4165,12 @@ const SessionManager = (() => {
     protocol.on('error', (message) => {
       Logger.error(`[${assistantId.slice(0, 8)}] Protocol error`, message);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
+      // handleClose's auth-failure branch returns early WITHOUT firing
+      // onDisconnected, so this is the only teardown hook for that path —
+      // without it an auth-rejected close would leave the mic capturing.
+      teardownSessionAudio(session);
       if (isActiveId(assistantId)) {
         UIController.setConnectionState('disconnected');
-        UIController.hideTypingIndicator();
         showToast(message, 'error', 'Connection Error');
         UIController.addSystemMessage(`Error: ${message}`, 'fa-circle-exclamation');
       }
@@ -4240,11 +4411,8 @@ const SessionManager = (() => {
     session.deviceEmulator.setState(session.deviceEmulator.STATES.IDLE, 'user disconnect');
     AssistantManager.setConnectionStatus(id, 'disconnected');
 
+    teardownSessionAudio(session);
     if (isActiveId(id)) {
-      AudioEngine.stopCapture();
-      AudioEngine.clearTTSQueue();
-      UIController.hideTypingIndicator();
-      UIController.updateMicButtonState(false);
       UIController.setConnectionState('disconnected');
     }
     Logger.ws(`[${id.slice(0, 8)}] User disconnected`);
@@ -4270,6 +4438,10 @@ const SessionManager = (() => {
     const session = sessions.get(id);
     if (session) {
       try {
+        // Teardown BEFORE the session/activeId go away — the async close
+        // event lands after activeId is re-pointed, so its own teardown
+        // would no-op and an active capturing mic would keep running.
+        teardownSessionAudio(session);
         session.protocol.disconnect();
       } catch (e) { /* already disconnected */ }
       sessions.delete(id);
@@ -4592,6 +4764,19 @@ const UIController = (() => {
       icon.className = 'fas fa-microphone';
       micToggled = false;
     }
+  }
+
+  /** Show/hide the audio level meter section. Shared by voice input
+   *  start/stop AND by connection teardown — the meter must never outlive
+   *  the mic capture that feeds it. */
+  function showAudioMeter() {
+    const section = el('audioMeterSection');
+    if (section) section.style.display = 'block';
+  }
+
+  function hideAudioMeter() {
+    const section = el('audioMeterSection');
+    if (section) section.style.display = 'none';
   }
 
   function handleInputKeydown(e) {
@@ -5429,6 +5614,8 @@ const UIController = (() => {
     addSystemMessage,
     hideLoadingOverlay,
     updateMicButtonState,
+    showAudioMeter,
+    hideAudioMeter,
     showPairingModal,
     hidePairingModal,
     updatePairingStatus,
