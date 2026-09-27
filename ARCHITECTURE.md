@@ -22,6 +22,7 @@ omitted.
 - [Pairing Workflow](#pairing-workflow)
 - [WebSocket Communication](#websocket-communication)
 - [Audio Pipeline](#audio-pipeline)
+- [Wake Word System](#wake-word-system)
 - [Avatar System](#avatar-system)
 - [Theme System](#theme-system)
 - [Storage](#storage)
@@ -326,6 +327,75 @@ every time the active assistant changes.
 
 ---
 
+## Wake Word System
+
+When the Xiaozhi server closes a live **auto-mode** session with its
+inactivity goodbye, `WakeWordSystem` keeps the microphone running locally
+and listens for a wake word, so the user can reconnect by voice instead of
+pressing connect. It plays the role the ESP32 firmware's on-device WakeNet
+plays on hardware, using a WebAssembly build of sherpa-onnx's KWS
+keyword-spotting engine (`public/static/wake/`, loaded lazily). All
+detection is local — no audio leaves the browser until the session is
+re-established.
+
+Three modules cooperate, following the storage-layer/logic-layer split used
+by the avatar and volume features:
+
+```
+WakeWordStorage (localStorage layer, per assistant)
+  ├─ load(assistantId) → { enabled, presets[], custom, threshold }
+  ├─ save(assistantId, cfg) / remove(assistantId)
+  └─ key: olivia_wakeword_v1_<id>   (removed with the assistant)
+
+SherpaKwsEngine (engine adapter — lazy emscripten/wasm load)
+  ├─ start(keywords, threshold, onKeyword) / stop() / feedPcm()
+  ├─ detectOffline(samples, keywords, threshold)  → console self-test path
+  └─ keywords are runtime text (phones/pinyin + '@DISPLAY'), no rebuild
+
+WakeWordSystem (logic layer — state machine, audio routing, reconnect)
+  ├─ maybeArm(ctx)                    → INACTIVE → LOADING → ARMED
+  ├─ onKeyword(word)                  → TRIGGERED → reconnect → INACTIVE
+  └─ disarm(reason) / rearmKeywords() → back to INACTIVE / hot engine swap
+```
+
+**State machine:** `INACTIVE → LOADING → ARMED → TRIGGERED`. `LOADING`
+covers the engine's first (wasm) load after arming; detection callbacks are
+ignored outside `ARMED`, so a late callback can never fire a stale standby.
+`rearmKeywords()` rebuilds the engine in place when settings are saved
+mid-standby, without touching the microphone or the ring buffer.
+
+**Arm rule:** `ProtocolClient`'s `disconnected` event calls
+`WakeWordSystem.maybeArm()`, which arms only when *all* hold: the server
+initiated a clean close (code 1000/1001, `wasClean`, not an intentional
+local disconnect), the session was auto-mode with the mic capturing, the
+assistant is the active one, and at least one wake word is configured. Any
+other close falls through to the normal disconnected path. Manual connect,
+disconnect, or mic-off actions disarm; a revoked mic track
+(`track.addEventListener('ended')`) disarms too, so standby can never
+outlive the microphone.
+
+**Audio routing via the capture sinks:** the shared capture pipeline always
+produces raw 16 kHz blocks; two `AudioEngine` sinks decide where they go.
+On arm, `setOpusFrameSink(null)` drops encoded packets (there is no session
+to send them to) and `setRawBlockSink(onRawBlock)` feeds every raw block to
+both the ring buffer and `SherpaKwsEngine.feedPcm()`. On resume the sinks
+are swapped back — raw tap off, opus sink to `protocol.sendAudio()`.
+
+**Ring buffer + flush:** during standby a 4-second `Float32Array` ring
+buffer (256 KB @ 16 kHz) accumulates the raw blocks, with a monotonic
+sample counter timestamping the detection. After the session is genuinely
+re-established (open WebSocket *and* server hello — polled, with one
+retry), the buffer slice starting 200 ms *before* detection is encoded and
+sent first, then live capture resumes — so the wake word itself is not
+replayed but the user's immediately following words are never lost. A
+short two-tone chime (`public/static/wake-chime.ogg`) marks the trigger.
+
+Per-assistant settings persist under `olivia_wakeword_v1_<id>` (see
+[Storage](#storage)); the presets' token lines and the engine build recipe
+live in README's [Wake Word Resume](./README.md#wake-word-resume) section.
+
+---
+
 ## Avatar System
 
 `AvatarStorage` (persistence) and `AvatarSystem` (UI + logic) provide a
@@ -414,9 +484,11 @@ traffic (WebSocket, OTA, vision) that a physical ESP32 would also send.
 | `olivia_theme_preference` | Manual theme override (`'light'` or `'dark'`); absent when following the system preference |
 | `olivia_avatar_v1_<assistantId>` | That assistant's custom avatar, as a 256×256 JPEG data URL |
 | `olivia_volume_v1_<assistantId>` | That assistant's saved local speech volume, `0`–`1` |
+| `olivia_wakeword_v1_<assistantId>` | That assistant's wake word settings: enabled flag, selected presets, custom keyword, sensitivity threshold |
 | `olivia_last_backup_ts` | ISO 8601 timestamp of the most recent successful export; written by `BackupStorage.save()` |
 
-Deleting an assistant removes its avatar and volume keys automatically.
+Deleting an assistant removes its avatar, volume, and wake word keys
+automatically.
 `olivia_assistants_v1` and `olivia_theme_preference` are the only two keys
 that persist independently of any single assistant's lifecycle.
 
@@ -587,6 +659,9 @@ olivia/
 | `ThemeManager` | Global light/dark theme preference and toggle |
 | `AvatarStorage` / `AvatarSystem` | Per-assistant avatar persistence and UI |
 | `VolumeStorage` / `VolumeSystem` | Per-assistant local speech volume persistence, UI, and natural-language command interception |
+| `WakeWordStorage` | Per-assistant wake word settings persistence (own `olivia_wakeword_v1_<id>` namespace) |
+| `SherpaKwsEngine` | sherpa-onnx KWS keyword-spotting engine adapter — lazy wasm load, PCM feed, offline detection |
+| `WakeWordSystem` | Wake word standby after a server-initiated goodbye: arm/disarm state machine, ring buffer, reconnect with buffered replay |
 | `UIController` | All DOM rendering: sidebar, settings panel, pairing overlay, tabs, responsive layout, toasts |
 | `ImageInput` | Camera viewfinder, gallery picker, pending image blob management |
 | `AppController` | Application entry point; boot sequence; connect/disconnect orchestration |

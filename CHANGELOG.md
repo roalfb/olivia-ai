@@ -10,11 +10,32 @@ the current architecture, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Table of Contents
 
+- [Unreleased](#unreleased)
 - [v2.2 — Settings, Backup & Restore](#v22--settings-backup--restore)
 - [v2.1 — Official Branding & Documentation](#v21--official-branding--documentation)
 - [v2.0 — Multi-Assistant Platform](#v20--multi-assistant-platform)
 - [v1.1 — Bug Fixes & Cloudflare Deployment](#v11--bug-fixes--cloudflare-deployment)
 - [v1.0 — Initial Release](#v10--initial-release)
+
+---
+
+## Unreleased
+
+### Added
+
+- **Wake word resume** — when the Xiaozhi server closes an auto-mode
+  session for inactivity, Olivia can now keep the microphone open locally
+  and listen for a wake word instead of dropping the connection. Saying
+  the wake word plays a chime, reconnects the session automatically, and
+  sends the speech buffered during standby first — up to 4 seconds of it,
+  starting just before the trigger so the wake phrase itself is not
+  replayed — so the conversation continues without losing your first
+  words. Four built-in wake words ("Hey Olivia", "Hi ESP",
+  "Hey Jarvis", 你好小智) plus custom English keywords; a
+  sensitivity slider tunes false accepts vs. misses, and a Test button in
+  Settings verifies recognition live. Detection runs on a WebAssembly
+  build of sherpa-onnx entirely inside the browser — no audio leaves it
+  until the session reconnects. Per assistant, under Settings → Wake Word.
 
 ---
 

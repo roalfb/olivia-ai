@@ -161,11 +161,19 @@ app.get('/api/ws', async (c) => {
     pending.length = 0
   }
 
+  /** Close codes that may legally be SENT in an outgoing close frame.
+   *  The WHATWG close() accepts only 1000 and 3000–4999 — anything else
+   *  (1001 going-away on page unload, 1005/1006/1015 abnormal close)
+   *  throws SyntaxError, which the catch below would swallow, skipping
+   *  the handshake entirely. */
+  const sendableCloseCode = (code: number) =>
+    code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000
+
   const closeLocal = (code = 1011, reason = 'Upstream connection closed') => {
     if (localClosed) return
     localClosed = true
     try {
-      localSocket.close(code, reason)
+      localSocket.close(sendableCloseCode(code), reason)
     } catch {
       /* already closed */
     }
@@ -175,7 +183,7 @@ app.get('/api/ws', async (c) => {
     if (upstreamClosed || !upstream) return
     upstreamClosed = true
     try {
-      upstream.close(code, reason)
+      upstream.close(sendableCloseCode(code), reason)
     } catch {
       /* already closed */
     }
@@ -195,7 +203,14 @@ app.get('/api/ws', async (c) => {
   })
 
   localSocket.addEventListener('close', (event) => {
-    closeUpstream(event.code || 1000, event.reason || 'Client disconnected')
+    // Complete BOTH legs: forward the close upstream, and mirror the
+    // browser's close frame back at it — with allowHalfOpen our side
+    // stays in CLOSING until we call close(), and without the mirror
+    // the browser socket hangs half-closed with no close event.
+    const code = event.code || 1000
+    const reason = event.reason || 'Client disconnected'
+    closeUpstream(code, reason)
+    closeLocal(code, reason)
   })
 
   ;(async () => {
@@ -230,6 +245,14 @@ app.get('/api/ws', async (c) => {
       // allowHalfOpen: true — coordinate close frames independently on both sides
       upstream.accept({ allowHalfOpen: true })
 
+      // The browser may have closed while the upstream fetch was in
+      // flight — nothing left to proxy, drop the fresh upstream socket
+      // instead of wiring it into a dead connection.
+      if (localClosed) {
+        closeUpstream(1000, 'Client disconnected')
+        return
+      }
+
       await flushPending()
 
       upstream.addEventListener('message', async (event) => {
@@ -243,10 +266,20 @@ app.get('/api/ws', async (c) => {
       })
 
       upstream.addEventListener('close', (event) => {
-        closeLocal(event.code || 1000, event.reason || 'Upstream closed')
+        // Complete the close handshake on BOTH legs. With allowHalfOpen the
+        // runtime leaves our ends in CLOSING until we call close() ourselves
+        // — skipping it parks the sockets in CLOSE_WAIT forever after the
+        // server hangs up.
+        const code = event.code || 1000
+        const reason = event.reason || 'Upstream closed'
+        closeUpstream(code, reason)
+        closeLocal(code, reason)
       })
 
       upstream.addEventListener('error', (event) => {
+        // An error may not be followed by a close event — complete both
+        // handshakes ourselves (idempotent via the closed flags).
+        closeUpstream()
         closeLocal(1011, 'Upstream WebSocket error')
       })
     } catch (err: unknown) {
@@ -724,6 +757,55 @@ app.get('/', (c) => {
             <option value="manual">Manual</option>
             <option value="realtime">Realtime</option>
           </select>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>Wake Word</h3>
+        <div id="wakeWordSection">
+          <div class="form-group">
+            <label for="wakeWordEnabledInput">Wake word resume</label>
+            <select id="wakeWordEnabledInput">
+              <option value="off" selected>Off</option>
+              <option value="on">On (auto listening only)</option>
+            </select>
+            <div id="wakeWordAutoHint" class="settings-hint">
+              Only applies when Listening Mode is Auto.
+            </div>
+          </div>
+          <div class="form-group" id="wakeWordKeywordsGroup">
+            <label>Wake words</label>
+            <!-- Preset checkboxes render dynamically from app.js
+                 (WAKE_PRESETS) into this empty container. -->
+            <div id="wakeWordPresetBox"></div>
+            <div id="wakeWordCustomList"></div>
+            <div class="wake-add-row">
+              <input type="text" id="wakeWordCustomInput"
+                     placeholder="Custom words, e.g. HEY KITTY" />
+              <button type="button" id="wakeWordAddBtn" class="btn-secondary">Add</button>
+            </div>
+            <div class="settings-hint">
+              English sounds only — type it as it sounds in English
+              letters; accents, ñ and digits are not covered (up to 10
+              phrases). Encoding format:
+              <a href="https://k2-fsa.github.io/sherpa/onnx/kws/index.html"
+                 target="_blank" rel="noopener">sherpa-onnx keyword docs</a>.
+            </div>
+            <div id="wakeWordCustomPreview" class="settings-hint" hidden></div>
+            <div id="wakeWordCustomError" class="settings-error" hidden></div>
+          </div>
+          <div class="form-group">
+            <label for="wakeWordThresholdInput">Sensitivity</label>
+            <input type="range" id="wakeWordThresholdInput"
+                   min="0.10" max="0.50" step="0.05" />
+            <span id="wakeWordThresholdValue">0.25</span>
+          </div>
+          <div class="form-group">
+            <button type="button" id="wakeWordTestBtn" class="btn-secondary btn-block">
+              Test wake word
+            </button>
+            <div id="wakeWordStatus" class="settings-hint"></div>
+          </div>
         </div>
       </div>
 

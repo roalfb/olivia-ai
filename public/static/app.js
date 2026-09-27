@@ -892,6 +892,656 @@ const VolumeSystem = (() => {
 })();
 
 // ================================================================
+// Pre-tokenized wake word presets. Token lines follow the sherpa-onnx KWS
+// keywords format for the GigaSpeech English model: sentencepiece BPE
+// pieces, then '@' + display form (no spaces; use '_'). Regenerate with
+// the command documented in README → "Wake word engine build". "Hello
+// Olivia" is the only shipped preset — the one verified end to end
+// against real speech; everything else belongs to per-user custom
+// phrases.
+const WAKE_PRESETS = [
+  { id: 'hello_olivia', label: 'Hello Olivia',
+    tokens: '▁HE LL O ▁O LI VI A @HELLO_OLIVIA' },
+];
+
+// WAKE WORD STORAGE (per-assistant, own localStorage namespace)
+// ================================================================
+const WakeWordStorage = (() => {
+  const KEY_PREFIX = 'olivia_wakeword_v1_';
+  const DEFAULTS = { enabled: false, presets: ['hello_olivia'], customs: [], threshold: 0.25 };
+
+  // Records written before multi-phrase support stored a single `custom`
+  // object — fold it into the `customs` list and pin the record shape.
+  // Preset ids that no longer exist in WAKE_PRESETS are pruned so a
+  // stale selection can never yield an empty keywords file; the preset
+  // itself was re-worded from "Hey" to "Hello", so that id is remapped.
+  function normalize(cfg) {
+    const customs = Array.isArray(cfg.customs)
+      ? cfg.customs.filter(c => c && c.tokens && c.display) : [];
+    if (cfg.custom && cfg.custom.tokens && cfg.custom.display &&
+        !customs.some(c => c.tokens === cfg.custom.tokens)) {
+      customs.push(cfg.custom);
+    }
+    return {
+      enabled: !!cfg.enabled,
+      presets: Array.isArray(cfg.presets)
+        ? cfg.presets
+            .map(id => (id === 'hey_olivia' ? 'hello_olivia' : id))
+            .filter(id => WAKE_PRESETS.some(p => p.id === id))
+        : [],
+      customs,
+      threshold: typeof cfg.threshold === 'number' ? cfg.threshold : 0.25,
+    };
+  }
+
+  function load(assistantId) {
+    try {
+      const raw = localStorage.getItem(KEY_PREFIX + assistantId);
+      if (!raw) return { ...DEFAULTS, customs: [] };
+      return normalize({ ...DEFAULTS, ...JSON.parse(raw) });
+    } catch (e) {
+      Logger.warn('WakeWordStorage: corrupt record, returning defaults');
+      return { ...DEFAULTS, customs: [] };
+    }
+  }
+
+  function save(assistantId, cfg) {
+    localStorage.setItem(KEY_PREFIX + assistantId, JSON.stringify(cfg));
+  }
+
+  function remove(assistantId) {
+    localStorage.removeItem(KEY_PREFIX + assistantId);
+  }
+
+  return { load, save, remove };
+})();
+
+// Sentencepiece BPE vocabulary of the GigaSpeech model (500 pieces, special
+// tokens removed), longest first so greedy longest-match segmentation equals
+// the reference tokenizer on real words. Used to turn custom wake words into
+// keyword token lines without needing the engine or a lexicon file.
+const WAKE_BPE_PIECES = (  '▁UNDERSTAND ▁EVERYTHING ▁SOMETHING ▁DIFFERENT ▁IMPORTANT ▁ACTUALLY ▁QUESTION ▁INTEREST '
+  + '▁THOUSAND ▁ANYTHING ▁TOGETHER ▁BECAUSE ▁THROUGH ▁ANOTHER ▁COMMUNI ▁AMERICA ▁HUNDRED '
+  + '▁WITHOUT ▁BELIEVE ▁BETWEEN ▁PROBLEM ▁NOTHING ▁PEOPLE ▁REALLY ▁LITTLE ▁THINGS ▁THOUGH '
+  + '▁SHOULD ▁BEFORE ▁HAPPEN ▁PERSON ▁AROUND ▁CHANGE ▁ALWAYS ▁SCHOOL ▁FRIEND ▁BETTER ▁TWENTY '
+  + '▁NUMBER ▁COURSE ▁SYSTEM ▁HAVING ▁SECOND ▁PUBLIC ▁HEALTH ▁THERE ▁ABOUT ▁THINK ▁WOULD ▁WHICH '
+  + '▁THEIR ▁OTHER ▁GOING ▁RIGHT ▁COULD ▁THESE ▁WHERE ▁THOSE ▁FIRST ▁AGAIN ▁AFTER ▁EVERY ▁GREAT '
+  + '▁THING ▁START ▁THREE ▁WORLD ▁NEVER ▁THANK ▁STATE ▁STILL ▁PLACE ▁MIGHT ▁COUNT ▁POINT ▁UNDER '
+  + '▁FOUND ▁LEARN ▁HOUSE ▁WHILE ▁POWER ▁MAYBE ▁BUILD ▁MONEY ▁GONNA ▁WHITE ▁SPEAK ▁BLACK ▁THAT '
+  + '▁THIS ▁WITH ▁HAVE ▁THEY ATION ▁WHAT ▁LIKE ▁FROM ▁YOUR ▁KNOW ▁JUST ▁WHEN ▁SOME ▁WERE ▁MORE '
+  + '▁TIME ▁WILL ▁SAID ▁VERY ▁THEM ▁BEEN ▁WANT ▁LOOK ▁WORK ▁INTO ▁THEN ▁HERE ▁OVER ▁WELL ▁COMP '
+  + '▁EVEN ▁MAKE ▁BACK ▁YEAR ▁ALSO CTION ▁GOOD ▁TAKE ▁COME ▁MUCH ▁THAN ▁PART ▁MEAN ▁DOWN ▁NEED '
+  + '▁TALK ▁CALL ▁KIND ▁ONLY ▁DOES ▁MOST ▁LIFE ▁MANY ▁FEEL ITION ▁GIVE ▁LONG ▁SHOW ▁LOVE ▁HELP '
+  + '▁MADE ▁HAND ▁TELL ▁CAME ▁FIND ▁HIGH ▁LAST ▁SAME ▁FOUR ▁HOME ATIVE ▁TURN ▁YEAH ▁NEXT ▁WORD '
+  + '▁BOOK ▁PLAY ▁AWAY ▁PLAN ▁KEEP ▁IDEA ▁HARD ▁WEEK ▁OKAY PRESS ▁NINE ▁LEFT ▁THE ▁AND ▁YOU '
+  + '▁FOR ▁WAS ▁BUT ▁NOT ▁ARE ▁CAN ▁ALL ▁CON ▁HIS ▁ONE ▁SHE ▁HAD MENT ▁WHO ▁OUT ▁HER ▁PRO IGHT '
+  + '▁SEE ▁OUR ▁HOW ▁GET ▁DON ▁NOW ▁SAY TION THER ▁HAS ABLE ▁DID ▁HIM ▁DIS ▁PRE ENCE ALLY ▁WAY '
+  + '▁ANY ▁COM ▁TWO ▁TRA ▁CHA ANCE ▁NEW ICAL ▁MAR ▁MAN SIDE ▁APP ▁PER ▁STA ▁LET ATED ▁SHA ▁DAY '
+  + '▁CHI ▁GRA ▁MIN ▁GOT ▁COL ▁LOT IOUS NESS ▁WHY PORT FORM ▁PUT ▁OWN WARD IBLE ▁TEA ▁IMP ▁OLD '
+  + 'SHIP ▁YES LAND LINE ▁SIX ▁TO ING ▁OF ▁IN ▁IT ▁IS ▁RE ▁WE ▁SO ▁BE ▁HE ▁ON ▁ME ▁DO ▁DE ENT '
+  + '▁AS TER ▁ST ▁OR ▁AT ▁MO ▁AN ▁MA ▁SU ▁MY ▁SE VER ▁CA ▁IF ▁NO ▁PA ION ▁UP ▁US ▁GO ▁EX ▁PO '
+  + '▁FA ATE ▁BY ▁LA ▁CO ▁LE ▁LI ▁BO ▁HO URE ▁MI IES ▁UN ▁FI IVE ITY ▁HA ▁RO IST AGE ▁RA ERS '
+  + '▁LO ▁SP ▁DA ▁EN EST ACT ▁BA ▁WA ▁SA ▁VI ▁DR ▁DI ▁FE TED ▁NA ▁TH ▁JO ▁QU MAN PER ▁HU ▁MU '
+  + 'FUL ARD ANT END ▁NE DER ONE ▁BI UGH ISH TIC ▁GA ▁GU LES ▁RU ROW AIN ▁BU ▁TA IAN ▁RI DAY '
+  + 'OUS IZE BER ▁VA ▁PI ▁HI ▁MR ▁PH ▁DU ▁JA ▁OH ▁JE ▁JU ▁A ▁I ED RE ▁S AL ER ▁C OR AR IN LE LY '
+  + '▁E ▁F VE RI CH LL ▁T EN IT CE ▁B ▁W ▁P UR ON IC TE ES RA TH RO IL AN SE LI ▁G NE NG LA LO '
+  + 'CK AD IR EL ▁O RY UN ME ND CI AT PE AS GE ▁K VI DE OM CO ET UL IG IS US TY RU LU HO OL MA '
+  + 'KE ID TI IM FF TA MO OW HE SH QU CA UM DI IF PP PO HA IA VO PH IV S T N E D \' Y M ▁ O C R '
+  + 'A P U G L B I F K W V H - Z X J Q ').split(' ');
+
+
+
+// ================================================================
+// SHERPA-ONNX KWS ENGINE — WakeWordEngine implementation
+// Loads the emscripten module lazily from static/wake/ and feeds it
+// 16 kHz mono PCM from the capture pipeline. Keywords are runtime
+// text (sentencepiece BPE pieces + '@' display), so no rebuild is
+// needed to change them. Model files are preloaded inside the .data
+// archive (GigaSpeech English model, Apache-2.0).
+// ================================================================
+const SherpaKwsEngine = (() => {
+  const ASSET_BASE = '/static/wake/';  // same-origin; matches how app.js itself is served
+  const MODEL = {
+    encoder: './encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+    decoder: './decoder-epoch-12-avg-2-chunk-16-left-64.onnx',
+    joiner: './joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+    tokens: './tokens.txt',
+  };
+
+  // Minimal WebAssembly SIMD probe module (magic + one v128 op).
+  const SIMD_PROBE = new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10,
+    1, 8, 0, 65, 0, 253, 15, 253, 98, 11,
+  ]);
+
+  let module = null;        // emscripten Module (after init)
+  let kws = null;           // Kws instance
+  let stream = null;
+  let keywordCb = null;
+  let loadPromise = null;
+
+  function isSupported() {
+    return typeof WebAssembly === 'object' && WebAssembly.validate(SIMD_PROBE);
+  }
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Failed to load ' + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  function load() {
+    if (module) return Promise.resolve();
+    if (loadPromise) return loadPromise;
+    if (!isSupported()) return Promise.reject(new Error('Browser lacks WebAssembly SIMD'));
+    loadPromise = loadScript(ASSET_BASE + 'sherpa-onnx-kws.js').then(() =>
+      new Promise((resolve, reject) => {
+        // The emscripten main script consumes a global Module config object.
+        window.Module = {
+          locateFile: (f) => ASSET_BASE + f,
+          onRuntimeInitialized: () => resolve(),
+          onAbort: () => reject(new Error('Wake engine aborted during init')),
+        };
+        loadScript(ASSET_BASE + 'sherpa-onnx-wasm-kws-main.js').catch(reject);
+      })
+    ).then(() => {
+      module = window.Module;
+      // window.Module must stay on window: this non-modularized emscripten
+      // build keeps referencing the global Module from its JS syscalls
+      // (e.g. file open during model load), even after runtime init.
+      Logger.info('Wake word engine ready (sherpa-onnx KWS wasm)');
+    });
+    return loadPromise;
+  }
+
+  // A keyword line referencing a token that is not in the model vocabulary
+  // makes the wasm runtime terminate the whole page (EncodeBase fatal +
+  // exit(-1)) — it must never reach createKws. Stale localStorage from an
+  // older model generation is the realistic source of such lines, since
+  // save-time validation only sees what the panel submits.
+  function validateKeywords(keywords) {
+    const pieceSet = new Set(WAKE_BPE_PIECES);
+    const bad = [];
+    for (const line of keywords.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const at = trimmed.indexOf('@');
+      const tokens = (at >= 0 ? trimmed.slice(0, at) : trimmed).trim().split(/\s+/);
+      for (const t of tokens) {
+        if (t && !pieceSet.has(t)) bad.push(t);
+      }
+    }
+    if (bad.length) {
+      throw new Error(`keyword token(s) not in the model vocabulary: ${bad.join(', ')}`);
+    }
+  }
+
+  function start(keywords, threshold, onKeyword) {
+    return load().then(() => {
+      stop();
+      validateKeywords(keywords);
+      const config = {
+        featConfig: { samplingRate: 16000, featureDim: 80 },
+        modelConfig: {
+          transducer: {
+            encoder: MODEL.encoder, decoder: MODEL.decoder, joiner: MODEL.joiner,
+          },
+          tokens: MODEL.tokens, provider: 'cpu', numThreads: 1, debug: 0,
+          modelingUnit: 'bpe', bpeVocab: './bpe.vocab',
+        },
+        maxActivePaths: 4,
+        numTrailingBlanks: 1,
+        keywordsScore: 1.0,
+        keywordsThreshold: threshold,
+        keywords: keywords,
+      };
+      kws = createKws(module, config);
+      stream = kws.createStream();
+      keywordCb = onKeyword;
+      Logger.info(`Wake word engine started (threshold=${threshold})`);
+    });
+  }
+
+  function stop() {
+    if (stream) { stream.free(); stream = null; }
+    if (kws) { kws.free(); kws = null; }
+    keywordCb = null;
+  }
+
+  function isRunning() { return !!kws; }
+
+  function feedPcm(samples) {
+    if (!kws || !stream) return;
+    stream.acceptWaveform(16000, samples);
+    // The keyword callback may stop() the engine (the panel Test does),
+    // nulling kws mid-loop — re-check before every iteration.
+    while (kws && kws.isReady(stream)) {
+      kws.decode(stream);
+      const result = kws.getResult(stream);
+      if (result.keyword && result.keyword.length > 0) {
+        kws.reset(stream);
+        const cb = keywordCb;
+        if (cb) cb(result.keyword);
+      }
+    }
+  }
+
+  // Offline detection over decoded audio (16 kHz mono Float32) for the
+  // debug self-test — same code path as live detection.
+  function detectOffline(samples, keywords, threshold) {
+    return start(keywords, threshold, null).then(() => {
+      const hits = [];
+      const CHUNK = 4096;
+      for (let off = 0; off < samples.length; off += CHUNK) {
+        const block = samples.subarray(off, off + CHUNK);
+        stream.acceptWaveform(16000, block);
+        while (kws.isReady(stream)) {
+          kws.decode(stream);
+          const result = kws.getResult(stream);
+          if (result.keyword && result.keyword.length > 0) {
+            kws.reset(stream);
+            hits.push({ keyword: result.keyword, at: (off / 16000).toFixed(2) + 's' });
+          }
+        }
+      }
+      return hits;
+    });
+  }
+
+  return { isSupported, load, start, stop, isRunning, feedPcm, detectOffline };
+})();
+
+// ================================================================
+// WAKE WORD SYSTEM — post-goodbye standby and voice session resume
+// Mirrors the ESP32's on-device wake word (WakeNet) role: after the
+// server closes an auto-mode session for inactivity, the mic stays
+// open locally, a wake phrase reconnects the session, and buffered
+// speech flows on without losing the user's words.
+// ================================================================
+const WakeWordSystem = (() => {
+  const RING_SECONDS = 4;
+  const RING_SAMPLES = 16000 * RING_SECONDS;   // 4 s @ 16 kHz = 256 KB
+  const FLUSH_MARGIN_SAMPLES = 3200;           // 200 ms before detection
+  const MAX_RECONNECT_ATTEMPTS = 2;
+
+  let state = 'INACTIVE';                      // INACTIVE|LOADING|ARMED|TRIGGERED
+  let armedAssistantId = null;
+  let ring = null;                             // Float32Array(RING_SAMPLES)
+  let ringWrite = 0;                           // next write index (mod RING_SAMPLES)
+  let totalSamples = 0;                        // samples seen since arm
+  let detectionAt = -1;                        // totalSamples at detection
+  let keywordLabels = '';                      // for UI text
+
+  function getState() { return state; }
+
+  function keywordsString(cfg) {
+    const lines = WAKE_PRESETS
+      .filter(p => cfg.presets.includes(p.id))
+      .map(p => p.tokens);
+    for (const c of cfg.customs) lines.push(c.tokens);
+    return lines.join('\n');
+  }
+
+  function activeKeywordsLabel(cfg) {
+    const names = WAKE_PRESETS.filter(p => cfg.presets.includes(p.id)).map(p => p.label);
+    for (const c of cfg.customs) names.push(c.display.replace(/_/g, ' '));
+    return names.join(' / ');
+  }
+
+  function ringPush(block) {
+    for (let i = 0; i < block.length && ring; i++) {
+      ring[ringWrite] = block[i];
+      ringWrite = (ringWrite + 1) % RING_SAMPLES;
+    }
+    totalSamples += block.length;
+  }
+
+  // Ordered PCM from absolute sample index `from` to `totalSamples`.
+  function ringSlice(from) {
+    const len = Math.max(0, totalSamples - from);
+    const outLen = Math.min(len, RING_SAMPLES);
+    const out = new Float32Array(outLen);
+    let start = totalSamples - outLen;
+    for (let i = 0; i < outLen; i++, start++) {
+      const src = ((start % RING_SAMPLES) + RING_SAMPLES) % RING_SAMPLES;
+      out[i] = ring[src];
+    }
+    return out;
+  }
+
+  // Blocks that arrive while the engine is being (re)created are queued
+  // (bounded, ~4 s) and flushed in order once it is live — createKws takes
+  // ~2 s, and without this the first wake-word utterance after arming is
+  // spoken straight into an engine that does not exist yet.
+  let pendingEngineBlocks = null;
+
+  function flushPendingEngineBlocks() {
+    if (!pendingEngineBlocks) return;
+    const queue = pendingEngineBlocks;
+    pendingEngineBlocks = null;
+    for (const b of queue) SherpaKwsEngine.feedPcm(b);
+  }
+
+  function onRawBlock(block) {
+    ringPush(block);
+    if (SherpaKwsEngine.isRunning()) {
+      SherpaKwsEngine.feedPcm(block);
+    } else if (state === 'LOADING' || state === 'ARMED') {
+      if (!pendingEngineBlocks) pendingEngineBlocks = [];
+      pendingEngineBlocks.push(block);
+      if (pendingEngineBlocks.length > 16) pendingEngineBlocks.shift();
+    }
+  }
+
+  // The KWS model fails on browser-processed audio: the WebRTC chain
+  // (echo cancellation, noise suppression, auto gain control) reshapes
+  // the spectrum enough that keyword spotting goes from reliable to
+  // never-firing. The detector therefore listens on its OWN getUserMedia
+  // stream with all processing disabled — valid because standby runs
+  // with the session closed (no TTS playing, so nothing to echo-cancel).
+  // The session mic (with AEC) stays open the whole time so the resume
+  // path never has to re-open it mid-utterance.
+  let detectorCtx = null;
+  let detectorStream = null;
+  let detectorSrc = null;
+  let detectorProc = null;
+  let detectorTrackEnded = null;
+  // Runtime counters surfaced through XiaozhiDebug.wakeDetectorStats() —
+  // a deaf standby must be diagnosable without a debugger attached.
+  let detectorStats = { blocks: 0, peak: 0, ctxState: 'closed', micLabel: '' };
+
+  function startDetector(onBlock, opts = {}) {
+    const standby = opts.standby !== false; // default: standby semantics
+    if (detectorStream) return Promise.resolve();
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1, sampleRate: 16000,
+        echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+      },
+    }).then(stream => {
+      if (standby && state === 'INACTIVE') { // disarmed while the prompt was up
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+      detectorStream = stream;
+      detectorStats = { blocks: 0, peak: 0, ctxState: 'starting', micLabel: stream.getAudioTracks()[0]?.label || '' };
+      Logger.info(`Wake detector mic opened (${detectorStats.micLabel || 'unknown device'})`);
+      detectorCtx = new AudioContext({ sampleRate: 16000 });
+      detectorCtx.resume().catch(() => {}); // autoplay policy: run even if created outside a gesture
+      detectorSrc = detectorCtx.createMediaStreamSource(stream);
+      detectorProc = detectorCtx.createScriptProcessor(4096, 1, 1);
+      detectorProc.onaudioprocess = (e) => {
+        if (detectorCtx && detectorCtx.state !== 'running') detectorStats.ctxState = detectorCtx.state;
+        else detectorStats.ctxState = 'running';
+        // Digital input gain: raw (AGC-less) capture sits ~10 dB below the
+        // level the KWS model fires on reliably (verified empirically —
+        // quiet-mic speech at peak ~0.07 misses, the same voice at ~0.28
+        // hits). ×4 restores it; louder mics simply clip peaks, which the
+        // feature extractor tolerates far better than being too quiet.
+        const raw = e.inputBuffer.getChannelData(0);
+        const block = new Float32Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+          const v = raw[i] * 4;
+          block[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+        }
+        detectorStats.blocks++;
+        let blockPeak = 0;
+        for (let i = 0; i < block.length; i += 512) {
+          const a = Math.abs(block[i]);
+          if (a > detectorStats.peak) detectorStats.peak = a;
+          if (a > blockPeak) blockPeak = a;
+        }
+        detectorStats.gainAdjustedPeak = blockPeak;
+        onBlock(block);
+      };
+      detectorSrc.connect(detectorProc);
+      detectorProc.connect(detectorCtx.destination);
+      detectorTrackEnded = () => {
+        if (standby) disarm('detector-mic-ended');
+        else if (opts.onEnded) opts.onEnded();
+      };
+      stream.getTracks().forEach(t => t.addEventListener('ended', detectorTrackEnded));
+    }).catch(err => {
+      Logger.warn('Detector mic could not be opened', err && err.message);
+      if (standby) {
+        showToast('Microphone audio unavailable — wake word standby off', 'error', 'Wake word');
+        disarm('detector-mic-failed');
+      } else if (opts.onFail) opts.onFail(err);
+    });
+  }
+
+  function stopDetector() {
+    if (detectorTrackEnded && detectorStream) {
+      detectorStream.getTracks().forEach(t => t.removeEventListener('ended', detectorTrackEnded));
+    }
+    detectorTrackEnded = null;
+    if (detectorProc) { detectorProc.disconnect(); detectorProc = null; }
+    if (detectorSrc) { detectorSrc.disconnect(); detectorSrc = null; }
+    if (detectorCtx) { detectorCtx.close().catch(() => {}); detectorCtx = null; }
+    if (detectorStream) { detectorStream.getTracks().forEach(t => t.stop()); detectorStream = null; }
+  }
+
+  function shouldArm({ enabled, active, autoMode, capturing, intentional, code, wasClean, source }) {
+    if (!enabled || !active || !autoMode || !capturing || intentional) return false;
+    if (code !== 1000 && code !== 1001) return false;
+    // Clean goodbye closes and watchdog-declared dead channels both leave
+    // the session voice-recoverable; every other abnormal close (auth,
+    // error, 1006) still refuses standby. If the network is truly down
+    // when the wake word fires, the bounded reconnect retries disarm
+    // standby with a toast — graceful, not a zombie.
+    if (wasClean === false && source !== 'watchdog') return false;
+    return true;
+  }
+
+  function maybeArm(ctx) {
+    if (state !== 'INACTIVE') return false;
+    if (!shouldArm(ctx)) return false;
+    const cfg = WakeWordStorage.load(ctx.assistantId);
+    if (!cfg.enabled || (cfg.presets.length === 0 && cfg.customs.length === 0)) return false;
+
+    armedAssistantId = ctx.assistantId;
+    keywordLabels = activeKeywordsLabel(cfg);
+    ring = new Float32Array(RING_SAMPLES);
+    ringWrite = 0; totalSamples = 0; detectionAt = -1;
+
+    // The detector must own the microphone EXCLUSIVELY during standby:
+    // on PipeWire/Linux a second raw stream opened beside the processed
+    // session stream captures pure digital silence (verified — hundreds
+    // of blocks, peak 0.0). Closing the session capture also stops the
+    // encoder from producing packets nobody consumes. On resume the
+    // session mic re-opens in parallel with the reconnect (it takes
+    // seconds; the detector's ring buffer keeps capturing speech the
+    // whole time and is flushed ahead of live audio).
+    AudioEngine.stopCapture();
+    UIController.hideAudioMeter();
+    UIController.updateMicButtonState(false);
+    startDetector(onRawBlock);
+
+    state = 'LOADING';
+    showToast(`Listening for: ${keywordLabels}`, 'info', 'Wake word');
+    if (!SherpaKwsEngine.isRunning()) showToast('Loading wake word engine…', 'info', 'Wake word');
+    UIController.setConnectionState('wake', keywordLabels);
+    const cause = ctx.source === 'watchdog'
+      ? 'Server stopped responding — connection closed'
+      : 'Session closed by server';
+    UIController.addSystemMessage(
+      `${cause} — listening for wake word: ${keywordLabels}`, 'fa-microphone-lines');
+
+    SherpaKwsEngine.start(keywordsString(cfg), cfg.threshold, onKeyword)
+      .then(() => { if (state === 'LOADING') state = 'ARMED'; flushPendingEngineBlocks(); })
+      .catch(err => {
+        Logger.error('Wake word engine failed to load', err);
+        showToast(`Wake word engine failed: ${err.message}`, 'error', 'Wake word');
+        disarm('engine-failed');
+      });
+    return true;
+  }
+
+  function onKeyword(word) {
+    if (state !== 'ARMED') return;
+    state = 'TRIGGERED';
+    detectionAt = totalSamples;
+    Logger.info(`Wake word detected: ${word}`);
+    playChime();
+    UIController.addSystemMessage(`Wake word detected (${word}) — reconnecting…`, 'fa-bolt');
+    // Re-open the session mic (processed constraints) in parallel with the
+    // reconnect: the handshake takes seconds, so it is live well before
+    // resumeStreaming wires its sink. The detector keeps filling the ring
+    // meanwhile, so nothing said during the reconnect is lost.
+    AudioEngine.startCapture(() => {}).catch(err => {
+      Logger.warn('Session mic could not re-open at wake resume', err && err.message);
+    });
+    connectWithRetry(0);
+  }
+
+  // protocol.connect() resolves once the WebSocket is constructed, long
+  // before the server hello — poll until isConnected() (open + hello) so
+  // resumeStreaming only runs on a genuinely established session.
+  function waitForConnected(timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const session = SessionManager.getSession(armedAssistantId);
+      if (!session) { reject(new Error('no session')); return; }
+      const protocol = session.protocol;
+      const startedAt = Date.now();
+      (function check() {
+        if (state !== 'TRIGGERED') { reject(new Error('disarmed')); return; }
+        if (protocol.isConnected()) { resolve(); return; }
+        if (!protocol.isConnecting() || Date.now() - startedAt > timeoutMs) {
+          reject(new Error('server hello not received'));
+          return;
+        }
+        setTimeout(check, 100);
+      })();
+    });
+  }
+
+  function connectWithRetry(attempt) {
+    if (state !== 'TRIGGERED') return;
+    SessionManager.connectAssistant(armedAssistantId)
+      .then(() => waitForConnected(11000))
+      .then(() => resumeStreaming())
+      .catch(err => {
+        if (state !== 'TRIGGERED') return;
+        if (attempt + 1 < MAX_RECONNECT_ATTEMPTS) {
+          Logger.warn(`Wake reconnect failed (${err.message}), retry ${attempt + 1}`);
+          setTimeout(() => { if (state === 'TRIGGERED') connectWithRetry(attempt + 1); }, 2000);
+        } else {
+          showToast('Could not reconnect after wake word — standby off', 'error', 'Wake word');
+          disarm('reconnect-failed');
+        }
+      });
+  }
+
+  function resumeStreaming() {
+    if (state !== 'TRIGGERED') return;
+    const session = SessionManager.getSession(armedAssistantId);
+    if (!session || !session.protocol.isConnected()) { disarm('no-session'); return; }
+    const protocol = session.protocol;
+    // Before sendListenStart: the LISTENING device-state change it fires
+    // must win over the 'connected' repaint below (same order as a
+    // normal auto-mode session).
+    UIController.setConnectionState('connected');
+    protocol.sendListenStart('auto');
+    // Buffered speech first (from 200 ms before the detection — the wake
+    // word itself excluded, trailing coarticulation kept), then live.
+    // setOpusFrameSink below runs synchronously before any asynchronously
+    // encoded packet is delivered to the sink, so buffered frames are not
+    // dropped.
+    const pcm = ringSlice(Math.max(0, detectionAt - FLUSH_MARGIN_SAMPLES));
+    AudioEngine.encodePcmChunk(pcm);
+    AudioEngine.setOpusFrameSink((packet) => protocol.sendAudio(packet));
+    UIController.showAudioMeter();
+    UIController.updateMicButtonState(true);
+    stopDetector();
+    ring = null;
+    state = 'INACTIVE';
+    armedAssistantId = null;
+    showToast('Session resumed — listening', 'success', 'Wake word');
+  }
+
+  let chimeBufferPromise = null;
+  function playChime() {
+    // Decode once, cache; play through the shared TTS gain node so the
+    // assistant's volume setting applies.
+    if (!chimeBufferPromise) {
+      chimeBufferPromise = fetch('/static/wake-chime.ogg')
+        .then(r => r.arrayBuffer())
+        .then(b => AudioEngine.decodeToArrayBuffer(b));
+    }
+    chimeBufferPromise
+      .then(buf => AudioEngine.playLocalBuffer(buf))
+      .catch(err => {
+        // Drop the cached promise so the next trigger retries the fetch/decode.
+        chimeBufferPromise = null;
+        Logger.warn('Chime playback failed', err);
+      });
+  }
+
+  function disarm(reason) {
+    if (state === 'INACTIVE' && !ring) return;
+    Logger.info(`Wake word standby disarmed (${reason})`);
+    state = 'INACTIVE';
+    armedAssistantId = null;
+    ring = null;
+    stopDetector();
+    AudioEngine.setOpusFrameSink(null);
+    AudioEngine.stopCapture();
+    SherpaKwsEngine.stop();
+    UIController.hideAudioMeter();
+    UIController.updateMicButtonState(false);
+    UIController.setConnectionState('disconnected');
+  }
+
+  // Disarm only if standby is armed for this assistant — safe to call on
+  // any manual action targeting any assistant (the mic is only ever held
+  // by the armed one).
+  function disarmFor(assistantId, reason) {
+    if (state === 'INACTIVE' || armedAssistantId !== assistantId) return false;
+    disarm(reason);
+    return true;
+  }
+
+  // Spec §9: settings saved mid-standby must reach the detector. Rebuilds
+  // the engine from the just-saved config without touching the mic — the
+  // ring buffer keeps filling via onRawBlock meanwhile (feedPcm no-ops
+  // while the engine is between instances, so at most a few hundred ms of
+  // audio skip detection). Optional assistantId limits the rearm to saves
+  // that targeted the armed assistant; a config that turned the feature
+  // (or all keywords) off disarms instead.
+  function rearmKeywords(assistantId) {
+    if (state !== 'ARMED' && state !== 'LOADING') return;
+    if (assistantId && armedAssistantId !== assistantId) return;
+    const cfg = WakeWordStorage.load(armedAssistantId);
+    if (!cfg.enabled || (cfg.presets.length === 0 && cfg.customs.length === 0)) {
+      disarm('disabled-in-settings');
+      return;
+    }
+    // Standby only exists in auto mode — a save that flipped the mode to
+    // manual ends it instead of re-arming behind the user's back.
+    if (AssistantManager.getFlatField(armedAssistantId, 'listeningMode') !== 'auto') {
+      disarm('mode-not-auto');
+      return;
+    }
+    keywordLabels = activeKeywordsLabel(cfg);
+    UIController.setConnectionState('wake', keywordLabels);
+    SherpaKwsEngine.stop();
+    SherpaKwsEngine.start(keywordsString(cfg), cfg.threshold, onKeyword)
+      .then(() => flushPendingEngineBlocks())
+      .catch(err => {
+        Logger.error('Wake word engine failed to rearm', err);
+        showToast(`Wake word engine failed: ${err.message}`, 'error', 'Wake word');
+        disarm('engine-failed');
+      });
+  }
+
+  return { maybeArm, disarm, disarmFor, getState, keywordsString, activeKeywordsLabel, rearmKeywords, startDetector, stopDetector, detectorStats: () => ({ ...detectorStats }) };
+})();
+
+// ================================================================
 // MODULE: AssistantManager  (PHASE 1 — Multi-Assistant Foundation)
 // ================================================================
 // Olivia now models every paired "device" as an independent Assistant
@@ -1824,7 +2474,10 @@ const AudioEngine = (() => {
   let scriptProcessorNode = null;
   let analyzerNode = null;
   let isCapturing = false;
-  let onAudioChunkCallback = null;
+  // Opus packet sink: receives every encoded frame. Defaults to the
+  // startCapture(onChunk) callback; reroutable/droppable via setOpusFrameSink
+  // without stopping the mic.
+  let opusFrameSink = null;
   let ttsQueue = [];
   let isTTSPlaying = false;
 
@@ -1897,6 +2550,10 @@ const AudioEngine = (() => {
   // 60ms frame at 16kHz = 960 samples (matches OPUS_FRAME_DURATION_MS in firmware)
   const OPUS_FRAME_SAMPLES  = 960;
   const OPUS_FRAME_DURATION = 60;   // ms
+  // ScriptProcessor capture block size (samples per onaudioprocess callback,
+  // ~256ms at 16kHz). Also the slice size encodePcmChunk() feeds through
+  // processBlock() so re-encoded chunks mirror live capture blocks.
+  const CAPTURE_BLOCK_SAMPLES = 4096;
   // libopus-wasm CDN URL (ES module, inlines WASM — no second request needed)
   const OPUS_WASM_CDN = 'https://cdn.jsdelivr.net/npm/libopus-wasm@0.2.0/dist/index.js';
 
@@ -2020,7 +2677,7 @@ const AudioEngine = (() => {
 
   /**
    * Process accumulated PCM samples — chunk into exact OPUS_FRAME_SAMPLES (960)
-   * frames, encode each, and call onAudioChunkCallback.
+   * frames, encode each, and hand each packet to opusFrameSink.
    *
    * BUG 3 FIX: Use flushInProgress guard to prevent concurrent calls from the
    * ScriptProcessor onaudioprocess handler racing on the shared pcmAccumulator.
@@ -2042,19 +2699,39 @@ const AudioEngine = (() => {
         const opusPacket = await encodeFloat32Frame(frame);
         if (opusPacket && opusPacket.byteLength > 0) {
           Logger.audio(`→ Opus frame ${opusPacket.byteLength}b (${OPUS_FRAME_SAMPLES} samples → ${OPUS_FRAME_DURATION}ms)`);
-          if (onAudioChunkCallback) {
-            // Produce a clean, detached ArrayBuffer copy for the callback
+          if (opusFrameSink) {
+            // Produce a clean, detached ArrayBuffer copy for the sink
             const buf = opusPacket.buffer.slice(
               opusPacket.byteOffset,
               opusPacket.byteOffset + opusPacket.byteLength
             );
-            onAudioChunkCallback(buf);
+            opusFrameSink(buf);
           }
         }
       }
     } finally {
       flushInProgress = false;
     }
+  }
+
+  /**
+   * Append a 16kHz mono PCM block to the accumulator, then flush every
+   * complete 960-sample frame through the encoder to opusFrameSink.
+   * Shared by the live onaudioprocess handler and encodePcmChunk(), so
+   * re-encoded chunks keep frame-order continuity with live capture
+   * (sub-frame remainders stay buffered in pcmAccumulator).
+   */
+  function processBlock(block) {
+    // Append to accumulator
+    const merged = new Float32Array(pcmAccumulator.length + block.length);
+    merged.set(pcmAccumulator, 0);
+    merged.set(block, pcmAccumulator.length);
+    pcmAccumulator = merged;
+
+    // Flush complete 960-sample frames (async but fire-and-forget is fine here)
+    flushAccumulator().catch(err => {
+      Logger.error('Audio flush error', err.message);
+    });
   }
 
   /**
@@ -2067,7 +2744,7 @@ const AudioEngine = (() => {
       return true;
     }
 
-    onAudioChunkCallback = onChunk;
+    opusFrameSink = onChunk;
     pcmAccumulator = new Float32Array(0);
 
     try {
@@ -2099,23 +2776,14 @@ const AudioEngine = (() => {
 
       // ScriptProcessor: 4096-sample buffer gives us ~256ms chunks at 16kHz.
       // We accumulate and slice into exact 960-sample Opus frames.
-      const bufferSize = 4096;
-      scriptProcessorNode = captureContext.createScriptProcessor(bufferSize, 1, 1);
+      scriptProcessorNode = captureContext.createScriptProcessor(CAPTURE_BLOCK_SAMPLES, 1, 1);
       scriptProcessorNode.onaudioprocess = (e) => {
         if (!isCapturing) return;
 
-        const incoming = e.inputBuffer.getChannelData(0);  // Float32, already at 16kHz
-
-        // Append to accumulator
-        const merged = new Float32Array(pcmAccumulator.length + incoming.length);
-        merged.set(pcmAccumulator, 0);
-        merged.set(incoming, pcmAccumulator.length);
-        pcmAccumulator = merged;
-
-        // Flush complete 960-sample frames (async but fire-and-forget is fine here)
-        flushAccumulator().catch(err => {
-          Logger.error('Audio flush error', err.message);
-        });
+        // Copy — getChannelData returns a reused buffer, and processBlock
+        // merges it into the pcm accumulator beyond this callback.
+        const block = new Float32Array(e.inputBuffer.getChannelData(0));
+        processBlock(block);
       };
 
       micSourceNode.connect(scriptProcessorNode);
@@ -2141,6 +2809,8 @@ const AudioEngine = (() => {
   function stopCapture() {
     isCapturing = false;
     pcmAccumulator = new Float32Array(0);
+    // A stopped mic must never call stale sinks
+    opusFrameSink = null;
     stopLevelMeter();
 
     if (scriptProcessorNode) {
@@ -2189,6 +2859,34 @@ const AudioEngine = (() => {
       levelAnimFrame = null;
     }
     if (meterEl) meterEl.style.width = '0%';
+  }
+
+  // Byte-frequency average (0-255) above which the meter shows ~10% —
+  // the practical speech/silence floor used by isInputAudible().
+  const METER_AUDIBLE_AVG = 8;
+
+  /** One-shot probe: is the microphone currently picking up sound above
+   *  the level meter's floor? Reads the live analyser directly instead of
+   *  the rAF meter loop, which freezes in background tabs. Used by
+   *  ProtocolClient's channel watchdog to track when the user speaks and
+   *  when an utterance ends, so a server that never responds to speech
+   *  can be detected as a dead channel. */
+  function isInputAudible() {
+    if (!isCapturing || !analyzerNode) return false;
+    const data = new Uint8Array(analyzerNode.frequencyBinCount);
+    analyzerNode.getByteFrequencyData(data);
+    const avg = data.reduce((a, b) => a + b, 0) / data.length;
+    return avg > METER_AUDIBLE_AVG;
+  }
+
+  /**
+   * Decode an encoded audio container (OGG/WAV) to an AudioBuffer via the
+   * TTS playback context — shared by the TTS Web Audio fallback and local
+   * sound effects (wake chime).
+   */
+  async function decodeAudioContainer(arrayBuffer) {
+    const ctx = await ensureAudioContext();
+    return ctx.decodeAudioData(arrayBuffer);
   }
 
   /**
@@ -2257,7 +2955,7 @@ const AudioEngine = (() => {
       if (!pcmFloat) {
         try {
           const buf = chunk instanceof ArrayBuffer ? chunk : chunk.buffer;
-          const audioBuffer = await audioContext.decodeAudioData(buf.slice(0));
+          const audioBuffer = await decodeAudioContainer(buf.slice(0));
           // Schedule this frame back-to-back with the previous one
           const source = audioContext.createBufferSource();
           source.buffer = audioBuffer;
@@ -2321,9 +3019,34 @@ const AudioEngine = (() => {
   return {
     startCapture,
     stopCapture,
+    // Wake-word standby reroutes encoded packets without stopping the mic.
+    // When never called, capture behaves exactly as before (opusFrameSink =
+    // the startCapture callback).
+    setOpusFrameSink: (fn) => { opusFrameSink = fn; },
+    encodePcmChunk: (pcm) => {
+      // Slice into capture-sized blocks so re-encoded audio goes through the
+      // exact same accumulator/frame/encode path as live capture.
+      for (let off = 0; off < pcm.length; off += CAPTURE_BLOCK_SAMPLES) {
+        processBlock(pcm.subarray(off, Math.min(off + CAPTURE_BLOCK_SAMPLES, pcm.length)));
+      }
+    },
+    // Wake-word standby / local sound helpers.
+    // decodeToArrayBuffer: encoded container (OGG/WAV) → AudioBuffer via
+    // the TTS decode path. playLocalBuffer: schedule a decoded buffer
+    // through the shared TTS gain node so the assistant's volume setting
+    // applies to local sounds.
+    decodeToArrayBuffer: decodeAudioContainer,
+    playLocalBuffer: (audioBuffer) => {
+      if (!audioContext) return;
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ensureGainNode() || audioContext.destination);
+      source.start();
+    },
     enqueueTTSChunk,
     clearTTSQueue,
     isCapturing: () => isCapturing,
+    isInputAudible,
     checkMicPermission,
     ensureAudioContext,
     loadOpus,           // expose so AppController can pre-warm
@@ -2437,6 +3160,33 @@ const ProtocolClient = (() => {
   let autoReconnect = false;
   let isIntentionalClose = false;
 
+  // ── Channel liveness watchdog (mirrors Protocol::IsTimeout in the
+  // ESP32 firmware, protocol.cc: the device treats a server that sends
+  // nothing as a dead channel) ────────────────────────────────────────
+  // The server can kill our connection without a Close frame ever
+  // reaching the browser (an LB-level idle drop leaves the proxy's
+  // upstream leg half-closed), so the client cannot trust readyState
+  // alone: it must notice the silence itself.
+  //
+  // Idle rule: no incoming frame at all for 150s → dead (just under the
+  // server's own no-voice close, ~180s in the reference server).
+  //
+  // Speaking rule: the server never talks OVER the user — VAD only
+  // produces a response AFTER an utterance ends. So "silence while the
+  // mic is audible" is normal, and the dead-channel signature is: the
+  // user finished an utterance and the server said NOTHING since before
+  // that utterance began. Detection: "no response within 30s after
+  // speech ended, with zero server frames since speech started".
+  const SERVER_SILENCE_IDLE_MS = 150000;
+  const SERVER_SPEECH_RESPONSE_MS = 30000;
+  // Quiet gap after which new mic activity counts as a new utterance.
+  const SERVER_SPEECH_GAP_MS = 10000;
+  const SERVER_WATCHDOG_INTERVAL_MS = 5000;
+  let lastServerActivityAt = 0;
+  let serverWatchdogTimerId = null;
+  let speechStartedAt = 0;
+  let lastAudibleAt = 0;
+
   // Callbacks
   const callbacks = {
     onConnected:    null,
@@ -2509,6 +3259,8 @@ const ProtocolClient = (() => {
     Logger.auth(`[${assistantId.slice(0,8)}] Using token: ${s.token === 'test-token' ? 'test-token (Xiaozhi cloud token)' : '***' + s.token.slice(-8)}`);
 
     isIntentionalClose = false;
+    stopServerWatchdog();
+    lastServerActivityAt = Date.now();
     deviceEmulator.setState(deviceEmulator.STATES.CONNECTING);
 
     Logger.ws(`Connecting to: ${s.wsUrl}`);
@@ -2579,6 +3331,9 @@ const ProtocolClient = (() => {
         Logger.error('Server hello timeout (10s)');
         const msg = 'Server did not respond to hello within 10 seconds';
         if (callbacks.onError) callbacks.onError(msg);
+        // forceClose() nulls our ws reference but does NOT detach the
+        // handlers: the browser still fires close (1006, wasClean=false)
+        // → handleClose → onDisconnected, where shouldArm rejects it.
         forceClose();
       }
     }, 10000);
@@ -2586,6 +3341,9 @@ const ProtocolClient = (() => {
 
   /** Handle incoming WebSocket messages */
   function handleMessage(event) {
+    // Any frame — JSON or binary audio — proves the channel is alive.
+    lastServerActivityAt = Date.now();
+
     if (event.data instanceof ArrayBuffer) {
       // Binary message = Opus audio from server
       handleBinaryMessage(event.data);
@@ -2698,6 +3456,9 @@ const ProtocolClient = (() => {
     helloReceived = true;
     sessionId = msg.session_id || '';
     reconnectAttempts = 0;
+    // Channel is live — start tracking server silence from now.
+    lastServerActivityAt = Date.now();
+    startServerWatchdog();
 
     Logger.ws(`Server hello received. Session: ${sessionId}`);
     Logger.auth(`Server audio params: ${JSON.stringify(msg.audio_params || {})}`);
@@ -3061,6 +3822,7 @@ const ProtocolClient = (() => {
       helloTimeoutId = null;
     }
 
+    stopServerWatchdog();
     helloReceived = false;
     deviceEmulator.setState(deviceEmulator.STATES.IDLE);
 
@@ -3076,7 +3838,7 @@ const ProtocolClient = (() => {
       return;
     }
 
-    if (callbacks.onDisconnected) callbacks.onDisconnected(event.code, event.reason);
+    if (callbacks.onDisconnected) callbacks.onDisconnected(event.code, event.reason, event.wasClean, isIntentionalClose);
 
     // Auto-reconnect logic (disabled by default)
     if (!isIntentionalClose && autoReconnect && reconnectAttempts < maxReconnectAttempts) {
@@ -3092,6 +3854,7 @@ const ProtocolClient = (() => {
     isIntentionalClose = true;
     helloReceived = false;
     sessionId = '';
+    stopServerWatchdog();
     if (ws) {
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close(1000, 'User disconnect');
@@ -3102,10 +3865,90 @@ const ProtocolClient = (() => {
   }
 
   function forceClose() {
+    stopServerWatchdog();
     if (ws) {
+      // Detach handlers before closing: a locally initiated close is not
+      // answered by the proxy's half-open local leg, so the close event
+      // may fire much later (or with 1006) — we already handled this
+      // connection's teardown and must ignore that late echo.
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
       ws.close();
       ws = null;
     }
+  }
+
+  // ── Channel liveness watchdog ────────────────────────────────────
+
+  function startServerWatchdog() {
+    stopServerWatchdog();
+    lastAudibleAt = 0;
+    speechStartedAt = 0;
+    serverWatchdogTimerId = setInterval(checkServerWatchdog, SERVER_WATCHDOG_INTERVAL_MS);
+  }
+
+  function stopServerWatchdog() {
+    if (serverWatchdogTimerId) {
+      clearInterval(serverWatchdogTimerId);
+      serverWatchdogTimerId = null;
+    }
+  }
+
+  function checkServerWatchdog() {
+    if (!helloReceived || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+
+    // The mic is a single shared resource that only ever captures for
+    // the ACTIVE assistant — a background session must never be judged
+    // by audio that belongs to a different assistant's connection.
+    const audibleNow = isActive() && AudioEngine.isCapturing() && AudioEngine.isInputAudible();
+
+    if (audibleNow) {
+      if (!lastAudibleAt || now - lastAudibleAt > SERVER_SPEECH_GAP_MS) {
+        speechStartedAt = now;
+      }
+      lastAudibleAt = now;
+      return; // mid-utterance: server silence is normal until VAD cuts
+    }
+
+    if (lastAudibleAt) {
+      // An utterance was seen (at watchdog sampling cadence — bursts
+      // shorter than one tick may fall through to the idle rule). Give
+      // the server time to answer it once speech ends (stt/llm/tts)…
+      if (now - lastAudibleAt < SERVER_SPEECH_RESPONSE_MS) return;
+      // …then, if it said NOTHING since the utterance began, the user
+      // has been talking into a dead channel.
+      if (lastServerActivityAt < speechStartedAt) {
+        declareChannelDead(now - lastServerActivityAt, SERVER_SPEECH_RESPONSE_MS);
+        return;
+      }
+    }
+
+    const silentForMs = now - lastServerActivityAt;
+    if (silentForMs >= SERVER_SILENCE_IDLE_MS) {
+      declareChannelDead(silentForMs, SERVER_SILENCE_IDLE_MS);
+    }
+  }
+
+  /** Treat the connection as dead without waiting for a close event that
+   *  may never arrive (that is exactly the failure mode this watchdog
+   *  exists for). Notifies onDisconnected directly — forceClose() detaches
+   *  ws.onclose, so the normal handleClose pipeline intentionally does
+   *  not run here. That also bypasses handleClose's auto-reconnect
+   *  branch — deliberate: reconnect-after-timeout is intentionally not
+   *  wired anywhere (mirrors the firmware, which returns to idle and
+   *  waits for the user to start the next interaction). */
+  function declareChannelDead(silentForMs, limitMs) {
+    Logger.error(`No data from server for ${Math.round(silentForMs / 1000)}s (limit ${Math.round(limitMs / 1000)}s) — closing dead audio channel`);
+    stopServerWatchdog();
+    sessionId = '';
+    helloReceived = false;
+    deviceEmulator.setState(deviceEmulator.STATES.IDLE, 'server silent');
+    forceClose();
+    // wasClean=false: this is not a server goodbye. The trailing 'watchdog'
+    // source lets downstream listeners (wake-word standby) treat a dead
+    // channel as voice-recoverable while every other abnormal close stays
+    // rejected — detection is local and a failed reconnect disarms cleanly.
+    if (callbacks.onDisconnected) callbacks.onDisconnected(1000, 'Server activity timeout', false, false, 'watchdog');
   }
 
   /** Send a JSON text message */
@@ -3217,7 +4060,10 @@ const ProtocolClient = (() => {
     };
     Logger.proto('→ abort', msg);
     deviceEmulator.setState(deviceEmulator.STATES.IDLE);
-    AudioEngine.clearTTSQueue();
+    // The TTS queue is a shared resource that only ever holds the ACTIVE
+    // assistant's playback — clearing it from a background session would
+    // cut off whoever is on screen mid-sentence.
+    if (isActive()) AudioEngine.clearTTSQueue();
     return sendText(msg);
   }
 
@@ -3226,7 +4072,11 @@ const ProtocolClient = (() => {
   }
 
   function isConnecting() {
-    return ws !== null && (ws.readyState === WebSocket.CONNECTING || !helloReceived);
+    // CONNECTING, or OPEN still awaiting the server hello. handleClose
+    // resets helloReceived and leaves the CLOSED socket behind, so the
+    // hello check must not apply past OPEN — a closed socket is not
+    // "connecting", or reconnect guards would block forever.
+    return ws !== null && (ws.readyState === WebSocket.CONNECTING || (ws.readyState === WebSocket.OPEN && !helloReceived));
   }
 
   function getSessionId() { return sessionId; }
@@ -3486,11 +4336,20 @@ const ChatEngine = (() => {
       return false;
     }
 
+    // The connection may have died while getUserMedia/encoder were
+    // loading (the awaits above): stop immediately so a late-starting
+    // mic never outlives the teardown that already ran for the close.
+    if (!protocol.isConnected()) {
+      AudioEngine.stopCapture();
+      showToast('Not connected to server', 'error');
+      return false;
+    }
+
     // 2. Capture is live — NOW tell server to start accepting audio
     protocol.sendListenStart(mode);
 
     // Show audio meter
-    document.getElementById('audioMeterSection').style.display = 'block';
+    UIController.showAudioMeter();
 
     Logger.chat(`Voice input started — streaming Opus @ ${AudioEngine.INPUT_SAMPLE_RATE}Hz`);
     return true;
@@ -3498,7 +4357,7 @@ const ChatEngine = (() => {
 
   function stopVoiceInput() {
     AudioEngine.stopCapture();
-    document.getElementById('audioMeterSection').style.display = 'none';
+    UIController.hideAudioMeter();
     protocol.sendListenStop();
     Logger.chat('Voice input stopped');
   }
@@ -3959,6 +4818,23 @@ const SessionManager = (() => {
     });
   }
 
+  /** Full local audio/UI teardown for a session whose connection just
+   *  ended — whether the user clicked Disconnect or the server closed on
+   *  us (idle timeout, dropped socket, auth rejection). SSOT for: stop mic
+   *  capture (and with it the Opus encoder), reset the mic toggle button,
+   *  hide the level meter, drop queued TTS, and clear the typing
+   *  indicator. Mic capture and TTS playback only ever run for the ACTIVE
+   *  assistant (single shared hardware resource), so everything here is a
+   *  no-op unless the disconnecting session is the one on screen. */
+  function teardownSessionAudio(session) {
+    if (!isActiveId(session.assistantId)) return;
+    AudioEngine.stopCapture();
+    AudioEngine.clearTTSQueue();
+    UIController.hideTypingIndicator();
+    UIController.updateMicButtonState(false);
+    UIController.hideAudioMeter();
+  }
+
   /** ProtocolClient events -> persisted status/session-id + (if active) UI/chat */
   function wireProtocolCallbacks(session) {
     const { assistantId, deviceEmulator, protocol, chat } = session;
@@ -3977,14 +4853,36 @@ const SessionManager = (() => {
       }
     });
 
-    protocol.on('disconnected', (code, reason) => {
+    protocol.on('disconnected', (code, reason, wasClean, intentional, source) => {
       Logger.ws(`[${assistantId.slice(0, 8)}] Disconnected: ${code} ${reason}`);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
-      AudioEngine.clearTTSQueue();
+      // A session that ended without the user — the server's inactivity
+      // goodbye, or a silently dead channel closed by the watchdog
+      // (source='watchdog') — can keep the mic and enter wake-word
+      // standby on a live auto-mode session. Every other close (manual,
+      // auth, other abnormal, wrong mode, mic off) falls through to the
+      // normal disconnected path, which stops mic, encoder, meter and
+      // TTS like a user disconnect.
+      const armed = WakeWordSystem.maybeArm({
+        assistantId,
+        code, wasClean, intentional, source,
+        autoMode: AssistantManager.getFlatField(assistantId, 'listeningMode') === 'auto',
+        capturing: isActiveId(assistantId) && AudioEngine.isCapturing(),
+        active: isActiveId(assistantId),
+        enabled: WakeWordStorage.load(assistantId).enabled,
+      });
+      if (armed) {
+        // maybeArm owns the chip ('wake'), system message and toast; the
+        // session id is gone and no reply can be pending anymore.
+        AudioEngine.clearTTSQueue();
+        UIController.updateSessionId('');
+        UIController.hideTypingIndicator();
+        return;
+      }
+      teardownSessionAudio(session);
       if (isActiveId(assistantId)) {
         UIController.setConnectionState('disconnected');
         UIController.updateSessionId('');
-        UIController.hideTypingIndicator();
         if (!reason || reason === 'User disconnect') {
           UIController.addSystemMessage('Disconnected from server.', 'fa-plug-circle-xmark');
         } else {
@@ -3997,9 +4895,12 @@ const SessionManager = (() => {
     protocol.on('error', (message) => {
       Logger.error(`[${assistantId.slice(0, 8)}] Protocol error`, message);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
+      // handleClose's auth-failure branch returns early WITHOUT firing
+      // onDisconnected, so this is the only teardown hook for that path —
+      // without it an auth-rejected close would leave the mic capturing.
+      teardownSessionAudio(session);
       if (isActiveId(assistantId)) {
         UIController.setConnectionState('disconnected');
-        UIController.hideTypingIndicator();
         showToast(message, 'error', 'Connection Error');
         UIController.addSystemMessage(`Error: ${message}`, 'fa-circle-exclamation');
       }
@@ -4099,6 +5000,12 @@ const SessionManager = (() => {
    * touching any other session's connection.
    */
   function switchTo(assistantId) {
+    // Wake-word standby belongs to the currently-active assistant, and the
+    // mic is a single shared resource — disarm before a real switch lands.
+    // (Re-selecting the already-active assistant is a no-op switch.)
+    if (assistantId !== AssistantManager.getActiveId()) {
+      WakeWordSystem.disarm('assistant-switch');
+    }
     const switched = AssistantManager.setActive(assistantId);
     if (!switched) return false;
 
@@ -4137,6 +5044,12 @@ const SessionManager = (() => {
     if (protocol.isConnected() || protocol.isConnecting()) {
       if (isActiveId(id)) showToast('Already connected or connecting', 'warning');
       return;
+    }
+
+    // Manual connect takes the shared mic back from wake-word standby —
+    // except when the connect IS the wake resume itself (TRIGGERED).
+    if (WakeWordSystem.getState() !== 'TRIGGERED') {
+      WakeWordSystem.disarmFor(id, 'user-action');
     }
 
     const wsUrl = AssistantManager.getFlatField(id, 'wsUrl');
@@ -4232,6 +5145,9 @@ const SessionManager = (() => {
   /** User clicks Disconnect for a specific assistant (defaults to active). */
   function disconnectAssistant(assistantId) {
     const id = assistantId || AssistantManager.getActiveId();
+    // Manual action: a wake-word standby armed for this assistant ends
+    // here (releases the mic before the intentional close fires).
+    WakeWordSystem.disarmFor(id, 'user-action');
     const session = sessions.get(id);
     if (!session) return;
 
@@ -4240,11 +5156,8 @@ const SessionManager = (() => {
     session.deviceEmulator.setState(session.deviceEmulator.STATES.IDLE, 'user disconnect');
     AssistantManager.setConnectionStatus(id, 'disconnected');
 
+    teardownSessionAudio(session);
     if (isActiveId(id)) {
-      AudioEngine.stopCapture();
-      AudioEngine.clearTTSQueue();
-      UIController.hideTypingIndicator();
-      UIController.updateMicButtonState(false);
       UIController.setConnectionState('disconnected');
     }
     Logger.ws(`[${id.slice(0, 8)}] User disconnected`);
@@ -4270,6 +5183,10 @@ const SessionManager = (() => {
     const session = sessions.get(id);
     if (session) {
       try {
+        // Teardown BEFORE the session/activeId go away — the async close
+        // event lands after activeId is re-pointed, so its own teardown
+        // would no-op and an active capturing mic would keep running.
+        teardownSessionAudio(session);
         session.protocol.disconnect();
       } catch (e) { /* already disconnected */ }
       sessions.delete(id);
@@ -4281,6 +5198,10 @@ const SessionManager = (() => {
     // OLIVIA FEATURE: remove this assistant's saved volume too, so
     // localStorage doesn't accumulate orphaned entries for deleted assistants.
     try { VolumeStorage.remove(id); } catch(e) { /* non-fatal */ }
+
+    // OLIVIA FEATURE: remove the wake word config with the assistant, so
+    // localStorage doesn't accumulate orphaned entries for deleted assistants.
+    try { WakeWordStorage.remove(id); } catch(e) { /* non-fatal */ }
 
     const removed = AssistantManager.removeAssistant(id);
     if (!removed) return false;
@@ -4371,6 +5292,29 @@ const UIController = (() => {
     el('saveSettingsBtn').addEventListener('click', saveSettings);
     el('resetSettingsBtn').addEventListener('click', resetSettings);
     el('resetPairingBtn').addEventListener('click', resetPairing);
+
+    // OLIVIA WAKE WORD: render the preset checkboxes once from
+    // WAKE_PRESETS (runtime data — the JSX ships an empty container,
+    // matching the Audio section's label/checkbox markup) and wire the
+    // section controls. Per-assistant values load in
+    // loadSettingsIntoForm(); the engine itself lazy-loads on first
+    // panel open (see openSettingsFor).
+    renderWakePresets();
+    el('wakeWordThresholdInput').addEventListener('input', () => {
+      el('wakeWordThresholdValue').textContent =
+        parseFloat(el('wakeWordThresholdInput').value).toFixed(2);
+    });
+    el('wakeWordTestBtn').addEventListener('click', handleWakeWordTest);
+    el('wakeWordCustomInput').addEventListener('input', updateWakeCustomPreview);
+    el('wakeWordCustomInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); addWakeCustomPhrase(); }
+    });
+    el('wakeWordAddBtn').addEventListener('click', addWakeCustomPhrase);
+    el('wakeWordCustomList').addEventListener('click', (e) => {
+      const btn = e.target.closest('.wake-custom-remove');
+      if (btn) removeWakeCustomPhrase(Number(btn.dataset.index));
+    });
+    el('listeningModeInput').addEventListener('change', applyWakeSectionAvailability);
 
     // PHASE 2: Assistant-level actions inside the Settings panel — all
     // target getSettingsTargetId(), NOT necessarily the active assistant.
@@ -4535,6 +5479,9 @@ const UIController = (() => {
   // resource, so voice input always targets the CURRENTLY ACTIVE
   // assistant's session — there is no concept of "background" voice input.
   function handleMicMouseDown(e) {
+    // A mic press during wake-word standby only disarms it — the session
+    // is closed anyway, so there is nothing to capture into.
+    if (WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action')) return;
     const session = SessionManager.getActiveSession();
     if (!session || !session.protocol.isConnected()) return;
     micClickTimeout = setTimeout(() => {
@@ -4542,6 +5489,7 @@ const UIController = (() => {
       Logger.audio('PTT (push-to-talk) start');
       // BUG #4 FIX: Close mobile sidebar when voice input starts
       closeMobileSidebar();
+      WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action');
       session.chat.startVoiceInput('manual');
       updateMicButtonState(true);
     }, 300);
@@ -4559,6 +5507,9 @@ const UIController = (() => {
   }
 
   function handleMicClick(e) {
+    // A mic press during wake-word standby only disarms it (see
+    // handleMicMouseDown).
+    if (WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action')) return;
     const session = SessionManager.getActiveSession();
     if (!session || !session.protocol.isConnected()) {
       showToast('Connect to server first', 'warning');
@@ -4570,6 +5521,7 @@ const UIController = (() => {
         micToggled = true;
         // BUG #4 FIX: Close mobile sidebar when voice input starts
         closeMobileSidebar();
+        WakeWordSystem.disarmFor(AssistantManager.getActiveId(), 'user-action');
         session.chat.startVoiceInput('auto');
         updateMicButtonState(true);
         showToast('Listening... (click again to stop)', 'info');
@@ -4592,6 +5544,19 @@ const UIController = (() => {
       icon.className = 'fas fa-microphone';
       micToggled = false;
     }
+  }
+
+  /** Show/hide the audio level meter section. Shared by voice input
+   *  start/stop AND by connection teardown — the meter must never outlive
+   *  the mic capture that feeds it. */
+  function showAudioMeter() {
+    const section = el('audioMeterSection');
+    if (section) section.style.display = 'block';
+  }
+
+  function hideAudioMeter() {
+    const section = el('audioMeterSection');
+    if (section) section.style.display = 'none';
   }
 
   function handleInputKeydown(e) {
@@ -4744,6 +5709,11 @@ const UIController = (() => {
   function openSettingsFor(assistantId) {
     settingsTargetId = assistantId;
     loadSettingsIntoForm();
+    // OLIVIA WAKE WORD: kick off the sherpa-onnx KWS engine on first
+    // panel open — wakeWordStatus shows "engine loading…" until ready,
+    // and the Test button / custom-word validation stay disabled until
+    // then (a load failure is permanent until page reload).
+    ensureWakeEngineLoaded();
     el('settingsPanel').classList.add('open');
   }
 
@@ -4751,6 +5721,340 @@ const UIController = (() => {
     el('settingsPanel').classList.remove('open');
     // Revert to "always follow the active assistant" once the panel closes.
     settingsTargetId = null;
+  }
+
+  // ── WAKE WORD SETTINGS [OLIVIA FEATURE] ────────────────────────────
+  // Per-assistant config lives in WakeWordStorage; the panel reads and
+  // writes it via the helpers below. The sherpa-onnx engine lazy-loads
+  // on first panel open. Known engine limitation: a load() failure is
+  // permanent until page reload, so the Test button stays disabled after
+  // one. Custom-word encoding is pure JS (WAKE_BPE_PIECES) and does not
+  // depend on the engine.
+  let wakeEngineStarted = false;
+  let wakeEngineReady = false;
+  let wakeEngineError = null;
+  let wakeTestActive = false;
+  // Staged custom phrases — edited freely in the panel, persisted to
+  // WakeWordStorage only on Save.
+  const WAKE_CUSTOM_LIMIT = 10;
+  let wakeCustomDraft = [];
+
+  function renderWakeCustomList() {
+    const list = el('wakeWordCustomList');
+    list.textContent = '';
+    wakeCustomDraft.forEach((c, i) => {
+      const item = document.createElement('div');
+      item.className = 'wake-custom-item';
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'wake-custom-remove';
+      remove.dataset.index = String(i);
+      remove.setAttribute('aria-label', `Remove ${c.display.replace(/_/g, ' ')}`);
+      remove.textContent = '✕';
+      const label = document.createElement('span');
+      label.textContent = c.display.replace(/_/g, ' ');
+      item.append(remove, label);
+      list.appendChild(item);
+    });
+  }
+
+  function addWakeCustomPhrase() {
+    const input = el('wakeWordCustomInput');
+    const text = input.value.trim().toUpperCase();
+    if (!text) return;
+    const tokens = customToTokens(text);
+    if (!tokens.ok) {
+      showWakeCustomError(wakeEncodeError(tokens));
+      return;
+    }
+    if (wakeCustomDraft.length >= WAKE_CUSTOM_LIMIT) {
+      showWakeCustomError(`Custom wake word limit reached (${WAKE_CUSTOM_LIMIT})`);
+      return;
+    }
+    const display = text.replace(/\s+/g, '_');
+    if (wakeCustomDraft.some(c => c.display === display)) {
+      showWakeCustomError(`"${display.replace(/_/g, ' ')}" is already in the list`);
+      return;
+    }
+    showWakeCustomError(null);
+    wakeCustomDraft.push({ display, tokens: tokens.tokens });
+    input.value = '';
+    updateWakeCustomPreview();
+    renderWakeCustomList();
+  }
+
+  function removeWakeCustomPhrase(index) {
+    wakeCustomDraft.splice(index, 1);
+    renderWakeCustomList();
+  }
+
+  function renderWakePresets() {
+    const box = el('wakeWordPresetBox');
+    if (!box || box.childElementCount) return;
+    // Labels come from the static WAKE_PRESETS table (no user input).
+    box.innerHTML = WAKE_PRESETS.map(p =>
+      `<label><input type="checkbox" class="wake-preset" data-id="${p.id}" /> <span>${p.label}</span></label>`
+    ).join('');
+  }
+
+  function ensureWakeEngineLoaded() {
+    renderWakePresets();
+    if (wakeEngineStarted) { applyWakeSectionAvailability(); return; }
+    wakeEngineStarted = true;
+    if (!SherpaKwsEngine.isSupported()) { applyWakeSectionAvailability(); return; }
+    applyWakeSectionAvailability();
+    SherpaKwsEngine.load().then(() => {
+      wakeEngineReady = true;
+    }).catch(err => {
+      wakeEngineError = err;
+      Logger.error('Wake word engine failed to load', err);
+    }).finally(applyWakeSectionAvailability);
+  }
+
+  // Availability + status text for the whole section: requires auto
+  // listening mode and a browser that runs the engine; the Test button
+  // additionally needs a loaded engine (custom-word encoding does not).
+  function applyWakeSectionAvailability() {
+    const section = el('wakeWordSection');
+    if (!section) return;
+    const modeAuto = el('listeningModeInput').value === 'auto';
+    const supported = SherpaKwsEngine.isSupported();
+    const disableAll = !modeAuto || !supported;
+
+    section.classList.toggle('disabled', disableAll);
+    ['wakeWordEnabledInput', 'wakeWordThresholdInput'].forEach(id => { el(id).disabled = disableAll; });
+    document.querySelectorAll('#wakeWordPresetBox input').forEach(cb => { cb.disabled = disableAll; });
+
+    const engineUsable = wakeEngineReady && !wakeEngineError;
+    el('wakeWordTestBtn').disabled = disableAll || !engineUsable;
+    el('wakeWordCustomInput').disabled = disableAll;
+    el('wakeWordAddBtn').disabled = disableAll;
+    el('wakeWordCustomList').classList.toggle('disabled', disableAll);
+
+    const status = el('wakeWordStatus');
+    if (!supported) {
+      status.textContent = 'Wake word engine not supported in this browser';
+    } else if (wakeEngineError) {
+      status.textContent = `Wake word engine failed to load (${wakeEngineError.message}) — reload the page to retry`;
+    } else if (wakeEngineStarted && !wakeEngineReady) {
+      status.textContent = 'engine loading…';
+    } else {
+      status.textContent = '';
+    }
+  }
+
+  function loadWakeWordSettings(id) {
+    renderWakePresets();
+    const cfg = WakeWordStorage.load(id);
+    el('wakeWordEnabledInput').value = cfg.enabled ? 'on' : 'off';
+    document.querySelectorAll('#wakeWordPresetBox input[type="checkbox"]').forEach(cb => {
+      cb.checked = cfg.presets.includes(cb.dataset.id);
+    });
+    wakeCustomDraft = cfg.customs.map(c => ({ display: c.display, tokens: c.tokens }));
+    el('wakeWordCustomInput').value = '';
+    el('wakeWordThresholdInput').value = String(cfg.threshold);
+    el('wakeWordThresholdValue').textContent = Number(cfg.threshold).toFixed(2);
+    el('wakeWordCustomError').hidden = true;
+    updateWakeCustomPreview();
+    renderWakeCustomList();
+    applyWakeSectionAvailability();
+  }
+
+  // Segmentation of the text into the model's BPE vocabulary. Greedy
+  // longest-match first — it reproduces the sentencepiece reference and
+  // the shipped preset lines; when it strands, dynamic programming finds
+  // another valid segmentation of the word if one exists. Every word is
+  // preceded by the '▁' whitespace marker (GigaSpeech convention).
+  function bpeEncode(text) {
+    const pieces = WAKE_BPE_PIECES;
+    const out = [];
+    for (const word of text.split(/\s+/)) {
+      const s = '▁' + word;
+      const seg = [];
+      let i = 0;
+      while (i < s.length) {
+        let match = null;
+        for (const p of pieces) {
+          if (s.startsWith(p, i)) { match = p; break; }
+        }
+        if (!match) break;
+        seg.push(match);
+        i += match.length;
+      }
+      if (i === s.length) {
+        out.push(...seg);
+        continue;
+      }
+      const from = new Array(s.length + 1).fill(-1);
+      from[0] = 0;
+      for (let j = 0; j < s.length; j++) {
+        if (from[j] === -1) continue;
+        for (const p of pieces) {
+          const end = j + p.length;
+          if (s.startsWith(p, j) && from[end] === -1) from[end] = j;
+        }
+      }
+      if (from[s.length] === -1) {
+        return { ok: false, uncovered: s[i] };
+      }
+      let start = from[s.length];
+      const wordPieces = [];
+      for (let end = s.length; end > 0; end = start, start = from[end]) {
+        wordPieces.unshift(s.slice(start, end));
+      }
+      out.push(...wordPieces);
+    }
+    return { ok: true, pieces: out.join(' ') };
+  }
+
+  function customToTokens(text) {
+    const encoded = bpeEncode(text);
+    if (!encoded.ok) return encoded;
+    return { ok: true, tokens: `${encoded.pieces} @${text.replace(/\s+/g, '_')}` };
+  }
+
+  // Single source of truth for the panel's wake config — reused by the
+  // save path and the Test button. ok=false carries the inline error.
+  function readWakeConfigFromPanel() {
+    const presets = Array.from(document.querySelectorAll('#wakeWordPresetBox input:checked'))
+      .map(cb => cb.dataset.id);
+    const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
+    let error = null;
+    // Typed-but-not-added text: stage it now, or reject the save if it
+    // cannot be encoded — the input must not silently drop work.
+    if (customText) {
+      const tokens = customToTokens(customText);
+      if (!tokens.ok) {
+        error = wakeEncodeError(tokens);
+      } else {
+        const display = customText.replace(/\s+/g, '_');
+        if (!wakeCustomDraft.some(c => c.display === display) &&
+            wakeCustomDraft.length < WAKE_CUSTOM_LIMIT) {
+          wakeCustomDraft.push({ display, tokens: tokens.tokens });
+          el('wakeWordCustomInput').value = '';
+          updateWakeCustomPreview();
+          renderWakeCustomList();
+        }
+      }
+    }
+    return {
+      ok: !error,
+      error,
+      cfg: {
+        enabled: el('wakeWordEnabledInput').value === 'on',
+        presets,
+        customs: wakeCustomDraft.slice(),
+        threshold: parseFloat(el('wakeWordThresholdInput').value),
+      },
+    };
+  }
+
+  function wakeEncodeError(tokens) {
+    return tokens.badPieces
+      ? `Unknown BPE pieces: ${tokens.badPieces.join(', ')} — use pieces from the engine vocabulary only`
+      : `Character not covered by the wake-word vocabulary: "${tokens.uncovered}" — try another spelling`;
+  }
+
+  // Live feedback for the custom field: shows the exact keyword line the
+  // save path would store, or why the text cannot be encoded.
+  function updateWakeCustomPreview() {
+    const preview = el('wakeWordCustomPreview');
+    const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
+    if (!customText) {
+      preview.hidden = true;
+      return;
+    }
+    const tokens = customToTokens(customText);
+    preview.textContent = tokens.ok ? `→ ${tokens.tokens}` : wakeEncodeError(tokens);
+    preview.hidden = false;
+  }
+
+  function showWakeCustomError(message) {
+    const box = el('wakeWordCustomError');
+    if (!box) return;
+    if (message) {
+      box.textContent = message;
+      box.hidden = false;
+    } else {
+      box.hidden = true;
+    }
+  }
+
+  function saveWakeWordSettings(id) {
+    const wake = readWakeConfigFromPanel();
+    if (!wake.ok) {
+      // An invalid custom word aborts ONLY the wake section — the rest
+      // of the settings were already persisted by saveSettings(). Toast
+      // because the panel closes right after the save.
+      showWakeCustomError(wake.error);
+      showToast(wake.error, 'error', 'Wake word');
+      return;
+    }
+    // Enabling with zero keywords would pass the storage check but never
+    // arm (maybeArm skips it) — reject the wake save instead.
+    const cfg = wake.cfg;
+    if (cfg.enabled && cfg.presets.length === 0 && cfg.customs.length === 0) {
+      const message = 'Pick a preset or enter a custom wake word first';
+      showWakeCustomError(message);
+      showToast(message, 'error', 'Wake word');
+      return;
+    }
+    showWakeCustomError(null);
+    WakeWordStorage.save(id, wake.cfg);
+    // Spec §9: mid-standby changes must reach the detector — no-op
+    // unless THIS assistant is the one currently armed.
+    WakeWordSystem.rearmKeywords(id);
+  }
+
+  // Live audition: borrows the mic for 15 s (refused while a session or
+  // standby holds it — the mic is a shared resource), feeds raw capture
+  // blocks into the engine with the panel's current keywords, and
+  // reports the first hit.
+  function handleWakeWordTest() {
+    if (wakeTestActive) return;
+    const wake = readWakeConfigFromPanel();
+    if (!wake.ok) {
+      showWakeCustomError(wake.error);
+      showToast(wake.error, 'error', 'Wake word');
+      return;
+    }
+    const cfg = wake.cfg;
+    if (!cfg.presets.length && !cfg.customs.length) {
+      showToast('Pick a preset or enter a custom wake word first', 'info', 'Wake word');
+      return;
+    }
+    if (AudioEngine.isCapturing() ||
+        ['ARMED', 'LOADING', 'TRIGGERED'].includes(WakeWordSystem.getState())) {
+      showToast('Microphone busy — stop the session or standby first', 'error', 'Wake word');
+      return;
+    }
+
+    const status = el('wakeWordStatus');
+    let timer = null;
+    const finish = (message) => {
+      wakeTestActive = false;
+      clearTimeout(timer);
+      SherpaKwsEngine.stop();
+      WakeWordSystem.stopDetector();
+      if (message) status.textContent = message;
+    };
+
+    wakeTestActive = true;
+    status.textContent = 'Listening for 15 s — say the wake word…';
+    SherpaKwsEngine.start(WakeWordSystem.keywordsString(cfg), cfg.threshold, (word) => {
+      finish(`Heard: ${word}`);
+      showToast(`Wake word heard: ${word.replace(/_/g, ' ')}`, 'success', 'Wake word');
+    }).catch(err => {
+      finish(`Test failed: ${err.message}`);
+    });
+    // The test listens on the same unprocessed detector stream standby
+    // uses, so what it reports is what standby will hear.
+    WakeWordSystem.startDetector((b) => SherpaKwsEngine.feedPcm(b), {
+      standby: false,
+      onFail: () => finish('Microphone unavailable — test cancelled'),
+      onEnded: () => finish('Microphone ended — test cancelled'),
+    });
+    timer = setTimeout(() => finish('No wake word heard (timeout).'), 15000);
   }
 
   function loadSettingsIntoForm() {
@@ -4768,6 +6072,7 @@ const UIController = (() => {
     el('listeningModeInput').value    = s.listeningMode || 'auto';
     el('audioEnabled').checked        = s.audioEnabled !== false;
     el('ttsPlayback').checked         = s.ttsPlayback !== false;
+    loadWakeWordSettings(id);
     updatePairingStatusDisplay();
     updateSettingsConnectionStatusDisplay();
 
@@ -4929,6 +6234,7 @@ const UIController = (() => {
     AssistantManager.setFlatField(id, 'listeningMode',   el('listeningModeInput').value);
     AssistantManager.setFlatField(id, 'audioEnabled',    el('audioEnabled').checked);
     AssistantManager.setFlatField(id, 'ttsPlayback',     el('ttsPlayback').checked);
+    saveWakeWordSettings(id);
 
     // Update device ID / client ID only if user entered a value
     // Normalize deviceId to lowercase to match firmware format (required by server)
@@ -4983,6 +6289,7 @@ const UIController = (() => {
 
     // Remove all state classes
     stateChip.className = 'device-state-chip';
+    stateChip.title = '';
     deviceAvatar.className = 'device-avatar';
 
     switch (state) {
@@ -5038,6 +6345,28 @@ const UIController = (() => {
         deviceAvatar.classList.add('speaking');
         break;
 
+      case 'wake':
+        // Wake-word standby: session closed, mic stays open locally
+        // waiting for the wake phrase. Listening accent, manual
+        // disconnect stays available (it disarms standby), and Connect
+        // stays visible too — the wake word is the hands-free path, but
+        // a manual reconnect must remain discoverable while standby is
+        // armed (it disarms and reconnects).
+        statusDot.className = 'status-dot listening';
+        statusText.textContent = 'Standby';
+        stateChip.classList.add('listening');
+        stateChipText.textContent = 'WAKE';
+        stateChip.title = message;
+        stateChipIcon.className = 'fas fa-microphone-lines';
+        chatSubtitle.textContent = 'Powered by Olivia \u2014 Wake word standby';
+        deviceAvatar.classList.add('listening');
+        connectBtn.style.display = 'flex';
+        connectBtn.title = 'Reconnect now';
+        disconnectBtn.style.display = 'flex';
+        sessionInfo.style.display = 'none';
+        inputHint.textContent = 'Say the wake word to resume';
+        break;
+
       case 'disconnected':
       default:
         statusDot.className = 'status-dot offline';
@@ -5050,6 +6379,7 @@ const UIController = (() => {
         stateChipIcon.className = 'fas fa-circle';
         chatSubtitle.textContent = 'Powered by Olivia \u2014 Disconnected';
         connectBtn.style.display = 'flex';
+        connectBtn.title = 'Connect to server';
         disconnectBtn.style.display = 'none';
         sessionInfo.style.display = 'none';
         inputHint.textContent = 'Connect to server to start chatting';
@@ -5429,6 +6759,8 @@ const UIController = (() => {
     addSystemMessage,
     hideLoadingOverlay,
     updateMicButtonState,
+    showAudioMeter,
+    hideAudioMeter,
     showPairingModal,
     hidePairingModal,
     updatePairingStatus,
@@ -6271,6 +7603,16 @@ const AppController = (() => {
       Logger.warn('Opus WASM pre-load failed (will retry on use)', err.message);
     });
 
+    // Pre-warm the wake-word engine when any assistant has the feature
+    // enabled: a cold arm-time load (21 MB of assets + wasm compile)
+    // leaves standby deaf for seconds after the server goodbye; a warm
+    // engine detects from the first audio block.
+    if (AssistantManager.getAllAssistants().some(a => WakeWordStorage.load(a.id).enabled)) {
+      SherpaKwsEngine.load().catch(err => {
+        Logger.warn('Wake word engine pre-load failed (will retry on use)', err && err.message);
+      });
+    }
+
     // Hide loading overlay
     setTimeout(() => {
       UIController.hideLoadingOverlay();
@@ -6339,6 +7681,33 @@ window.XiaozhiDebug = {
   theme:          ThemeManager,
   backup:         BackupSystem,
   logger:         Logger,
+  wakeWord: {
+    engine: SherpaKwsEngine,
+    storage: WakeWordStorage,
+    presets: WAKE_PRESETS,
+    // Offline self-test: decode each URL as audio and run the same
+    // detection path as live standby over it. detectOffline leaves the
+    // engine running when it finishes, so stop() runs in finally — a
+    // failed clip must never leave a live engine behind.
+    selfTest: async (urls) => {
+      const results = [];
+      const offline = new OfflineAudioContext(1, 16000, 16000);
+      try {
+        for (const url of urls) {
+          const buf = await (await fetch(url)).arrayBuffer();
+          const decoded = await offline.decodeAudioData(buf);
+          const samples = decoded.getChannelData(0);
+          const cfg = WakeWordStorage.load(AssistantManager.getActiveId());
+          const hits = await SherpaKwsEngine.detectOffline(
+            samples, WakeWordSystem.keywordsString(cfg), cfg.threshold);
+          results.push({ url, hits });
+        }
+      } finally {
+        SherpaKwsEngine.stop();
+      }
+      return results;
+    },
+  },
   get protocol()     { return SessionManager.getActiveSession()?.protocol; },
   get provisioning() { return SessionManager.getActiveSession()?.provisioning; },
   get device()       { return SessionManager.getActiveSession()?.deviceEmulator; },
@@ -6353,6 +7722,8 @@ window.XiaozhiDebug = {
   sendDetect: (text) => SessionManager.getActiveSession()?.protocol.sendListenDetect(text),
   // Check opus status
   opusStatus: () => AudioEngine.loadOpus().then(m => ({ loaded: true, version: m.version })).catch(e => ({ loaded: false, error: e.message })),
+  // Wake detector liveness: blocks flowing, input level, AudioContext state.
+  wakeDetectorStats: () => WakeWordSystem.detectorStats(),
 };
 
 console.log('%c[Xiaozhi Web Client]', 'color: #0084ff; font-weight: bold; font-size: 14px;',

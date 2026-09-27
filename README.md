@@ -56,6 +56,7 @@ What started as a single virtual device has grown into a full **multi-assistant 
 - [Brand Identity](#brand-identity)
 - [Assistant Avatars](#assistant-avatars)
 - [Per-Assistant Speech Volume](#per-assistant-speech-volume)
+- [Wake Word Resume](#wake-word-resume)
 - [Backup & Restore](#backup--restore)
 - [Usage Guide](#usage-guide)
 - [Installation](#installation)
@@ -819,6 +820,137 @@ The Xiaozhi protocol's existing (and previously unused) `custom` message type al
 ```
 
 Wiring it up in a future phase would take a single additional `protocol.on('custom', ...)` listener — no changes to the WebSocket handshake or any new message type required.
+
+---
+
+## Wake Word Resume
+
+When an auto-mode session ends from under you — the Xiaozhi server saying its inactivity goodbye and closing, or the connection going silent and being closed by Olivia's dead-channel watchdog — Olivia can keep the microphone open locally and listen for a **wake word** instead of dropping you back to the connect button. Saying the wake word plays a chime, reconnects the session, and sends the speech captured during standby first — a ring buffer keeps up to 4 seconds of audio, flushed from 200 ms before the detection moment so the wake phrase itself is not echoed back — then live audio flows. You can start talking the moment the chime sounds and never lose your first words.
+
+This mirrors what a physical ESP32 does with its on-device WakeNet: the hardware listens locally so the cloud connection can be re-established by voice alone.
+
+### Enabling It
+
+Open the assistant's settings (gear icon) and find the **Wake Word** section:
+
+1. Set **Wake word resume** to *On (auto listening only)*
+2. Tick at least one wake word (preset or custom)
+3. Adjust **Sensitivity** if needed (see below)
+
+Standby only ever arms when **all** of these hold:
+
+- The session ended on its own: either the server closed it cleanly (its inactivity goodbye) or the channel died silently and the watchdog closed it — never on a manual disconnect, an authentication failure, or any other abnormal close
+- The session was in **auto** listening mode with the microphone capturing
+- The assistant was the active one on screen
+- The feature is enabled and at least one wake word is selected
+
+If the network itself is down when the wake word fires, the reconnect retries twice, reports the failure and drops standby — you are never left with a dead-looking session.
+
+While standby is armed, the connection chip shows which phrases are being listened for and a system message is added to the chat. A chime plays on detection, the session reconnects automatically (with one retry), and buffered speech is sent before live audio. Any manual action — connect, disconnect, mic off — disarms standby. Changing the keywords mid-standby takes effect immediately, and turning the feature off disarms it.
+
+### The Preset
+
+| Preset | Say |
+|---|---|
+| Hello Olivia | "Hello Olivia" |
+
+It is the only shipped preset, verified end to end against real speech. Anything else you want Olivia to answer to is a custom wake word (below).
+
+### Custom Wake Words
+
+Type any English word or short phrase (e.g. `HEY KITTY`) into the custom field and press **Add** — Olivia converts it to the engine's token line by segmenting it into the model's sentencepiece BPE vocabulary and validates the result before accepting it. Letters outside the vocabulary (accents, digits, punctuation) are reported with an inline error. Up to 10 custom phrases can be staged alongside any number of presets: every phrase in the list is listened for simultaneously, phrases can be removed at any time, and the staged list persists only when the settings are saved.
+
+The token format is space-separated BPE pieces (each word prefixed by the `▁` whitespace marker) followed by `@` and the display form (no spaces — use `_`). For example, `HEY KITTY` becomes:
+
+```
+▁HE Y ▁K IT TY @HEY_KITTY
+```
+
+The token line is shown live as you type. The format is the engine's standard keyword format, documented in the [sherpa-onnx keyword-spotting docs](https://k2-fsa.github.io/sherpa/onnx/kws/index.html), which also cover per-keyword `:score` boosts, `#threshold` overrides and the official `text2token` converter for offline keyword generation.
+
+### Sensitivity
+
+The **Sensitivity** slider (0.10–0.50, default 0.25) is the engine's keyword threshold. **Higher means stricter**: fewer false accepts, but more misses when your pronunciation or the mic input differs from training data. Lower it if Olivia rarely reacts; raise it if it wakes on background speech or TV audio.
+
+Use the **Test wake word** button to check recognition without ending your session: it starts a short live listening pass and reports every phrase it hears.
+
+### Privacy: Everything Stays in Your Browser
+
+The engine is a WebAssembly build of [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s keyword-spotting model, loaded lazily from the same server that serves the app itself. During standby it runs entirely in your browser; no audio leaves it until the session reconnects. Encoded audio only starts flowing to the Xiaozhi server again when the wake word fires and the session is re-established. Wake word settings are stored per assistant in `localStorage` (key `olivia_wakeword_v1_<assistantId>`) and never leave the browser.
+
+The detector (and the **Test wake word** button) listen on their own microphone stream with the browser's audio processing disabled (echo cancellation, noise suppression and auto gain control off). The keyword-spotting model is small and fails on processed audio — the WebRTC chain reshapes the speech spectrum enough to make detection never fire. While standby is armed this raw stream is the only open microphone: keeping the session's processed stream open beside it makes the second capture deliver pure silence on some audio stacks (PipeWire on Linux, verified). When the wake word fires, the session microphone re-opens with its normal processing — in parallel with the reconnection, before any assistant speech can play — so the wake audio and the resumed session never share a stream.
+
+### Limitations
+
+- **Wake words are English-only.** The bundled GigaSpeech model is an English keyword-spotting model; its vocabulary does not cover accented letters, digits, or other scripts.
+- **Background-tab behavior varies by browser.** Some browsers throttle or suspend audio processing in inactive tabs, which can pause detection. Keep the Olivia tab visible for reliable wake word standby.
+
+### Wake word engine build (contributors)
+
+The `public/static/wake/` directory holds four prebuilt artifacts (`sherpa-onnx-kws.js`, `sherpa-onnx-wasm-kws-main.js`, `sherpa-onnx-wasm-kws-main.wasm`, `sherpa-onnx-wasm-kws-main.data`) — a WebAssembly build of sherpa-onnx's KWS demo with the model preloaded inside the `.data` archive. Keywords are runtime text, so adding wake words never requires a rebuild; rebuild only when updating the engine or model. To reproduce the artifacts from scratch:
+
+1. **Install emsdk 4.0.23** (pinned — other versions are untested):
+
+   ```bash
+   git clone https://github.com/emscripten-core/emsdk.git
+   cd emsdk && ./emsdk install 4.0.23 && ./emsdk activate 4.0.23 && source ./emsdk_env.sh
+   emcc --version   # must print 4.0.23
+   ```
+
+2. **Clone sherpa-onnx and download the model** (pin the commit you build; `--depth 1` of current master works):
+
+   ```bash
+   git clone --depth 1 https://github.com/k2-fsa/sherpa-onnx.git
+   wget https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2
+   tar xf sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2
+   ```
+
+3. **Populate the build's asset directory** with the model files. The demo's CMakeLists guards on a decoder file name that happens to match this model's real decoder, so no stub is needed:
+
+   ```bash
+   cd sherpa-onnx/wasm/kws/assets
+   rm -f *.onnx tokens.txt en.phone
+   M=/path/to/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01
+   cp $M/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx .
+   cp $M/decoder-epoch-12-avg-2-chunk-16-left-64.onnx .
+   cp $M/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx .
+   cp $M/tokens.txt .
+   ```
+
+   One more asset, `bpe.vocab`, is generated from the model's `bpe.model` with sentencepiece — the app points `bpe_vocab` at it so custom keyword pieces can be validated against the real vocabulary:
+
+   ```bash
+   pip install sentencepiece
+   python3 -c "import sentencepiece as spm; sp = spm.SentencePieceProcessor(model_file='$M/bpe.model'); open('bpe.vocab','w').write(''.join(f'{sp.id_to_piece(i)} {sp.get_score(i)}\n' for i in range(sp.get_piece_size())))"
+   ```
+
+4. **Build** (needs `cmake` and `make`; the build downloads an onnxruntime static lib on first configure):
+
+   ```bash
+   cd ../../.. && ./build-wasm-simd-kws.sh
+   ls -lh build-wasm-simd-kws/install/bin/wasm/
+   ```
+
+5. **Copy the four artifacts** (`sherpa-onnx-kws.js`, `sherpa-onnx-wasm-kws-main.js`, `sherpa-onnx-wasm-kws-main.wasm`, `sherpa-onnx-wasm-kws-main.data`) to `public/static/wake/`. Do not copy the demo `app.js`/`index.html` from that directory.
+
+**Regenerating preset token lines.** The preset lines embedded in `app.js` (`WAKE_PRESETS`) are sentencepiece BPE segmentations of the phrase and must be regenerated from the same model if the model ever changes:
+
+```bash
+python3 -c "import sentencepiece as spm; sp = spm.SentencePieceProcessor(model_file='$M/bpe.model'); [print(' '.join(sp.encode(p, out_type=str)) + ' @' + p.replace(' ', '_')) for p in ['Hello Olivia']]"
+```
+
+The canonical current lines are:
+
+```
+▁HE Y ▁O LI VI A @HEY_OLIVIA
+▁HI ▁E S P @HI_ESP
+▁HE Y ▁JA R VI S @HEY_JARVIS
+```
+
+Notes:
+
+- Every piece must exist in `tokens.txt` — a line referencing an unknown token silently never fires.
+- Before shipping a preset, verify it against real speech: the previous bilingual model accepted only its two shipped demo keywords and silently ignored every other English keyword.
 
 ---
 

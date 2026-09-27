@@ -764,6 +764,132 @@ body {
   accent-color: var(--primary);
 }
 
+/* OLIVIA FEATURE: wake word settings section — the preset checkbox list
+   (rendered dynamically from app.js) mirrors .checkbox-group, plus the
+   hint/error text styles and the section's disabled state. */
+#wakeWordPresetBox {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+#wakeWordPresetBox label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.wake-preset {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+
+/* Staged custom wake phrases — input row plus one removable row per
+   phrase, persisted only when the settings are saved. */
+.wake-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.wake-add-row input { flex: 1; }
+
+#wakeWordCustomList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+#wakeWordCustomList.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.wake-custom-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+/* The remove button sits where the preset checkbox sits, so both row
+   types read as one uniform list. */
+.wake-custom-remove {
+  width: 15px;
+  height: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.wake-custom-remove:hover {
+  color: var(--danger);
+}
+
+.settings-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.settings-error {
+  display: block;
+  font-size: 11px;
+  color: var(--danger);
+  margin-top: 4px;
+}
+
+#wakeWordSection.disabled {
+  opacity: 0.5;
+}
+
+#wakeWordSection.disabled input,
+#wakeWordSection.disabled select,
+#wakeWordSection.disabled button {
+  pointer-events: none;
+}
+
+#wakeWordSection details {
+  margin-top: 8px;
+}
+
+#wakeWordSection summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+#wakeWordSection input[type="range"] {
+  width: 100%;
+  accent-color: var(--primary);
+}
+
+#wakeWordThresholdValue {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+#wakeWordTestBtn {
+  width: 100%;
+}
+
 .settings-actions {
   display: flex;
   flex-direction: column;
