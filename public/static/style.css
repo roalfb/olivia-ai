@@ -815,22 +815,26 @@ body {
 .wake-custom-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
   font-size: 13px;
   color: var(--text-primary);
 }
 
+/* The remove button sits where the preset checkbox sits, so both row
+   types read as one uniform list. */
 .wake-custom-remove {
+  width: 15px;
+  height: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   background: none;
   border: none;
   color: var(--text-muted);
   cursor: pointer;
   font-size: 13px;
-  padding: 2px 4px;
+  line-height: 1;
   flex-shrink: 0;
 }
 

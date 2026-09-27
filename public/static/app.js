@@ -5745,15 +5745,15 @@ const UIController = (() => {
     wakeCustomDraft.forEach((c, i) => {
       const item = document.createElement('div');
       item.className = 'wake-custom-item';
-      const label = document.createElement('span');
-      label.textContent = c.display.replace(/_/g, ' ');
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.className = 'wake-custom-remove';
       remove.dataset.index = String(i);
-      remove.setAttribute('aria-label', 'Remove');
+      remove.setAttribute('aria-label', `Remove ${c.display.replace(/_/g, ' ')}`);
       remove.textContent = '✕';
-      item.append(label, remove);
+      const label = document.createElement('span');
+      label.textContent = c.display.replace(/_/g, ' ');
+      item.append(remove, label);
       list.appendChild(item);
     });
   }
