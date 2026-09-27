@@ -780,10 +780,19 @@ app.get('/', (c) => {
             <div id="wakeWordPresetBox"></div>
             <input type="text" id="wakeWordCustomInput"
                    placeholder="Custom words, e.g. HEY KITTY" />
+            <div class="settings-hint">
+              English sounds only — type it as it sounds in English
+              letters; accents, ñ and digits are not covered.
+            </div>
+            <div id="wakeWordCustomPreview" class="settings-hint" hidden></div>
             <details>
               <summary>Advanced: BPE pieces</summary>
               <input type="text" id="wakeWordPhonesInput"
                      placeholder="▁K IT TY" />
+              <div class="settings-hint">
+                Auto-derived from the custom text — edit only for manual
+                tweaks.
+              </div>
             </details>
             <div id="wakeWordCustomError" class="settings-error" hidden></div>
           </div>

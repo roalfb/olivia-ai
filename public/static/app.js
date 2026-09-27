@@ -5283,6 +5283,9 @@ const UIController = (() => {
         parseFloat(el('wakeWordThresholdInput').value).toFixed(2);
     });
     el('wakeWordTestBtn').addEventListener('click', handleWakeWordTest);
+    ['wakeWordCustomInput', 'wakeWordPhonesInput'].forEach(id => {
+      el(id).addEventListener('input', updateWakeCustomPreview);
+    });
     el('listeningModeInput').addEventListener('change', applyWakeSectionAvailability);
 
     // PHASE 2: Assistant-level actions inside the Settings panel — all
@@ -5771,6 +5774,7 @@ const UIController = (() => {
     el('wakeWordThresholdInput').value = String(cfg.threshold);
     el('wakeWordThresholdValue').textContent = Number(cfg.threshold).toFixed(2);
     el('wakeWordCustomError').hidden = true;
+    updateWakeCustomPreview();
     applyWakeSectionAvailability();
   }
 
@@ -5828,9 +5832,7 @@ const UIController = (() => {
     if (customText) {
       const tokens = customToTokens(customText, piecesText);
       if (!tokens.ok) {
-        error = tokens.badPieces
-          ? `Unknown BPE pieces: ${tokens.badPieces.join(', ')} — use pieces from the engine vocabulary only`
-          : `Character not covered by the wake-word vocabulary: "${tokens.uncovered}" — try another spelling`;
+        error = wakeEncodeError(tokens);
       } else {
         custom = { display: customText.replace(/\s+/g, '_'), tokens: tokens.tokens };
       }
@@ -5845,6 +5847,28 @@ const UIController = (() => {
         threshold: parseFloat(el('wakeWordThresholdInput').value),
       },
     };
+  }
+
+  function wakeEncodeError(tokens) {
+    return tokens.badPieces
+      ? `Unknown BPE pieces: ${tokens.badPieces.join(', ')} — use pieces from the engine vocabulary only`
+      : `Character not covered by the wake-word vocabulary: "${tokens.uncovered}" — try another spelling`;
+  }
+
+  // Live feedback for the custom field: shows the exact keyword line the
+  // save path would store, or why the text cannot be encoded.
+  function updateWakeCustomPreview() {
+    const preview = el('wakeWordCustomPreview');
+    const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
+    const piecesText = el('wakeWordPhonesInput').value.trim().toUpperCase()
+      .replace(/@[\w]+/g, '').trim();
+    if (!customText) {
+      preview.hidden = true;
+      return;
+    }
+    const tokens = customToTokens(customText, piecesText);
+    preview.textContent = tokens.ok ? `→ ${tokens.tokens}` : wakeEncodeError(tokens);
+    preview.hidden = false;
   }
 
   function showWakeCustomError(message) {
