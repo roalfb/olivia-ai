@@ -790,6 +790,54 @@ body {
   accent-color: var(--primary);
 }
 
+/* Staged custom wake phrases — input row plus one removable row per
+   phrase, persisted only when the settings are saved. */
+.wake-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.wake-add-row input { flex: 1; }
+
+#wakeWordCustomList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+#wakeWordCustomList.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.wake-custom-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.wake-custom-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  flex-shrink: 0;
+}
+
+.wake-custom-remove:hover {
+  color: var(--danger);
+}
+
 .settings-hint {
   display: block;
   font-size: 11px;

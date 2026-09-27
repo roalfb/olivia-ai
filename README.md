@@ -858,7 +858,7 @@ While standby is armed, the connection chip shows which phrases are being listen
 
 ### Custom Wake Words
 
-Type any English word or short phrase into the custom field (e.g. `HEY KITTY`) and save — Olivia converts it to the engine's token line by segmenting it into the model's sentencepiece BPE vocabulary and validates the result before accepting it. Letters outside the vocabulary (accents, digits, punctuation) are reported with an inline error.
+Type any English word or short phrase (e.g. `HEY KITTY`) into the custom field and press **Add** — Olivia converts it to the engine's token line by segmenting it into the model's sentencepiece BPE vocabulary and validates the result before accepting it. Letters outside the vocabulary (accents, digits, punctuation) are reported with an inline error. Up to 10 custom phrases can be staged alongside any number of presets: every phrase in the list is listened for simultaneously, phrases can be removed at any time, and the staged list persists only when the settings are saved.
 
 The token format is space-separated BPE pieces (each word prefixed by the `▁` whitespace marker) followed by `@` and the display form (no spaces — use `_`). For example, `HEY KITTY` becomes:
 
@@ -866,7 +866,7 @@ The token format is space-separated BPE pieces (each word prefixed by the `▁` 
 ▁HE Y ▁K IT TY @HEY_KITTY
 ```
 
-The token line is shown live under the custom field as you type. The format is the engine's standard keyword format, documented in the [sherpa-onnx keyword-spotting docs](https://k2-fsa.github.io/sherpa/onnx/kws/index.html), which also cover per-keyword `:score` boosts, `#threshold` overrides and the official `text2token` converter for offline keyword generation.
+The token line is shown live as you type. The format is the engine's standard keyword format, documented in the [sherpa-onnx keyword-spotting docs](https://k2-fsa.github.io/sherpa/onnx/kws/index.html), which also cover per-keyword `:score` boosts, `#threshold` overrides and the official `text2token` converter for offline keyword generation.
 
 ### Sensitivity
 

@@ -778,16 +778,20 @@ app.get('/', (c) => {
             <!-- Preset checkboxes render dynamically from app.js
                  (WAKE_PRESETS) into this empty container. -->
             <div id="wakeWordPresetBox"></div>
-            <input type="text" id="wakeWordCustomInput"
-                   placeholder="Custom words, e.g. HEY KITTY" />
+            <div class="wake-add-row">
+              <input type="text" id="wakeWordCustomInput"
+                     placeholder="Custom words, e.g. HEY KITTY" />
+              <button type="button" id="wakeWordAddBtn" class="btn-secondary">Add</button>
+            </div>
             <div class="settings-hint">
               English sounds only — type it as it sounds in English
-              letters; accents, ñ and digits are not covered. Encoding
-              format:
+              letters; accents, ñ and digits are not covered (up to 10
+              phrases). Encoding format:
               <a href="https://k2-fsa.github.io/sherpa/onnx/kws/index.html"
                  target="_blank" rel="noopener">sherpa-onnx keyword docs</a>.
             </div>
             <div id="wakeWordCustomPreview" class="settings-hint" hidden></div>
+            <div id="wakeWordCustomList"></div>
             <div id="wakeWordCustomError" class="settings-error" hidden></div>
           </div>
           <div class="form-group">

@@ -896,17 +896,33 @@ const VolumeSystem = (() => {
 // ================================================================
 const WakeWordStorage = (() => {
   const KEY_PREFIX = 'olivia_wakeword_v1_';
-  const DEFAULTS = { enabled: false, presets: ['hey_olivia'], custom: null, threshold: 0.25 };
+  const DEFAULTS = { enabled: false, presets: ['hey_olivia'], customs: [], threshold: 0.25 };
+
+  // Records written before multi-phrase support stored a single `custom`
+  // object — fold it into the `customs` list and pin the record shape.
+  function normalize(cfg) {
+    const customs = Array.isArray(cfg.customs)
+      ? cfg.customs.filter(c => c && c.tokens && c.display) : [];
+    if (cfg.custom && cfg.custom.tokens && cfg.custom.display &&
+        !customs.some(c => c.tokens === cfg.custom.tokens)) {
+      customs.push(cfg.custom);
+    }
+    return {
+      enabled: !!cfg.enabled,
+      presets: Array.isArray(cfg.presets) ? cfg.presets : [],
+      customs,
+      threshold: typeof cfg.threshold === 'number' ? cfg.threshold : 0.25,
+    };
+  }
 
   function load(assistantId) {
     try {
       const raw = localStorage.getItem(KEY_PREFIX + assistantId);
-      if (!raw) return { ...DEFAULTS };
-      const parsed = JSON.parse(raw);
-      return { ...DEFAULTS, ...parsed };
+      if (!raw) return { ...DEFAULTS, customs: [] };
+      return normalize({ ...DEFAULTS, ...JSON.parse(raw) });
     } catch (e) {
       Logger.warn('WakeWordStorage: corrupt record, returning defaults');
-      return { ...DEFAULTS };
+      return { ...DEFAULTS, customs: [] };
     }
   }
 
@@ -1160,13 +1176,13 @@ const WakeWordSystem = (() => {
     const lines = WAKE_PRESETS
       .filter(p => cfg.presets.includes(p.id))
       .map(p => p.tokens);
-    if (cfg.custom && cfg.custom.tokens) lines.push(cfg.custom.tokens);
+    for (const c of cfg.customs) lines.push(c.tokens);
     return lines.join('\n');
   }
 
   function activeKeywordsLabel(cfg) {
     const names = WAKE_PRESETS.filter(p => cfg.presets.includes(p.id)).map(p => p.label);
-    if (cfg.custom && cfg.custom.display) names.push(cfg.custom.display.replace(/_/g, ' '));
+    for (const c of cfg.customs) names.push(c.display.replace(/_/g, ' '));
     return names.join(' / ');
   }
 
@@ -1319,7 +1335,7 @@ const WakeWordSystem = (() => {
     if (state !== 'INACTIVE') return false;
     if (!shouldArm(ctx)) return false;
     const cfg = WakeWordStorage.load(ctx.assistantId);
-    if (!cfg.enabled || (cfg.presets.length === 0 && !cfg.custom)) return false;
+    if (!cfg.enabled || (cfg.presets.length === 0 && cfg.customs.length === 0)) return false;
 
     armedAssistantId = ctx.assistantId;
     keywordLabels = activeKeywordsLabel(cfg);
@@ -1494,7 +1510,7 @@ const WakeWordSystem = (() => {
     if (state !== 'ARMED' && state !== 'LOADING') return;
     if (assistantId && armedAssistantId !== assistantId) return;
     const cfg = WakeWordStorage.load(armedAssistantId);
-    if (!cfg.enabled || (cfg.presets.length === 0 && !cfg.custom)) {
+    if (!cfg.enabled || (cfg.presets.length === 0 && cfg.customs.length === 0)) {
       disarm('disabled-in-settings');
       return;
     }
@@ -5284,6 +5300,14 @@ const UIController = (() => {
     });
     el('wakeWordTestBtn').addEventListener('click', handleWakeWordTest);
     el('wakeWordCustomInput').addEventListener('input', updateWakeCustomPreview);
+    el('wakeWordCustomInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); addWakeCustomPhrase(); }
+    });
+    el('wakeWordAddBtn').addEventListener('click', addWakeCustomPhrase);
+    el('wakeWordCustomList').addEventListener('click', (e) => {
+      const btn = e.target.closest('.wake-custom-remove');
+      if (btn) removeWakeCustomPhrase(Number(btn.dataset.index));
+    });
     el('listeningModeInput').addEventListener('change', applyWakeSectionAvailability);
 
     // PHASE 2: Assistant-level actions inside the Settings panel — all
@@ -5704,6 +5728,59 @@ const UIController = (() => {
   let wakeEngineReady = false;
   let wakeEngineError = null;
   let wakeTestActive = false;
+  // Staged custom phrases — edited freely in the panel, persisted to
+  // WakeWordStorage only on Save.
+  const WAKE_CUSTOM_LIMIT = 10;
+  let wakeCustomDraft = [];
+
+  function renderWakeCustomList() {
+    const list = el('wakeWordCustomList');
+    list.textContent = '';
+    wakeCustomDraft.forEach((c, i) => {
+      const item = document.createElement('div');
+      item.className = 'wake-custom-item';
+      const label = document.createElement('span');
+      label.textContent = c.display.replace(/_/g, ' ');
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'wake-custom-remove';
+      remove.dataset.index = String(i);
+      remove.setAttribute('aria-label', 'Remove');
+      remove.textContent = '✕';
+      item.append(label, remove);
+      list.appendChild(item);
+    });
+  }
+
+  function addWakeCustomPhrase() {
+    const input = el('wakeWordCustomInput');
+    const text = input.value.trim().toUpperCase();
+    if (!text) return;
+    const tokens = customToTokens(text);
+    if (!tokens.ok) {
+      showWakeCustomError(wakeEncodeError(tokens));
+      return;
+    }
+    if (wakeCustomDraft.length >= WAKE_CUSTOM_LIMIT) {
+      showWakeCustomError(`Custom wake word limit reached (${WAKE_CUSTOM_LIMIT})`);
+      return;
+    }
+    const display = text.replace(/\s+/g, '_');
+    if (wakeCustomDraft.some(c => c.display === display)) {
+      showWakeCustomError(`"${display.replace(/_/g, ' ')}" is already in the list`);
+      return;
+    }
+    showWakeCustomError(null);
+    wakeCustomDraft.push({ display, tokens: tokens.tokens });
+    input.value = '';
+    updateWakeCustomPreview();
+    renderWakeCustomList();
+  }
+
+  function removeWakeCustomPhrase(index) {
+    wakeCustomDraft.splice(index, 1);
+    renderWakeCustomList();
+  }
 
   function renderWakePresets() {
     const box = el('wakeWordPresetBox');
@@ -5745,6 +5822,8 @@ const UIController = (() => {
     const engineUsable = wakeEngineReady && !wakeEngineError;
     el('wakeWordTestBtn').disabled = disableAll || !engineUsable;
     el('wakeWordCustomInput').disabled = disableAll;
+    el('wakeWordAddBtn').disabled = disableAll;
+    el('wakeWordCustomList').classList.toggle('disabled', disableAll);
 
     const status = el('wakeWordStatus');
     if (!supported) {
@@ -5765,11 +5844,13 @@ const UIController = (() => {
     document.querySelectorAll('#wakeWordPresetBox input[type="checkbox"]').forEach(cb => {
       cb.checked = cfg.presets.includes(cb.dataset.id);
     });
-    el('wakeWordCustomInput').value = cfg.custom ? cfg.custom.display.replace(/_/g, ' ') : '';
+    wakeCustomDraft = cfg.customs.map(c => ({ display: c.display, tokens: c.tokens }));
+    el('wakeWordCustomInput').value = '';
     el('wakeWordThresholdInput').value = String(cfg.threshold);
     el('wakeWordThresholdValue').textContent = Number(cfg.threshold).toFixed(2);
     el('wakeWordCustomError').hidden = true;
     updateWakeCustomPreview();
+    renderWakeCustomList();
     applyWakeSectionAvailability();
   }
 
@@ -5832,14 +5913,22 @@ const UIController = (() => {
     const presets = Array.from(document.querySelectorAll('#wakeWordPresetBox input:checked'))
       .map(cb => cb.dataset.id);
     const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
-    let custom = null;
     let error = null;
+    // Typed-but-not-added text: stage it now, or reject the save if it
+    // cannot be encoded — the input must not silently drop work.
     if (customText) {
       const tokens = customToTokens(customText);
       if (!tokens.ok) {
         error = wakeEncodeError(tokens);
       } else {
-        custom = { display: customText.replace(/\s+/g, '_'), tokens: tokens.tokens };
+        const display = customText.replace(/\s+/g, '_');
+        if (!wakeCustomDraft.some(c => c.display === display) &&
+            wakeCustomDraft.length < WAKE_CUSTOM_LIMIT) {
+          wakeCustomDraft.push({ display, tokens: tokens.tokens });
+          el('wakeWordCustomInput').value = '';
+          updateWakeCustomPreview();
+          renderWakeCustomList();
+        }
       }
     }
     return {
@@ -5848,7 +5937,7 @@ const UIController = (() => {
       cfg: {
         enabled: el('wakeWordEnabledInput').value === 'on',
         presets,
-        custom,
+        customs: wakeCustomDraft.slice(),
         threshold: parseFloat(el('wakeWordThresholdInput').value),
       },
     };
@@ -5898,7 +5987,7 @@ const UIController = (() => {
     // Enabling with zero keywords would pass the storage check but never
     // arm (maybeArm skips it) — reject the wake save instead.
     const cfg = wake.cfg;
-    if (cfg.enabled && cfg.presets.length === 0 && !cfg.custom) {
+    if (cfg.enabled && cfg.presets.length === 0 && cfg.customs.length === 0) {
       const message = 'Pick a preset or enter a custom wake word first';
       showWakeCustomError(message);
       showToast(message, 'error', 'Wake word');
@@ -5924,7 +6013,7 @@ const UIController = (() => {
       return;
     }
     const cfg = wake.cfg;
-    if (!cfg.presets.length && !cfg.custom) {
+    if (!cfg.presets.length && !cfg.customs.length) {
       showToast('Pick a preset or enter a custom wake word first', 'info', 'Wake word');
       return;
     }
