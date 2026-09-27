@@ -778,6 +778,7 @@ app.get('/', (c) => {
             <!-- Preset checkboxes render dynamically from app.js
                  (WAKE_PRESETS) into this empty container. -->
             <div id="wakeWordPresetBox"></div>
+            <div id="wakeWordCustomList"></div>
             <div class="wake-add-row">
               <input type="text" id="wakeWordCustomInput"
                      placeholder="Custom words, e.g. HEY KITTY" />
@@ -791,7 +792,6 @@ app.get('/', (c) => {
                  target="_blank" rel="noopener">sherpa-onnx keyword docs</a>.
             </div>
             <div id="wakeWordCustomPreview" class="settings-hint" hidden></div>
-            <div id="wakeWordCustomList"></div>
             <div id="wakeWordCustomError" class="settings-error" hidden></div>
           </div>
           <div class="form-group">
