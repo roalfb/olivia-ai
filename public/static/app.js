@@ -5284,10 +5284,6 @@ const UIController = (() => {
     });
     el('wakeWordTestBtn').addEventListener('click', handleWakeWordTest);
     el('wakeWordCustomInput').addEventListener('input', updateWakeCustomPreview);
-    el('wakeWordPhonesInput').addEventListener('input', () => {
-      wakePhonesDirty = true;
-      updateWakeCustomPreview();
-    });
     el('listeningModeInput').addEventListener('change', applyWakeSectionAvailability);
 
     // PHASE 2: Assistant-level actions inside the Settings panel — all
@@ -5749,7 +5745,6 @@ const UIController = (() => {
     const engineUsable = wakeEngineReady && !wakeEngineError;
     el('wakeWordTestBtn').disabled = disableAll || !engineUsable;
     el('wakeWordCustomInput').disabled = disableAll;
-    el('wakeWordPhonesInput').disabled = disableAll;
 
     const status = el('wakeWordStatus');
     if (!supported) {
@@ -5771,52 +5766,61 @@ const UIController = (() => {
       cb.checked = cfg.presets.includes(cb.dataset.id);
     });
     el('wakeWordCustomInput').value = cfg.custom ? cfg.custom.display.replace(/_/g, ' ') : '';
-    // The BPE-pieces override is a per-save escape hatch, not persisted.
-    el('wakeWordPhonesInput').value = '';
     el('wakeWordThresholdInput').value = String(cfg.threshold);
     el('wakeWordThresholdValue').textContent = Number(cfg.threshold).toFixed(2);
     el('wakeWordCustomError').hidden = true;
-    wakePhonesDirty = false;
     updateWakeCustomPreview();
     applyWakeSectionAvailability();
   }
 
-  let wakeBpePieceSet = null;
-  function getBpePieceSet() {
-    if (!wakeBpePieceSet) wakeBpePieceSet = new Set(WAKE_BPE_PIECES);
-    return wakeBpePieceSet;
-  }
-
-  // Greedy longest-match segmentation against the model's BPE vocabulary.
-  // Every word is preceded by the '▁' whitespace marker (GigaSpeech
-  // convention). Returns null when a character is not covered by the
-  // vocabulary (accents, digits, punctuation).
+  // Segmentation of the text into the model's BPE vocabulary. Greedy
+  // longest-match first — it reproduces the sentencepiece reference and
+  // the shipped preset lines; when it strands, dynamic programming finds
+  // another valid segmentation of the word if one exists. Every word is
+  // preceded by the '▁' whitespace marker (GigaSpeech convention).
   function bpeEncode(text) {
     const pieces = WAKE_BPE_PIECES;
     const out = [];
     for (const word of text.split(/\s+/)) {
-      const withMarker = '▁' + word;
+      const s = '▁' + word;
+      const seg = [];
       let i = 0;
-      while (i < withMarker.length) {
+      while (i < s.length) {
         let match = null;
         for (const p of pieces) {
-          if (withMarker.startsWith(p, i)) { match = p; break; }
+          if (s.startsWith(p, i)) { match = p; break; }
         }
-        if (!match) return { ok: false, uncovered: withMarker[i] };
-        out.push(match);
+        if (!match) break;
+        seg.push(match);
         i += match.length;
       }
+      if (i === s.length) {
+        out.push(...seg);
+        continue;
+      }
+      const from = new Array(s.length + 1).fill(-1);
+      from[0] = 0;
+      for (let j = 0; j < s.length; j++) {
+        if (from[j] === -1) continue;
+        for (const p of pieces) {
+          const end = j + p.length;
+          if (s.startsWith(p, j) && from[end] === -1) from[end] = j;
+        }
+      }
+      if (from[s.length] === -1) {
+        return { ok: false, uncovered: s[i] };
+      }
+      let start = from[s.length];
+      const wordPieces = [];
+      for (let end = s.length; end > 0; end = start, start = from[end]) {
+        wordPieces.unshift(s.slice(start, end));
+      }
+      out.push(...wordPieces);
     }
     return { ok: true, pieces: out.join(' ') };
   }
 
-  function customToTokens(text, piecesOverride) {
-    if (piecesOverride) {
-      const pieceSet = getBpePieceSet();
-      const badPieces = piecesOverride.split(/\s+/).filter(p => !pieceSet.has(p));
-      if (badPieces.length) return { ok: false, badPieces };
-      return { ok: true, tokens: `${piecesOverride} @${text.replace(/\s+/g, '_')}` };
-    }
+  function customToTokens(text) {
     const encoded = bpeEncode(text);
     if (!encoded.ok) return encoded;
     return { ok: true, tokens: `${encoded.pieces} @${text.replace(/\s+/g, '_')}` };
@@ -5828,12 +5832,10 @@ const UIController = (() => {
     const presets = Array.from(document.querySelectorAll('#wakeWordPresetBox input:checked'))
       .map(cb => cb.dataset.id);
     const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
-    const piecesText = el('wakeWordPhonesInput').value.trim().toUpperCase()
-      .replace(/@[\w]+/g, '').trim();
     let custom = null;
     let error = null;
     if (customText) {
-      const tokens = customToTokens(customText, piecesText);
+      const tokens = customToTokens(customText);
       if (!tokens.ok) {
         error = wakeEncodeError(tokens);
       } else {
@@ -5858,34 +5860,17 @@ const UIController = (() => {
       : `Character not covered by the wake-word vocabulary: "${tokens.uncovered}" — try another spelling`;
   }
 
-  // The Advanced field mirrors the derived encoding until the user edits
-  // it by hand — a manual override survives custom-text changes.
-  let wakePhonesDirty = false;
-
   // Live feedback for the custom field: shows the exact keyword line the
-  // save path would store (mirrored into the Advanced field) or why the
-  // text cannot be encoded.
+  // save path would store, or why the text cannot be encoded.
   function updateWakeCustomPreview() {
     const preview = el('wakeWordCustomPreview');
-    const phones = el('wakeWordPhonesInput');
     const customText = el('wakeWordCustomInput').value.trim().toUpperCase();
     if (!customText) {
       preview.hidden = true;
-      if (!wakePhonesDirty) phones.value = '';
       return;
     }
-    const piecesText = phones.value.trim().toUpperCase()
-      .replace(/@[\w]+/g, '').trim();
-    const tokens = customToTokens(customText, wakePhonesDirty ? piecesText : '');
-    if (tokens.ok) {
-      if (!wakePhonesDirty) {
-        const at = tokens.tokens.indexOf(' @');
-        phones.value = at === -1 ? tokens.tokens : tokens.tokens.slice(0, at);
-      }
-      preview.textContent = `→ ${tokens.tokens}`;
-    } else {
-      preview.textContent = wakeEncodeError(tokens);
-    }
+    const tokens = customToTokens(customText);
+    preview.textContent = tokens.ok ? `→ ${tokens.tokens}` : wakeEncodeError(tokens);
     preview.hidden = false;
   }
 

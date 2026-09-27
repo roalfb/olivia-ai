@@ -782,21 +782,12 @@ app.get('/', (c) => {
                    placeholder="Custom words, e.g. HEY KITTY" />
             <div class="settings-hint">
               English sounds only — type it as it sounds in English
-              letters; accents, ñ and digits are not covered.
+              letters; accents, ñ and digits are not covered. Encoding
+              format:
+              <a href="https://k2-fsa.github.io/sherpa/onnx/kws/index.html"
+                 target="_blank" rel="noopener">sherpa-onnx keyword docs</a>.
             </div>
             <div id="wakeWordCustomPreview" class="settings-hint" hidden></div>
-            <details>
-              <summary>Advanced: BPE pieces</summary>
-              <input type="text" id="wakeWordPhonesInput"
-                     placeholder="▁K IT TY" />
-              <div class="settings-hint">
-                Sub-word units from the engine vocabulary (▁ starts a
-                word), auto-filled from the custom text — edit only for
-                manual tweaks. Format reference:
-                <a href="https://k2-fsa.github.io/sherpa/onnx/kws/index.html"
-                   target="_blank" rel="noopener">sherpa-onnx keyword docs</a>.
-              </div>
-            </details>
             <div id="wakeWordCustomError" class="settings-error" hidden></div>
           </div>
           <div class="form-group">

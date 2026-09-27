@@ -866,7 +866,7 @@ The token format is space-separated BPE pieces (each word prefixed by the `▁` 
 ▁HE Y ▁K IT TY @HEY_KITTY
 ```
 
-The **Advanced: BPE pieces** field mirrors this segmentation live; edit it to override the result — each piece must exist in the model vocabulary. The line format is the engine's standard keyword format, documented in the [sherpa-onnx keyword-spotting docs](https://k2-fsa.github.io/sherpa/onnx/kws/index.html), which also cover per-keyword `:score` boosts and `#threshold` overrides and the official `text2token` converter.
+The token line is shown live under the custom field as you type. The format is the engine's standard keyword format, documented in the [sherpa-onnx keyword-spotting docs](https://k2-fsa.github.io/sherpa/onnx/kws/index.html), which also cover per-keyword `:score` boosts, `#threshold` overrides and the official `text2token` converter for offline keyword generation.
 
 ### Sensitivity
 
